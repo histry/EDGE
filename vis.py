@@ -42,30 +42,7 @@ smpl_joints = [
 ]
 
 smpl_parents = [
-    -1,
-    0,
-    0,
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    9,
-    9,
-    12,
-    13,
-    14,
-    16,
-    17,
-    18,
-    19,
-    20,
-    21,
+    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21,
 ]
 
 smpl_offsets = [
@@ -137,17 +114,18 @@ def plot_single_pose(num, poses, lines, ax, axrange, scat, contact):
         set_scatter_data_3d(point, position, color)
 
     for i, (p, line) in enumerate(zip(smpl_parents, lines)):
-        # don't plot root
         if i == 0:
             continue
-        # stack to create a line
         data = np.stack((pose[i], pose[p]), axis=0)
         set_line_data_3d(line, data)
 
     if num == 0:
         if isinstance(axrange, int):
             axrange = (axrange, axrange, axrange)
-        xcenter, ycenter, zcenter = 0, 0, 2.5
+        # ==========================================
+        # 👇 修改点 1：将摄像机对准原点 (0, 0, 0)
+        # ==========================================
+        xcenter, ycenter, zcenter = 0, 0, 0
         stepx, stepy, stepz = axrange[0] / 2, axrange[1] / 2, axrange[2] / 2
 
         x_min, x_max = xcenter - stepx, xcenter + stepx
@@ -171,21 +149,27 @@ def skeleton_render(
     render=True
 ):
     if render:
-        # generate the pose with FK
         Path(out).mkdir(parents=True, exist_ok=True)
         num_steps = poses.shape[0]
         
         fig = plt.figure()
         ax = fig.add_subplot(projection="3d")
         
-        point = np.array([0, 0, 1])
+        # ==========================================
+        # 👇 修改点 2：将地板降至 Z = -1.0 (脚底位置)
+        # ==========================================
+        point = np.array([0, 0, -1.0])
         normal = np.array([0, 0, 1])
         d = -point.dot(normal)
         xx, yy = np.meshgrid(np.linspace(-1.5, 1.5, 2), np.linspace(-1.5, 1.5, 2))
         z = (-normal[0] * xx - normal[1] * yy - d) * 1.0 / normal[2]
-        # plot the plane
         ax.plot_surface(xx, yy, z, zorder=-11, cmap=cm.twilight)
-        # Create lines initially without data
+        
+        # ==========================================
+        # 👇 修改点 3：设置 45 度绝佳观赏视角
+        # ==========================================
+        ax.view_init(elev=20, azim=45)
+
         lines = [
             ax.plot([], [], [], zorder=10, linewidth=1.5)[0]
             for _ in smpl_parents
@@ -196,7 +180,6 @@ def skeleton_render(
         ]
         axrange = 3
 
-        # create contact labels
         feet = poses[:, (7, 8, 10, 11)]
         feetv = np.zeros(feet.shape[:2])
         feetv[:-1] = np.linalg.norm(feet[1:] - feet[:-1], axis=-1)
@@ -205,24 +188,29 @@ def skeleton_render(
         else:
             contact = contact > 0.95
 
-        # Creating the Animation object
+        # ==========================================
+        # 👇 修改点 4：创建副本进行 Y-Up 到 Z-Up 旋转，绝不污染原始 pkl 数据！
+        # ==========================================
+        vis_poses = poses.copy()
+        vis_poses[:, :, 1] = -poses[:, :, 2]  # Depth
+        vis_poses[:, :, 2] = poses[:, :, 1]   # Height
+
         anim = animation.FuncAnimation(
             fig,
             plot_single_pose,
             num_steps,
-            fargs=(poses, lines, ax, axrange, scat, contact),
+            fargs=(vis_poses, lines, ax, axrange, scat, contact),
             interval=1000 // 30,
         )
+        
     if sound:
-        # make a temporary directory to save the intermediate gif in
         if render:
             temp_dir = TemporaryDirectory()
             gifname = os.path.join(temp_dir.name, f"{epoch}.gif")
             anim.save(gifname)
 
-        # stitch wavs
         if stitch:
-            assert type(name) == list  # must be a list of names to do stitching
+            assert type(name) == list
             name_ = [os.path.splitext(x)[0] + ".wav" for x in name]
             audio, sr = lr.load(name_[0], sr=None)
             ll, half = len(audio), len(audio) // 2
@@ -233,7 +221,6 @@ def skeleton_render(
                 audio, sr = lr.load(n_, sr=None)
                 total_wav[idx : idx + half] = audio[half:]
                 idx += half
-            # save a dummy spliced audio
             audioname = f"{temp_dir.name}/tempsound.wav" if render else os.path.join(out, f'{epoch}_{"_".join(os.path.splitext(os.path.basename(name[0]))[0].split("_")[:-1])}.wav')
             sf.write(audioname, total_wav, sr)
             outname = os.path.join(
@@ -253,7 +240,6 @@ def skeleton_render(
             )
     else:
         if render:
-            # actually save the gif
             path = os.path.normpath(name)
             pathparts = path.split(os.sep)
             gifname = os.path.join(out, f"{pathparts[-1][:-4]}.gif")
@@ -287,15 +273,8 @@ class SMPLSkeleton:
                 self._children[parent].append(i)
 
     def forward(self, rotations, root_positions):
-        """
-        Perform forward kinematics using the given trajectory and local rotations.
-        Arguments (where N = batch size, L = sequence length, J = number of joints):
-         -- rotations: (N, L, J, 3) tensor of axis-angle rotations describing the local rotations of each joint.
-         -- root_positions: (N, L, 3) tensor describing the root joint positions.
-        """
         assert len(rotations.shape) == 4
         assert len(root_positions.shape) == 3
-        # transform from axis angle to quaternion
         rotations = axis_angle_to_quaternion(rotations)
 
         positions_world = []
@@ -308,7 +287,6 @@ class SMPLSkeleton:
             self._offsets.shape[1],
         )
 
-        # Parallelize along the batch and time dimensions
         for i in range(self._offsets.shape[0]):
             if self._parents[i] == -1:
                 positions_world.append(root_positions)
@@ -327,7 +305,6 @@ class SMPLSkeleton:
                         )
                     )
                 else:
-                    # This joint is a terminal node -> it would be useless to compute the transformation
                     rotations_world.append(None)
 
         return torch.stack(positions_world, dim=3).permute(0, 1, 3, 2)

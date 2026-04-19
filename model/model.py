@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import torch
@@ -7,6 +7,8 @@ from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
 from torch import Tensor
 from torch.nn import functional as F
+from torch.nn.utils import spectral_norm  # 引入用于 Lipschitz 约束的谱归一化
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from model.rotary_embedding_torch import RotaryEmbedding
 from model.utils import PositionalEncoding, SinusoidalPosEmb, prob_mask_like
@@ -84,7 +86,6 @@ class TransformerEncoderLayer(nn.Module):
 
         return x
 
-    # self-attention block
     def _sa_block(
         self, x: Tensor, attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]
     ) -> Tensor:
@@ -99,7 +100,6 @@ class TransformerEncoderLayer(nn.Module):
         )[0]
         return self.dropout1(x)
 
-    # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
@@ -127,10 +127,12 @@ class FiLMTransformerDecoderLayer(nn.Module):
         self.multihead_attn = nn.MultiheadAttention(
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
-        # Feedforward
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        
+        # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
+        # 使用 spectral_norm 包装 MLP 层，限制其梯度的剧烈突变，有效消除滑步与高频抖动。
+        self.linear1 = spectral_norm(nn.Linear(d_model, dim_feedforward))
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear2 = spectral_norm(nn.Linear(dim_feedforward, d_model))
 
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -148,7 +150,6 @@ class FiLMTransformerDecoderLayer(nn.Module):
         self.rotary = rotary
         self.use_rotary = rotary is not None
 
-    # x, cond, t
     def forward(
         self,
         tgt,
@@ -161,15 +162,12 @@ class FiLMTransformerDecoderLayer(nn.Module):
     ):
         x = tgt
         if self.norm_first:
-            # self-attention -> film -> residual
             x_1 = self._sa_block(self.norm1(x), tgt_mask, tgt_key_padding_mask)
             x = x + featurewise_affine(x_1, self.film1(t))
-            # cross-attention -> film -> residual
             x_2 = self._mha_block(
                 self.norm2(x), memory, memory_mask, memory_key_padding_mask
             )
             x = x + featurewise_affine(x_2, self.film2(t))
-            # feedforward -> film -> residual
             x_3 = self._ff_block(self.norm3(x))
             x = x + featurewise_affine(x_3, self.film3(t))
         else:
@@ -189,8 +187,6 @@ class FiLMTransformerDecoderLayer(nn.Module):
             x = self.norm3(x + featurewise_affine(self._ff_block(x), self.film3(t)))
         return x
 
-    # self-attention block
-    # qkv
     def _sa_block(self, x, attn_mask, key_padding_mask):
         qk = self.rotary.rotate_queries_or_keys(x) if self.use_rotary else x
         x = self.self_attn(
@@ -203,8 +199,6 @@ class FiLMTransformerDecoderLayer(nn.Module):
         )[0]
         return self.dropout1(x)
 
-    # multihead attention block
-    # qkv
     def _mha_block(self, x, mem, attn_mask, key_padding_mask):
         q = self.rotary.rotate_queries_or_keys(x) if self.use_rotary else x
         k = self.rotary.rotate_queries_or_keys(mem) if self.use_rotary else mem
@@ -218,20 +212,37 @@ class FiLMTransformerDecoderLayer(nn.Module):
         )[0]
         return self.dropout2(x)
 
-    # feed forward block
     def _ff_block(self, x):
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout3(x)
 
 
 class DecoderLayerStack(nn.Module):
-    def __init__(self, stack):
+    def __init__(self, stack, use_gradient_checkpointing=False):
         super().__init__()
         self.stack = stack
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
-    def forward(self, x, cond, t):
+    @staticmethod
+    def _checkpoint_layer(layer, x, cond, t, tgt_mask):
+        def custom_forward(x_, cond_, t_, tgt_mask_):
+            return layer(x_, cond_, t_, tgt_mask=tgt_mask_)
+
+        return torch_checkpoint(
+            custom_forward,
+            x,
+            cond,
+            t,
+            tgt_mask,
+            use_reentrant=False,
+        )
+
+    def forward(self, x, cond, t, tgt_mask=None):
         for layer in self.stack:
-            x = layer(x, cond, t)
+            if self.use_gradient_checkpointing and self.training:
+                x = self._checkpoint_layer(layer, x, cond, t, tgt_mask)
+            else:
+                x = layer(x, cond, t, tgt_mask=tgt_mask)
         return x
 
 
@@ -239,7 +250,7 @@ class DanceDecoder(nn.Module):
     def __init__(
         self,
         nfeats: int,
-        seq_len: int = 150,  # 5 seconds, 30 fps
+        seq_len: int = 150,  
         latent_dim: int = 256,
         ff_size: int = 1024,
         num_layers: int = 4,
@@ -248,17 +259,23 @@ class DanceDecoder(nn.Module):
         cond_feature_dim: int = 4800,
         activation: Callable[[Tensor], Tensor] = F.gelu,
         use_rotary=True,
+        use_gradient_checkpointing=False,
+        use_sparse_attn=False,
+        sparse_attn_window=24,
         **kwargs
     ) -> None:
 
         super().__init__()
 
         output_feats = nfeats
+        self.cond_feature_dim = cond_feature_dim
+        self.num_heads = num_heads
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_sparse_attn = use_sparse_attn
+        self.sparse_attn_window = sparse_attn_window
 
-        # positional embeddings
         self.rotary = None
         self.abs_pos_encoding = nn.Identity()
-        # if rotary, replace absolute embedding with a rotary embedding instance (absolute becomes an identity)
         if use_rotary:
             self.rotary = RotaryEmbedding(dim=latent_dim)
         else:
@@ -266,9 +283,8 @@ class DanceDecoder(nn.Module):
                 latent_dim, dropout, batch_first=True
             )
 
-        # time embedding processing
         self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(latent_dim),  # learned?
+            SinusoidalPosEmb(latent_dim),
             nn.Linear(latent_dim, latent_dim * 4),
             nn.Mish(),
         )
@@ -276,19 +292,21 @@ class DanceDecoder(nn.Module):
         self.to_time_cond = nn.Sequential(nn.Linear(latent_dim * 4, latent_dim),)
 
         self.to_time_tokens = nn.Sequential(
-            nn.Linear(latent_dim * 4, latent_dim * 2),  # 2 time tokens
+            nn.Linear(latent_dim * 4, latent_dim * 2),
             Rearrange("b (r d) -> b r d", r=2),
         )
 
-        # null embeddings for guidance dropout
         self.null_cond_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
         self.null_cond_hidden = nn.Parameter(torch.randn(1, latent_dim))
 
         self.norm_cond = nn.LayerNorm(latent_dim)
 
-        # input projection
-        self.input_projection = nn.Linear(nfeats, latent_dim)
-        self.cond_encoder = nn.Sequential()
+        # 【核心创新】：改变模型的输入投影层以接收联合条件输入
+        # 输入维度 = nfeats(去噪过程的随机动作) + nfeats(约束条件下的真实动作) + 1(指示哪些帧是约束条件的掩码)
+        expanded_input_dim = nfeats * 2 + 1
+        self.input_projection = nn.Linear(expanded_input_dim, latent_dim)
+        
+        self.cond_encoder = nn.ModuleList()
         for _ in range(2):
             self.cond_encoder.append(
                 TransformerEncoderLayer(
@@ -301,7 +319,7 @@ class DanceDecoder(nn.Module):
                     rotary=self.rotary,
                 )
             )
-        # conditional projection
+
         self.cond_projection = nn.Linear(cond_feature_dim, latent_dim)
         self.non_attn_cond_projection = nn.Sequential(
             nn.LayerNorm(latent_dim),
@@ -309,7 +327,20 @@ class DanceDecoder(nn.Module):
             nn.SiLU(),
             nn.Linear(latent_dim, latent_dim),
         )
-        # decoder
+
+        # Optional ControlNet-style trajectory branch.
+        self.trajectory_projection = nn.Sequential(
+            nn.Linear(2, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.trajectory_root_head = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.SiLU(),
+            nn.Linear(latent_dim // 2, 3),
+        )
+
         decoderstack = nn.ModuleList([])
         for _ in range(num_layers):
             decoderstack.append(
@@ -324,61 +355,201 @@ class DanceDecoder(nn.Module):
                 )
             )
 
-        self.seqTransDecoder = DecoderLayerStack(decoderstack)
-        
+        self.seqTransDecoder = DecoderLayerStack(
+            decoderstack, use_gradient_checkpointing=use_gradient_checkpointing
+        )
         self.final_layer = nn.Linear(latent_dim, output_feats)
 
-    def guided_forward(self, x, cond_embed, times, guidance_weight):
-        unc = self.forward(x, cond_embed, times, cond_drop_prob=1)
-        conditioned = self.forward(x, cond_embed, times, cond_drop_prob=0)
+    def _encode_condition_tokens(self, cond_tokens):
+        for layer in self.cond_encoder:
+            if self.use_gradient_checkpointing and self.training:
+                cond_tokens = torch_checkpoint(
+                    lambda x_, m=layer: m(x_),
+                    cond_tokens,
+                    use_reentrant=False,
+                )
+            else:
+                cond_tokens = layer(cond_tokens)
+        return cond_tokens
+
+    def _prepare_cond_inputs(self, cond_embed, batch_size, seq_len, device, dtype):
+        if isinstance(cond_embed, dict):
+            audio_cond = cond_embed.get("audio", None)
+            trajectory_cond = cond_embed.get("trajectory", None)
+        else:
+            audio_cond = cond_embed
+            trajectory_cond = None
+
+        if audio_cond is None:
+            audio_cond = torch.zeros(
+                (batch_size, seq_len, self.cond_feature_dim), device=device, dtype=dtype
+            )
+        else:
+            audio_cond = audio_cond.to(device=device, dtype=dtype)
+            if audio_cond.shape[-1] != self.cond_feature_dim:
+                raise ValueError(
+                    f"Expected audio feature dim {self.cond_feature_dim}, got {audio_cond.shape[-1]}"
+                )
+            if audio_cond.shape[1] != seq_len:
+                audio_cond = F.interpolate(
+                    audio_cond.transpose(1, 2),
+                    size=seq_len,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+
+        if trajectory_cond is not None:
+            trajectory_cond = trajectory_cond.to(device=device, dtype=dtype)
+            if trajectory_cond.shape[-1] > 2:
+                trajectory_cond = trajectory_cond[..., :2]
+            if trajectory_cond.shape[-1] != 2:
+                raise ValueError(
+                    f"Trajectory condition must have 2 channels (XY), got {trajectory_cond.shape[-1]}"
+                )
+            if trajectory_cond.shape[1] != seq_len:
+                trajectory_cond = F.interpolate(
+                    trajectory_cond.transpose(1, 2),
+                    size=seq_len,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+        return audio_cond, trajectory_cond
+
+    def _build_sparse_attn_mask(self, batch_size, seq_len, device, force_mask=None):
+        if (not self.use_sparse_attn) or self.sparse_attn_window <= 0:
+            return None
+
+        idx = torch.arange(seq_len, device=device)
+        base_mask = (idx[None, :] - idx[:, None]).abs() > self.sparse_attn_window
+        per_batch_mask = base_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
+
+        if force_mask is not None:
+            keyframe_mask = force_mask[..., 0] > 0.5
+            for batch_index in range(batch_size):
+                keyframes = keyframe_mask[batch_index]
+                if torch.any(keyframes):
+                    per_batch_mask[batch_index, :, keyframes] = False
+                    per_batch_mask[batch_index, keyframes, :] = False
+
+        return per_batch_mask.repeat_interleave(self.num_heads, dim=0)
+
+    def _resize_null_cond_embed(self, target_len):
+        null_cond_embed = self.null_cond_embed
+        if null_cond_embed.shape[1] == target_len:
+            return null_cond_embed
+        return F.interpolate(
+            null_cond_embed.transpose(1, 2),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+
+    def guided_forward(
+        self,
+        x,
+        cond_embed,
+        times,
+        guidance_weight,
+        force_mask=None,
+        force_x_clean=None,
+    ):
+        unc = self.forward(
+            x,
+            cond_embed,
+            times,
+            cond_drop_prob=1.0,
+            force_mask=force_mask,
+            force_x_clean=force_x_clean,
+        )
+        conditioned = self.forward(
+            x,
+            cond_embed,
+            times,
+            cond_drop_prob=0.0,
+            force_mask=force_mask,
+            force_x_clean=force_x_clean,
+        )
 
         return unc + (conditioned - unc) * guidance_weight
 
     def forward(
-        self, x: Tensor, cond_embed: Tensor, times: Tensor, cond_drop_prob: float = 0.0
+        self,
+        x: Tensor,
+        cond_embed: Any,
+        times: Tensor,
+        cond_drop_prob: float = 0.0,
+        force_mask: Optional[Tensor] = None,
+        force_x_clean: Optional[Tensor] = None,
     ):
-        batch_size, device = x.shape[0], x.device
+        batch_size, seq_len, _, device = *x.shape, x.device
 
-        # project to latent space
-        x = self.input_projection(x)
-        # add the positional embeddings of the input sequence to provide temporal information
+        if force_mask is None:
+            force_mask = torch.zeros(
+                (batch_size, seq_len, 1), device=device, dtype=x.dtype
+            )
+        if force_x_clean is None:
+            force_x_clean = torch.zeros_like(x)
+
+        # =========================================================================
+        # 【修复核心】：强制设备对齐与精度对齐
+        # 无论 force_mask 和 force_x_clean 是从外部（diffusion_loop）传进来的，
+        # 还是内部生成的，在进行数学计算前，强制拉到与动作序列 x 同一个 GPU 节点和混合精度上。
+        # =========================================================================
+        force_mask = force_mask.to(device=device, dtype=x.dtype)
+        force_x_clean = force_x_clean.to(device=device, dtype=x.dtype)
+
+        masked_x_clean = force_x_clean * force_mask
+        x_concat = torch.cat([x, masked_x_clean, force_mask], dim=-1)
+        
+        x = self.input_projection(x_concat)
         x = self.abs_pos_encoding(x)
 
-        # create music conditional embedding with conditional dropout
+        cond_embed, trajectory_cond = self._prepare_cond_inputs(
+            cond_embed, batch_size, seq_len, device, x.dtype
+        )
+        trajectory_tokens = None
+        if trajectory_cond is not None:
+            trajectory_tokens = self.trajectory_projection(trajectory_cond)
+            x = x + trajectory_tokens
+
         keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
         keep_mask_embed = rearrange(keep_mask, "b -> b 1 1")
         keep_mask_hidden = rearrange(keep_mask, "b -> b 1")
 
         cond_tokens = self.cond_projection(cond_embed)
-        # encode tokens
         cond_tokens = self.abs_pos_encoding(cond_tokens)
-        cond_tokens = self.cond_encoder(cond_tokens)
+        cond_tokens = self._encode_condition_tokens(cond_tokens)
 
-        null_cond_embed = self.null_cond_embed.to(cond_tokens.dtype)
+        null_cond_embed = self._resize_null_cond_embed(cond_tokens.shape[1]).to(
+            cond_tokens.dtype
+        )
         cond_tokens = torch.where(keep_mask_embed, cond_tokens, null_cond_embed)
 
         mean_pooled_cond_tokens = cond_tokens.mean(dim=-2)
         cond_hidden = self.non_attn_cond_projection(mean_pooled_cond_tokens)
 
-        # create the diffusion timestep embedding, add the extra music projection
         t_hidden = self.time_mlp(times)
 
-        # project to attention and FiLM conditioning
         t = self.to_time_cond(t_hidden)
         t_tokens = self.to_time_tokens(t_hidden)
 
-        # FiLM conditioning
         null_cond_hidden = self.null_cond_hidden.to(t.dtype)
         cond_hidden = torch.where(keep_mask_hidden, cond_hidden, null_cond_hidden)
         t += cond_hidden
 
-        # cross-attention conditioning
         c = torch.cat((cond_tokens, t_tokens), dim=-2)
         cond_tokens = self.norm_cond(c)
 
-        # Pass through the transformer decoder
-        # attending to the conditional embedding
-        output = self.seqTransDecoder(x, cond_tokens, t)
+        self_attn_mask = self._build_sparse_attn_mask(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            force_mask=force_mask,
+        )
+        output = self.seqTransDecoder(x, cond_tokens, t, tgt_mask=self_attn_mask)
 
         output = self.final_layer(output)
+        if trajectory_tokens is not None:
+            root_delta = self.trajectory_root_head(trajectory_tokens)
+            output = torch.cat((output[..., :3] + root_delta, output[..., 3:]), dim=-1)
         return output

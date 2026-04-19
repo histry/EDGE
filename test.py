@@ -5,7 +5,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import random
 
-import jukemirlib
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -14,6 +13,7 @@ from args import parse_test_opt
 from data.slice import slice_audio
 from EDGE import EDGE
 from data.audio_extraction.baseline_features import extract as baseline_extract
+from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
 from data.audio_extraction.jukebox_features import extract as juke_extract
 
 # sort filenames that look like songname_slice{number}.ext
@@ -38,7 +38,14 @@ stringintkey = cmp_to_key(stringintcmp_)
 
 
 def test(opt):
-    feature_func = juke_extract if opt.feature_type == "jukebox" else baseline_extract
+    feature_map = {
+        "jukebox": juke_extract,
+        "baseline": baseline_extract,
+        "hybrid": hybrid_extract,
+    }
+    if opt.feature_type not in feature_map:
+        raise ValueError(f"Unknown feature_type: {opt.feature_type}")
+    feature_func = feature_map[opt.feature_type]
     sample_length = opt.out_length
     sample_size = int(sample_length / 2.5) - 1
 
@@ -77,6 +84,13 @@ def test(opt):
             print(f"Slicing {wav_file}")
             slice_audio(wav_file, 2.5, 5.0, dirname)
             file_list = sorted(glob.glob(f"{dirname}/*.wav"), key=stringintkey)
+
+            # ======== 新增：长度保护机制 ========
+            if len(file_list) < sample_size:
+                print(f"⚠️ 警告: 测试音频不够长！自动缩短生成长度适应当前音频。")
+                sample_size = len(file_list)
+            # ===================================
+
             # randomly sample a chunk of length at most sample_size
             rand_idx = random.randint(0, len(file_list) - sample_size)
             cond_list = []
@@ -103,7 +117,15 @@ def test(opt):
             all_cond.append(cond_list)
             all_filenames.append(file_list[rand_idx : rand_idx + sample_size])
 
-    model = EDGE(opt.feature_type, opt.checkpoint)
+    # model = EDGE(opt.feature_type, opt.checkpoint, mixed_precision="no")
+    # ✅ 修复后的代码：强制透传 audio_dim 
+    model = EDGE(
+        opt.feature_type, 
+        opt.checkpoint, 
+        audio_dim=opt.audio_dim,  # 👈 确保 803 维能传进去
+        mixed_precision="no"
+    )
+    
     model.eval()
 
     # directory for optionally saving the dances for eval

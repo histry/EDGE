@@ -19,8 +19,19 @@ from vis import skeleton_render
 
 from .utils import extract, make_beta_schedule
 
+
 def identity(t, *args, **kwargs):
     return t
+
+
+def move_condition_to_device(cond, device):
+    if isinstance(cond, dict):
+        moved = {}
+        for key, value in cond.items():
+            moved[key] = value.to(device) if torch.is_tensor(value) else value
+        return moved
+    return cond.to(device)
+
 
 class EMA:
     def __init__(self, beta):
@@ -64,8 +75,6 @@ class GaussianDiffusion(nn.Module):
         self.master_model = copy.deepcopy(self.model)
 
         self.cond_drop_prob = cond_drop_prob
-
-        # make a SMPL instance for FK module
         self.smpl = smpl
 
         betas = torch.Tensor(
@@ -85,43 +94,21 @@ class GaussianDiffusion(nn.Module):
 
         self.guidance_weight = guidance_weight
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
-        self.register_buffer(
-            "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod)
-        )
-        self.register_buffer(
-            "log_one_minus_alphas_cumprod", torch.log(1.0 - alphas_cumprod)
-        )
-        self.register_buffer(
-            "sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod)
-        )
-        self.register_buffer(
-            "sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1)
-        )
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer("log_one_minus_alphas_cumprod", torch.log(1.0 - alphas_cumprod))
+        self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod))
+        self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = (
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
         self.register_buffer("posterior_variance", posterior_variance)
 
-        ## log calculation clipped because the posterior variance
-        ## is 0 at the beginning of the diffusion chain
-        self.register_buffer(
-            "posterior_log_variance_clipped",
-            torch.log(torch.clamp(posterior_variance, min=1e-20)),
-        )
-        self.register_buffer(
-            "posterior_mean_coef1",
-            betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod),
-        )
-        self.register_buffer(
-            "posterior_mean_coef2",
-            (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod),
-        )
+        self.register_buffer("posterior_log_variance_clipped", torch.log(torch.clamp(posterior_variance, min=1e-20)))
+        self.register_buffer("posterior_mean_coef1", betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
+        self.register_buffer("posterior_mean_coef2", (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod))
 
-        # p2 weighting
         self.p2_loss_weight_k = 1
         self.p2_loss_weight_gamma = 0.5 if use_p2 else 0
         self.register_buffer(
@@ -130,16 +117,9 @@ class GaussianDiffusion(nn.Module):
             ** -self.p2_loss_weight_gamma,
         )
 
-        ## get loss coefficients and initialize objective
         self.loss_fn = F.mse_loss if loss_type == "l2" else F.l1_loss
 
-    # ------------------------------------------ sampling ------------------------------------------#
-
     def predict_start_from_noise(self, x_t, t, noise):
-        """
-            if self.predict_epsilon, model output is (scaled) noise;
-            otherwise, model predicts x0 directly
-        """
         if self.predict_epsilon:
             return (
                 extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
@@ -147,18 +127,26 @@ class GaussianDiffusion(nn.Module):
             )
         else:
             return noise
-    
+
     def predict_noise_from_start(self, x_t, t, x0):
         return (
-            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
-    
-    def model_predictions(self, x, cond, t, weight=None, clip_x_start = False):
+
+    def model_predictions(self, x, cond, t, weight=None, clip_x_start=False, constraint=None):
         weight = weight if weight is not None else self.guidance_weight
-        model_output = self.model.guided_forward(x, cond, t, weight)
-        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
-        
+
+        force_mask, force_x_clean = None, None
+        if constraint is not None:
+            force_mask = constraint["mask"][:, :, :1]
+            force_x_clean = constraint["value"]
+
+        model_output = self.model.guided_forward(
+            x, cond, t, weight, force_mask=force_mask, force_x_clean=force_x_clean
+        )
+        maybe_clip = partial(torch.clamp, min=-1., max=1.) if clip_x_start else identity
+
         x_start = model_output
         x_start = maybe_clip(x_start)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
@@ -176,8 +164,7 @@ class GaussianDiffusion(nn.Module):
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, cond, t):
-        # guidance clipping
+    def p_mean_variance(self, x, cond, t, constraint=None):
         if t[0] > 1.0 * self.n_timestep:
             weight = min(self.guidance_weight, 0)
         elif t[0] < 0.1 * self.n_timestep:
@@ -185,8 +172,15 @@ class GaussianDiffusion(nn.Module):
         else:
             weight = self.guidance_weight
 
+        force_mask, force_x_clean = None, None
+        if constraint is not None:
+            force_mask = constraint["mask"][:, :, :1]
+            force_x_clean = constraint["value"]
+
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.model.guided_forward(x, cond, t, weight)
+            x, t=t, noise=self.model.guided_forward(
+                x, cond, t, weight, force_mask=force_mask, force_x_clean=force_x_clean
+            )
         )
 
         if self.clip_denoised:
@@ -200,13 +194,12 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_recon
 
     @torch.no_grad()
-    def p_sample(self, x, cond, t):
+    def p_sample(self, x, cond, t, constraint=None):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(
-            x=x, cond=cond, t=t
+            x=x, cond=cond, t=t, constraint=constraint
         )
         noise = torch.randn_like(model_mean)
-        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(
             b, *((1,) * (len(noise.shape) - 1))
         )
@@ -224,20 +217,17 @@ class GaussianDiffusion(nn.Module):
         start_point=None,
     ):
         device = self.betas.device
-
-        # default to diffusion over whole timescale
         start_point = self.n_timestep if start_point is None else start_point
         batch_size = shape[0]
         x = torch.randn(shape, device=device) if noise is None else noise.to(device)
-        cond = cond.to(device)
+        cond = move_condition_to_device(cond, device)
 
         if return_diffusion:
             diffusion = [x]
 
         for i in tqdm(reversed(range(0, start_point))):
-            # fill with i
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            x, _ = self.p_sample(x, cond, timesteps)
+            x, _ = self.p_sample(x, cond, timesteps, constraint=constraint)
 
             if return_diffusion:
                 diffusion.append(x)
@@ -246,23 +236,25 @@ class GaussianDiffusion(nn.Module):
             return x, diffusion
         else:
             return x
-        
+
     @torch.no_grad()
-    def ddim_sample(self, shape, cond, **kwargs):
+    def ddim_sample(self, shape, cond, constraint=None, **kwargs):
         batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 1
 
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
         times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        time_pairs = list(zip(times[:-1], times[1:]))
 
-        x = torch.randn(shape, device = device)
-        cond = cond.to(device)
+        x = torch.randn(shape, device=device)
+        cond = move_condition_to_device(cond, device)
 
         x_start = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(x, cond, time_cond, clip_x_start = self.clip_denoised)
+            pred_noise, x_start, *_ = self.model_predictions(
+                x, cond, time_cond, clip_x_start=self.clip_denoised, constraint=constraint
+            )
 
             if time_next < 0:
                 x = x_start
@@ -270,41 +262,40 @@ class GaussianDiffusion(nn.Module):
 
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
-
             sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
             noise = torch.randn_like(x)
 
-            x = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
         return x
-    
-    @torch.no_grad()
-    def long_ddim_sample(self, shape, cond, **kwargs):
-        batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 1
-        
-        if batch == 1:
-            return self.ddim_sample(shape, cond)
 
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+    @torch.no_grad()
+    def long_ddim_sample(self, shape, cond, constraint=None, **kwargs):
+        batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 1
+
+        if batch == 1:
+            return self.ddim_sample(shape, cond, constraint=constraint)
+
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
         times = list(reversed(times.int().tolist()))
         weights = np.clip(np.linspace(0, self.guidance_weight * 2, sampling_timesteps), None, self.guidance_weight)
-        time_pairs = list(zip(times[:-1], times[1:], weights)) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        time_pairs = list(zip(times[:-1], times[1:], weights))
 
-        x = torch.randn(shape, device = device)
-        cond = cond.to(device)
-        
+        x = torch.randn(shape, device=device)
+        cond = move_condition_to_device(cond, device)
+
         assert batch > 1
         assert x.shape[1] % 2 == 0
         half = x.shape[1] // 2
 
         x_start = None
 
-        for time, time_next, weight in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next, weight in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(x, cond, time_cond, weight=weight, clip_x_start = self.clip_denoised) 
+            pred_noise, x_start, *_ = self.model_predictions(
+                x, cond, time_cond, weight=weight, clip_x_start=self.clip_denoised, constraint=constraint
+            )
 
             if time_next < 0:
                 x = x_start
@@ -312,18 +303,14 @@ class GaussianDiffusion(nn.Module):
 
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
-
             sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
             noise = torch.randn_like(x)
 
-            x = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
-            
+            x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+
             if time > 0:
-                # the first half of each sequence is the second half of the previous one
                 x[1:, :half] = x[:-1, half:]
         return x
 
@@ -338,24 +325,21 @@ class GaussianDiffusion(nn.Module):
         start_point=None,
     ):
         device = self.betas.device
-
         batch_size = shape[0]
         x = torch.randn(shape, device=device) if noise is None else noise.to(device)
-        cond = cond.to(device)
+        cond = move_condition_to_device(cond, device)
         if return_diffusion:
             diffusion = [x]
 
-        mask = constraint["mask"].to(device)  # batch x horizon x channels
-        value = constraint["value"].to(device)  # batch x horizon x channels
+        mask = constraint["mask"].to(device)
+        value = constraint["value"].to(device)
 
         start_point = self.n_timestep if start_point is None else start_point
         for i in tqdm(reversed(range(0, start_point))):
-            # fill with i
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
 
-            # sample x from step i to step i-1
-            x, _ = self.p_sample(x, cond, timesteps)
-            # enforce constraint between each denoising step
+            x, _ = self.p_sample(x, cond, timesteps, constraint=constraint)
+
             value_ = self.q_sample(value, timesteps - 1) if (i > 0) else x
             x = value_ * mask + (1.0 - mask) * x
 
@@ -369,47 +353,38 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def long_inpaint_loop(
-        self,
-        shape,
-        cond,
-        noise=None,
-        constraint=None,
-        return_diffusion=False,
-        start_point=None,
+        self, shape, cond, noise=None, constraint=None, return_diffusion=False, start_point=None,
     ):
         device = self.betas.device
-
         batch_size = shape[0]
         x = torch.randn(shape, device=device) if noise is None else noise.to(device)
-        cond = cond.to(device)
+        cond = move_condition_to_device(cond, device)
         if return_diffusion:
             diffusion = [x]
 
         assert x.shape[1] % 2 == 0
         if batch_size == 1:
-            # there's no continuation to do, just do normal
-            return self.p_sample_loop(
-                shape,
-                cond,
-                noise=noise,
-                constraint=constraint,
-                return_diffusion=return_diffusion,
-                start_point=start_point,
+            return self.inpaint_loop(
+                shape, cond, noise=noise, constraint=constraint, return_diffusion=return_diffusion, start_point=start_point,
             )
         assert batch_size > 1
         half = x.shape[1] // 2
 
         start_point = self.n_timestep if start_point is None else start_point
+        mask = constraint["mask"].to(device) if constraint else None
+        value = constraint["value"].to(device) if constraint else None
+
         for i in tqdm(reversed(range(0, start_point))):
-            # fill with i
             timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
 
-            # sample x from step i to step i-1
-            x, _ = self.p_sample(x, cond, timesteps)
-            # enforce constraint between each denoising step
+            x, _ = self.p_sample(x, cond, timesteps, constraint=constraint)
+
+            if mask is not None and value is not None:
+                value_ = self.q_sample(value, timesteps - 1) if (i > 0) else x
+                x = value_ * mask + (1.0 - mask) * x
+
             if i > 0:
-                # the first half of each sequence is the second half of the previous one
-                x[1:, :half] = x[:-1, half:] 
+                x[1:, :half] = x[:-1, half:]
 
             if return_diffusion:
                 diffusion.append(x)
@@ -420,36 +395,50 @@ class GaussianDiffusion(nn.Module):
             return x
 
     @torch.no_grad()
-    def conditional_sample(
-        self, shape, cond, constraint=None, *args, horizon=None, **kwargs
-    ):
-        """
-            conditions : [ (time, state), ... ]
-        """
+    def conditional_sample(self, shape, cond, constraint=None, *args, horizon=None, **kwargs):
         device = self.betas.device
         horizon = horizon or self.horizon
-
-        return self.p_sample_loop(shape, cond, *args, **kwargs)
+        return self.p_sample_loop(shape, cond, constraint=constraint, *args, **kwargs)
 
     # ------------------------------------------ training ------------------------------------------#
 
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_start)
-
         sample = (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
-
         return sample
 
     def p_losses(self, x_start, cond, t):
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        # reconstruct
-        x_recon = self.model(x_noisy, cond, t, cond_drop_prob=self.cond_drop_prob)
+        b, s, c = x_start.shape
+        force_mask = torch.zeros((b, s, 1), device=x_start.device, dtype=x_start.dtype)
+
+        for i in range(b):
+            rand = torch.rand(1).item()
+            if rand < 0.3:
+                pass
+            elif rand < 0.6:
+                keep_len = torch.randint(1, max(2, s // 5), (1,)).item()
+                force_mask[i, :keep_len, 0] = 1.0
+                force_mask[i, -keep_len:, 0] = 1.0
+            else:
+                interval = torch.randint(10, 30, (1,)).item()
+                force_mask[i, ::interval, 0] = 1.0
+
+        x_recon = self.model(
+            x_noisy,
+            cond,
+            t,
+            cond_drop_prob=self.cond_drop_prob,
+            force_mask=force_mask,
+            force_x_clean=x_start
+        )
+
         assert noise.shape == x_recon.shape
 
         model_out = x_recon
@@ -458,66 +447,67 @@ class GaussianDiffusion(nn.Module):
         else:
             target = x_start
 
-        # full reconstruction loss
         loss = self.loss_fn(model_out, target, reduction="none")
         loss = reduce(loss, "b ... -> b (...)", "mean")
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
 
-        # split off contact from the rest
-        model_contact, model_out = torch.split(
-            model_out, (4, model_out.shape[2] - 4), dim=2
-        )
-        target_contact, target = torch.split(target, (4, target.shape[2] - 4), dim=2)
+        if model_out.shape[2] == 381:
+            target_v = target[:, 1:] - target[:, :-1]
+            model_out_v = model_out[:, 1:] - model_out[:, :-1]
+            v_loss = self.loss_fn(model_out_v, target_v, reduction="none")
+            v_loss = reduce(v_loss, "b ... -> b (...)", "mean")
+            v_loss = v_loss * extract(self.p2_loss_weight, t, v_loss.shape)
 
-        # velocity loss
-        target_v = target[:, 1:] - target[:, :-1]
-        model_out_v = model_out[:, 1:] - model_out[:, :-1]
-        v_loss = self.loss_fn(model_out_v, target_v, reduction="none")
-        v_loss = reduce(v_loss, "b ... -> b (...)", "mean")
-        v_loss = v_loss * extract(self.p2_loss_weight, t, v_loss.shape)
+            losses = (
+                1.0 * loss.mean(),
+                3.0 * v_loss.mean(),
+                0.0,
+                0.0
+            )
+            return sum(losses), losses
+        else:
+            model_contact, model_out = torch.split(model_out, (4, model_out.shape[2] - 4), dim=2)
+            target_contact, target = torch.split(target, (4, target.shape[2] - 4), dim=2)
 
-        # FK loss
-        b, s, c = model_out.shape
-        # unnormalize
-        # model_out = self.normalizer.unnormalize(model_out)
-        # target = self.normalizer.unnormalize(target)
-        # X, Q
-        model_x = model_out[:, :, :3]
-        model_q = ax_from_6v(model_out[:, :, 3:].reshape(b, s, -1, 6))
-        target_x = target[:, :, :3]
-        target_q = ax_from_6v(target[:, :, 3:].reshape(b, s, -1, 6))
+            target_v = target[:, 1:] - target[:, :-1]
+            model_out_v = model_out[:, 1:] - model_out[:, :-1]
+            v_loss = self.loss_fn(model_out_v, target_v, reduction="none")
+            v_loss = reduce(v_loss, "b ... -> b (...)", "mean")
+            v_loss = v_loss * extract(self.p2_loss_weight, t, v_loss.shape)
 
-        # perform FK
-        model_xp = self.smpl.forward(model_q, model_x)
-        target_xp = self.smpl.forward(target_q, target_x)
+            model_x = model_out[:, :, :3]
+            model_q = ax_from_6v(model_out[:, :, 3:].reshape(b, s, -1, 6))
+            target_x = target[:, :, :3]
+            target_q = ax_from_6v(target[:, :, 3:].reshape(b, s, -1, 6))
 
-        fk_loss = self.loss_fn(model_xp, target_xp, reduction="none")
-        fk_loss = reduce(fk_loss, "b ... -> b (...)", "mean")
-        fk_loss = fk_loss * extract(self.p2_loss_weight, t, fk_loss.shape)
+            model_xp = self.smpl.forward(model_q, model_x)
+            target_xp = self.smpl.forward(target_q, target_x)
 
-        # foot skate loss
-        foot_idx = [7, 8, 10, 11]
+            fk_loss = self.loss_fn(model_xp, target_xp, reduction="none")
+            fk_loss = reduce(fk_loss, "b ... -> b (...)", "mean")
+            fk_loss = fk_loss * extract(self.p2_loss_weight, t, fk_loss.shape)
 
-        # find static indices consistent with model's own predictions
-        static_idx = model_contact > 0.95  # N x S x 4
-        model_feet = model_xp[:, :, foot_idx]  # foot positions (N, S, 4, 3)
-        model_foot_v = torch.zeros_like(model_feet)
-        model_foot_v[:, :-1] = (
-            model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
-        )  # (N, S-1, 4, 3)
-        model_foot_v[~static_idx] = 0
-        foot_loss = self.loss_fn(
-            model_foot_v, torch.zeros_like(model_foot_v), reduction="none"
-        )
-        foot_loss = reduce(foot_loss, "b ... -> b (...)", "mean")
+            foot_idx = [7, 8, 10, 11]
+            static_idx = model_contact > 0.95
+            model_feet = model_xp[:, :, foot_idx]
+            model_foot_v = torch.zeros_like(model_feet)
+            model_foot_v[:, :-1] = (
+                model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
+            )
+            model_foot_v[~static_idx] = 0
+            foot_loss = self.loss_fn(
+                model_foot_v, torch.zeros_like(model_foot_v), reduction="none"
+            )
+            foot_loss = reduce(foot_loss, "b ... -> b (...)", "mean")
+            foot_loss = foot_loss * extract(self.p2_loss_weight, t, foot_loss.shape)
 
-        losses = (
-            0.636 * loss.mean(),
-            2.964 * v_loss.mean(),
-            0.646 * fk_loss.mean(),
-            10.942 * foot_loss.mean(),
-        )
-        return sum(losses), losses
+            losses = (
+                0.636 * loss.mean(),
+                2.964 * v_loss.mean(),
+                0.646 * fk_loss.mean(),
+                10.942 * foot_loss.mean(),
+            )
+            return sum(losses), losses
 
     def loss(self, x, cond, t_override=None):
         batch_size = len(x)
@@ -581,26 +571,39 @@ class GaussianDiffusion(nn.Module):
 
         samples = normalizer.unnormalize(samples)
 
+        # ==============================================================================
+        # 👇 保留上一次的修改：强制锁死全局位移 (Root Translation)，钉在画面中央
+        # ==============================================================================
+        if samples.shape[2] == 151:
+            samples[..., 4:7] = 0.0
+        # ==============================================================================
+
         if samples.shape[2] == 151:
             sample_contact, samples = torch.split(
                 samples, (4, samples.shape[2] - 4), dim=2
             )
         else:
             sample_contact = None
-        # do the FK all at once
+
+        target_device = self.betas.device
+        if isinstance(cond, dict):
+            for value in cond.values():
+                if torch.is_tensor(value):
+                    target_device = value.device
+                    break
+        elif torch.is_tensor(cond):
+            target_device = cond.device
+
         b, s, c = samples.shape
-        pos = samples[:, :, :3].to(cond.device)  # np.zeros((sample.shape[0], 3))
+        pos = samples[:, :, :3].to(target_device)
         q = samples[:, :, 3:].reshape(b, s, 24, 6)
-        # go 6d to ax
-        q = ax_from_6v(q).to(cond.device)
+        q = ax_from_6v(q).to(target_device)
 
         if mode == "long":
             b, s, c1, c2 = q.shape
             assert s % 2 == 0
             half = s // 2
             if b > 1:
-                # if long mode, stitch position using linear interp
-
                 fade_out = torch.ones((1, s, 1)).to(pos.device)
                 fade_in = torch.ones((1, s, 1)).to(pos.device)
                 fade_out[:, half:, :] = torch.linspace(1, 0, half)[None, :, None].to(
@@ -619,17 +622,14 @@ class GaussianDiffusion(nn.Module):
                     full_pos[idx : idx + s] += pos_slice
                     idx += half
 
-                # stitch joint angles with slerp
                 slerp_weight = torch.linspace(0, 1, half)[None, :, None].to(pos.device)
 
                 left, right = q[:-1, half:], q[1:, :half]
-                # convert to quat
                 left, right = (
                     axis_angle_to_quaternion(left),
                     axis_angle_to_quaternion(right),
                 )
-                merged = quat_slerp(left, right, slerp_weight)  # (b-1) x half x ...
-                # convert back
+                merged = quat_slerp(left, right, slerp_weight)
                 merged = quaternion_to_axis_angle(merged)
 
                 full_q = torch.zeros((s + half * (b - 1), c1, c2)).to(pos.device)
@@ -640,7 +640,6 @@ class GaussianDiffusion(nn.Module):
                     idx += half
                 full_q[idx : idx + half] += q[-1, half:]
 
-                # unsqueeze for fk
                 full_pos = full_pos.unsqueeze(0)
                 full_q = full_q.unsqueeze(0)
             else:
@@ -648,8 +647,8 @@ class GaussianDiffusion(nn.Module):
                 full_q = q
             full_pose = (
                 self.smpl.forward(full_q, full_pos).detach().cpu().numpy()
-            )  # b, s, 24, 3
-            # squeeze the batch dimension away and render
+            )
+            
             skeleton_render(
                 full_pose[0],
                 epoch=f"{epoch}",
@@ -674,6 +673,7 @@ class GaussianDiffusion(nn.Module):
             return
 
         poses = self.smpl.forward(q, pos).detach().cpu().numpy()
+
         sample_contact = (
             sample_contact.detach().cpu().numpy()
             if sample_contact is not None
@@ -701,7 +701,6 @@ class GaussianDiffusion(nn.Module):
                 path = os.path.normpath(filename)
                 pathparts = path.split(os.sep)
                 pathparts[-1] = pathparts[-1].replace("npy", "wav")
-                # path is like "data/train/features/name"
                 pathparts[2] = "wav_sliced"
                 audioname = os.path.join(*pathparts)
                 outname = f"{epoch}_{num}_{pathparts[-1][:-4]}.pkl"

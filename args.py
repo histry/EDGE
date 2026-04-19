@@ -5,7 +5,7 @@ def parse_train_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", default="runs/train", help="project/name")
     parser.add_argument("--exp_name", default="exp", help="save to project/name")
-    parser.add_argument("--data_path", type=str, default="data/", help="raw data path")
+    parser.add_argument("--data_path", type=str, default="data/dunhuang_bvh", help="path to processed dataset root")
     parser.add_argument(
         "--processed_data_dir",
         type=str,
@@ -16,12 +16,65 @@ def parse_train_opt():
         "--render_dir", type=str, default="renders/", help="Sample render path"
     )
 
-    parser.add_argument("--feature_type", type=str, default="jukebox")
+    # 修改点 1：将默认特征修改为 hybrid
+    parser.add_argument(
+        "--feature_type",
+        type=str,
+        default="hybrid",
+        choices=["hybrid", "baseline", "jukebox"],
+    )
+    # 修改点 2：增加音频特征维度参数，默认 803 (Wav2Vec2 + Librosa)
+    parser.add_argument("--audio_dim", type=int, default=803, help="Dimension of the audio feature")
+    
     parser.add_argument(
         "--wandb_pj_name", type=str, default="EDGE", help="project name"
     )
     parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument("--learning_rate", type=float, default=4e-4, help="optimizer learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.02, help="optimizer weight decay")
+    parser.add_argument("--seq_len", type=int, default=150, help="motion sequence length")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="bf16",
+        choices=["no", "fp16", "bf16"],
+        help="accelerate mixed precision mode",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="enable gradient checkpointing in transformer blocks",
+    )
+    parser.add_argument(
+        "--use_sparse_attn",
+        action="store_true",
+        help="enable local sparse attention mask in decoder self-attention",
+    )
+    parser.add_argument(
+        "--sparse_attn_window",
+        type=int,
+        default=24,
+        help="half-window size for sparse attention (frames)",
+    )
+    parser.add_argument(
+        "--cond_drop_prob",
+        type=float,
+        default=0.25,
+        help="classifier-free guidance drop probability during training",
+    )
+    parser.add_argument(
+        "--train_stage",
+        type=str,
+        default="full",
+        choices=["full", "stage1", "stage2"],
+        help="stage-wise training shortcut",
+    )
+    parser.add_argument(
+        "--use_traj_cond",
+        action="store_true",
+        help="enable trajectory condition branch (ControlNet-style root guidance)",
+    )
     parser.add_argument(
         "--force_reload", action="store_true", help="force reloads the datasets"
     )
@@ -44,7 +97,17 @@ def parse_train_opt():
 
 def parse_test_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--feature_type", type=str, default="jukebox")
+    
+    # 修改点 3：测试时也默认使用 hybrid 特征
+    parser.add_argument(
+        "--feature_type",
+        type=str,
+        default="hybrid",
+        choices=["hybrid", "baseline", "jukebox"],
+    )
+    # 修改点 4：测试时同步增加音频特征维度参数
+    parser.add_argument("--audio_dim", type=int, default=803, help="Dimension of the audio feature")
+    
     parser.add_argument("--out_length", type=float, default=30, help="max. length of output, in seconds")
     parser.add_argument(
         "--processed_data_dir",
@@ -76,7 +139,7 @@ def parse_test_opt():
     parser.add_argument(
         "--cache_features",
         action="store_true",
-        help="Save the jukebox features for later reuse",
+        help="Save the hybrid features for later reuse", # 修改帮助文档说明
     )
     parser.add_argument(
         "--no_render",
