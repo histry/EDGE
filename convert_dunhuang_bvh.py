@@ -139,19 +139,17 @@ def process_single_bvh(bvh_file, out_path):
     bvh_root_pos, bvh_joint_rotations, bvh_joint_orders, seq_len = load_bvh_data(bvh_file)
     
     # ==============================================================================
-    # 🎯 核心一：固化坐标系转换 (Bake Coordinate Alignment)
-    # 把之前在 dataset.py 里的黑魔法挪到这里！绕 X 轴旋转 90 度，使小人完美站立。
+    # 🎯 修复 1：物理单位与中心归位 (Center & Scale)
     # ==============================================================================
-    align_rot = R.from_euler('x', 90, degrees=True)
+    bvh_root_pos = bvh_root_pos * 0.01  # 厘米转米
     
-    # 1. 旋转全局位移 (Root Translation)
-    # ⚠️ 极其关键：从你给的 BVH offset 来看 (如 43.68)，数据单位大概率是【厘米(cm)】
-    # 而 AIST++ 的模型单位是【米(m)】！这里强制乘以 0.01 进行等比缩小。
-    bvh_root_pos = bvh_root_pos * 0.01
-    aligned_pos = align_rot.apply(bvh_root_pos)
+    # 【彻底修复】：把第一帧的 X, Y, Z 全部归零！
+    # 因为 SMPL 骨架的腿会自然向下延伸 -0.9 米，刚好能踩在 -1.0 的地板上！
+    bvh_root_pos -= bvh_root_pos[0]
+    aligned_pos = bvh_root_pos
     
     # ==============================================================================
-    # 🎯 核心二：重定向与 72 维 Axis-Angle 组装
+    # 🎯 修复 2：重定向与 72 维 Axis-Angle 组装
     # ==============================================================================
     q_72 = np.zeros((seq_len, 24 * 3)) # (seq_len, 72)
     
@@ -159,26 +157,23 @@ def process_single_bvh(bvh_file, out_path):
         bvh_joint = SMPL_TO_BVH_MAPPING[smpl_joint]
         
         if bvh_joint is None or bvh_joint not in bvh_joint_rotations:
-            continue # 没有对应关节则保持静止 0
+            continue # 没有对应关节则保持静止
             
         euler_angles = bvh_joint_rotations[bvh_joint]
-        order = bvh_joint_orders[bvh_joint] # 自动获取，比如 'yxz'
+        
+        # ⚠️ 致命修复：必须大写！大写代表 Intrinsic (内旋)
+        # 动捕数据全是内旋。之前的小写导致旋转矩阵被完全反向乘了一遍！
+        order = bvh_joint_orders[bvh_joint].upper() 
         
         # 将原生欧拉角转为 Scipy Rotation
         joint_rot = R.from_euler(order, euler_angles, degrees=True) 
-        
-        # 2. 根节点的旋转也要施加全局坐标系对齐 (站立校正)
-        if smpl_joint == "root":
-            joint_rot = align_rot * joint_rot
             
         # 转换为 SMPL 需要的 Axis-Angle (旋转向量)
         axis_angle = joint_rot.as_rotvec()
         
         q_72[:, i*3 : (i+1)*3] = axis_angle
 
-    # ==============================================================================
-    # 🎯 核心三：保存为 AIST++ 兼容的 381 维等效 .pkl 格式
-    # ==============================================================================
+    # 3. 保存为 AIST++ 兼容的 .pkl 格式
     out_data = {
         "pos": aligned_pos.astype(np.float32),
         "q": q_72.astype(np.float32)
@@ -189,13 +184,11 @@ def process_single_bvh(bvh_file, out_path):
         pickle.dump(out_data, f)
         
     print(f"✅ 转换成功！已保存为: {out_path}")
-    print(f"   维度检查 -> pos: {out_data['pos'].shape}, q: {out_data['q'].shape}")
-
-
+    
 if __name__ == "__main__":
     # 你需要把存放敦煌原始 bvh 文件的目录放在这里
-    raw_bvh_dir = "data/dunhuang_raw_bvh/"
-    processed_dir = "data/dunhuang/motions_sliced/"
+    raw_bvh_dir = "data/dunhuang_bvh/raw"
+    processed_dir = "data/dunhuang_bvh/processed/"
     
     os.makedirs(processed_dir, exist_ok=True)
     bvh_files = glob.glob(os.path.join(raw_bvh_dir, "*.bvh"))

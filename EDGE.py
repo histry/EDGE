@@ -212,14 +212,22 @@ class EDGE:
             )
         self.normalizer = train_dataset.normalizer
 
-        num_cpus = multiprocessing.cpu_count()
-        
-        # 训练数据加载器
+        # num_cpus = multiprocessing.cpu_count()
+        # # 训练数据加载器
+        # train_data_loader = DataLoader(
+        #     train_dataset,
+        #     batch_size=opt.batch_size,
+        #     shuffle=True,
+        #     num_workers=min(int(num_cpus * 0.75), 32),
+        #     pin_memory=True,
+        #     drop_last=False,
+        # )
+        # ✅ 请替换为更保守、更安全的值（比如固定为 4 或 8）：
         train_data_loader = DataLoader(
             train_dataset,
             batch_size=opt.batch_size,
             shuffle=True,
-            num_workers=min(int(num_cpus * 0.75), 32),
+            num_workers=8,  # 👈 强制锁死在 8，避免撑爆 /tmp
             pin_memory=True,
             drop_last=False,
         )

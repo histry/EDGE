@@ -8,7 +8,7 @@ from vis import SMPLSkeleton, skeleton_render
 # 1. 读取你刚刚洗好的敦煌 PKL 数据
 # ==========================================
 # ⚠️ 请把这里替换为你刚刚生成的敦煌 pkl 文件的路径
-pkl_path = "data/dunhuang/motions_sliced/test_dunhuang.pkl" 
+pkl_path = "data/dunhuang_bvh/processed/dyl_001_Take_000.pkl" 
 
 print(f"🔄 正在读取转换后的敦煌数据: {pkl_path}")
 with open(pkl_path, 'rb') as f:

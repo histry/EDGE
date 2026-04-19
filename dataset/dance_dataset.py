@@ -104,6 +104,55 @@ class AISTPPDataset(Dataset):
         cond = {"audio": feature}
         return pose, cond, filename_, self.data["wavs"][idx]
 
+    # def load_aistpp(self):
+    #     split_data_path = os.path.join(
+    #         self.data_path, "train" if self.train else "test"
+    #     )
+
+    #     motion_path = os.path.join(split_data_path, "motions_sliced")
+    #     sound_path = os.path.join(split_data_path, f"{self.feature_type}_feats")
+    #     wav_path = os.path.join(split_data_path, "wavs_sliced")
+        
+    #     motions = sorted(glob.glob(os.path.join(motion_path, "*.pkl")))
+    #     features = sorted(glob.glob(os.path.join(sound_path, "*.npy")))
+    #     wavs = sorted(glob.glob(os.path.join(wav_path, "*.wav")))
+
+    #     all_pos = []
+    #     all_q = []
+    #     all_names = []
+    #     all_wavs = []
+    #     assert len(motions) == len(features), f"Mismatch: {len(motions)} motions vs {len(features)} audio features."
+        
+    #     required_len = self.seq_len * self.data_stride
+
+    #     for motion, feature, wav in zip(motions, features, wavs):
+    #         m_name = os.path.splitext(os.path.basename(motion))[0]
+    #         f_name = os.path.splitext(os.path.basename(feature))[0]
+    #         w_name = os.path.splitext(os.path.basename(wav))[0]
+    #         assert m_name == f_name == w_name, str((motion, feature, wav))
+            
+    #         data = pickle.load(open(motion, "rb"))
+    #         pos = data["pos"]
+    #         q = data["q"]
+            
+    #         # 【修复一维对象数组异常】：丢弃长度不达标的残次切片，截断过长的切片
+    #         if pos.shape[0] < required_len:
+    #             continue
+
+    #         all_pos.append(pos[:required_len])
+    #         all_q.append(q[:required_len])
+    #         all_names.append(feature)
+    #         all_wavs.append(wav)
+
+    #     # 此时数据形状绝对整齐，np.array 不会坍塌为 1D object
+    #     all_pos = np.array(all_pos)  # N x required_len x 3
+    #     all_q = np.array(all_q)      # N x required_len x (joint * 3)
+        
+    #     all_pos = all_pos[:, :: self.data_stride, :]
+    #     all_q = all_q[:, :: self.data_stride, :]
+        
+    #     data = {"pos": all_pos, "q": all_q, "filenames": all_names, "wavs": all_wavs}
+    #     return data
     def load_aistpp(self):
         split_data_path = os.path.join(
             self.data_path, "train" if self.train else "test"
@@ -121,21 +170,28 @@ class AISTPPDataset(Dataset):
         all_q = []
         all_names = []
         all_wavs = []
-        assert len(motions) == len(features), f"Mismatch: {len(motions)} motions vs {len(features)} audio features."
         
+        # ==================== 👇 修复逻辑：安全取交集匹配 👇 ====================
+        motion_dict = {os.path.splitext(os.path.basename(m))[0]: m for m in motions}
+        feature_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in features}
+        wav_dict = {os.path.splitext(os.path.basename(w))[0]: w for w in wavs}
+
+        common_keys = sorted(list(set(motion_dict.keys()) & set(feature_dict.keys()) & set(wav_dict.keys())))
+        
+        print(f"🧩 正在取交集: 匹配到 {len(common_keys)} 个完整的音视频切片对 (动作库:{len(motions)} / 音频库:{len(features)})")
+
         required_len = self.seq_len * self.data_stride
 
-        for motion, feature, wav in zip(motions, features, wavs):
-            m_name = os.path.splitext(os.path.basename(motion))[0]
-            f_name = os.path.splitext(os.path.basename(feature))[0]
-            w_name = os.path.splitext(os.path.basename(wav))[0]
-            assert m_name == f_name == w_name, str((motion, feature, wav))
+        for key in common_keys:
+            motion = motion_dict[key]
+            feature = feature_dict[key]
+            wav = wav_dict[key]
             
             data = pickle.load(open(motion, "rb"))
             pos = data["pos"]
             q = data["q"]
             
-            # 【修复一维对象数组异常】：丢弃长度不达标的残次切片，截断过长的切片
+            # 丢弃长度不达标的残次切片，截断过长的切片
             if pos.shape[0] < required_len:
                 continue
 
@@ -143,6 +199,7 @@ class AISTPPDataset(Dataset):
             all_q.append(q[:required_len])
             all_names.append(feature)
             all_wavs.append(wav)
+        # =========================================================================
 
         # 此时数据形状绝对整齐，np.array 不会坍塌为 1D object
         all_pos = np.array(all_pos)  # N x required_len x 3
