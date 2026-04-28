@@ -5,7 +5,7 @@ def parse_train_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", default="runs/train", help="project/name")
     parser.add_argument("--exp_name", default="exp", help="save to project/name")
-    parser.add_argument("--data_path", type=str, default="data/dunhuang_bvh", help="path to processed dataset root")
+    parser.add_argument("--data_path", type=str, default="data/dunhuang_bvh/processed", help="path to processed dataset root")
     parser.add_argument(
         "--processed_data_dir",
         type=str,
@@ -64,17 +64,86 @@ def parse_train_opt():
         help="classifier-free guidance drop probability during training",
     )
     parser.add_argument(
+        "--mmr_loss_weight",
+        type=float,
+        default=0.5,
+        help="maximum MMR audio-motion alignment loss weight; set to 0 for unpaired music/motion data",
+    )
+    parser.add_argument(
+        "--keyframe_condition_prob",
+        type=float,
+        default=0.7,
+        help="probability of training with start/end keyframe inpainting conditions; set to 0 to disable",
+    )
+    parser.add_argument(
+        "--keyframe_condition_width",
+        type=int,
+        default=3,
+        help="number of start/end frames exposed as known keyframes during inpainting training",
+    )
+    parser.add_argument(
+        "--keyframe_loss_weight",
+        type=float,
+        default=2.0,
+        help="loss weight for matching generated motion on exposed keyframe frames",
+    )
+    parser.add_argument(
+        "--contact_loss_weight",
+        type=float,
+        default=0.8,
+        help="extra loss weight for physical 0/1 foot-contact channels; helps avoid all-contact saturation",
+    )
+    parser.add_argument(
+        "--foot_loss_weight",
+        type=float,
+        default=2.5,
+        help="physical foot sliding loss weight after warmup",
+    )
+    parser.add_argument(
+        "--sync_loss_weight",
+        type=float,
+        default=1.2,
+        help="root/leg kinematic sync loss weight after warmup",
+    )
+    parser.add_argument(
+        "--mid_keyframe_condition_prob",
+        type=float,
+        default=-1.0,
+        help="probability of exposing 1-2 middle keyframes during stage2; -1 means auto: 0.7 for stage2, 0 otherwise",
+    )
+    parser.add_argument(
+        "--mid_keyframe_count",
+        type=int,
+        default=2,
+        help="maximum number of middle keyframes to expose per sequence during stage2",
+    )
+    parser.add_argument(
+        "--mid_keyframe_condition_width",
+        type=int,
+        default=1,
+        help="number of frames exposed around each middle keyframe",
+    )
+    parser.add_argument(
+        "--mid_keyframe_selection",
+        type=str,
+        default="motion_peak",
+        choices=["motion_peak", "audio_onset", "mixed", "random"],
+        help="how to choose middle keyframes: motion peaks are safest for unpaired Dunhuang motion data",
+    )
+    parser.add_argument(
         "--train_stage",
         type=str,
         default="full",
         choices=["full", "stage1", "stage2"],
         help="stage-wise training shortcut",
     )
-    parser.add_argument(
-        "--use_traj_cond",
-        action="store_true",
-        help="enable trajectory condition branch (ControlNet-style root guidance)",
-    )
+    # 🧹 清理：目前网络已默认支持通过传入 Trajectory 字典键名实现动态分支控制
+    # 该开关已废弃，暂时注释掉避免与外部传参逻辑冲突
+    # parser.add_argument(
+    #     "--use_traj_cond",
+    #     action="store_true",
+    #     help="enable trajectory condition branch (ControlNet-style root guidance)",
+    # )
     parser.add_argument(
         "--force_reload", action="store_true", help="force reloads the datasets"
     )
@@ -84,8 +153,31 @@ def parse_train_opt():
     parser.add_argument(
         "--save_interval",
         type=int,
-        default=100,
+        default=10,
         help='Log model after every "save_period" epoch',
+    )
+    parser.add_argument(
+        "--val_batches",
+        type=int,
+        default=10,
+        help="number of validation batches to evaluate at each save interval",
+    )
+    parser.add_argument(
+        "--enable_ood_eval",
+        action="store_true",
+        help="run expensive out-of-distribution music evaluation after checkpoint saves",
+    )
+    parser.add_argument(
+        "--ood_music_dir",
+        type=str,
+        default="test_music_bank",
+        help="directory of OOD wav files used when --enable_ood_eval is set",
+    )
+    parser.add_argument(
+        "--ood_max_files",
+        type=int,
+        default=0,
+        help="limit the number of OOD wav files per evaluation; 0 means all files",
     )
     parser.add_argument("--ema_interval", type=int, default=1, help="ema every x steps")
     parser.add_argument(

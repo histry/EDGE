@@ -15,7 +15,6 @@ def _handle_zeros_in_scale(scale, copy=True, constant_mask=None):
     scale[constant_mask] = 1.0
     return scale
 
-
 class MinMaxScaler:
     _parameter_constraints: dict = {
         "feature_range": [tuple],
@@ -29,11 +28,6 @@ class MinMaxScaler:
         self.clip = clip
 
     def _reset(self):
-        """Reset internal data-dependent state of the scaler, if necessary.
-        __init__ parameters are not touched.
-        """
-        # Checking one attribute is enough, because they are all set together
-        # in partial_fit
         if hasattr(self, "scale_"):
             del self.scale_
             del self.min_
@@ -43,17 +37,13 @@ class MinMaxScaler:
             del self.data_range_
 
     def fit(self, X):
-        # Reset internal state before fitting
         self._reset()
         return self.partial_fit(X)
 
     def partial_fit(self, X):
         feature_range = self.feature_range
         if feature_range[0] >= feature_range[1]:
-            raise ValueError(
-                "Minimum of desired feature range must be smaller than maximum. Got %s."
-                % str(feature_range)
-            )
+            raise ValueError("Minimum of desired feature range must be smaller than maximum.")
 
         data_min = torch.min(X, axis=0)[0]
         data_max = torch.max(X, axis=0)[0]
@@ -61,9 +51,12 @@ class MinMaxScaler:
         self.n_samples_seen_ = X.shape[0]
 
         data_range = data_max - data_min
-        self.scale_ = (feature_range[1] - feature_range[0]) / _handle_zeros_in_scale(
-            data_range, copy=True
-        )
+        # 避免除以 0
+        zero_mask = data_range < 10 * torch.finfo(data_range.dtype).eps
+        data_range_safe = data_range.clone()
+        data_range_safe[zero_mask] = 1.0
+
+        self.scale_ = (feature_range[1] - feature_range[0]) / data_range_safe
         self.min_ = feature_range[0] - data_min * self.scale_
         self.data_min_ = data_min
         self.data_max_ = data_max
@@ -71,13 +64,15 @@ class MinMaxScaler:
         return self
 
     def transform(self, X):
-        X *= self.scale_.to(X.device)
-        X += self.min_.to(X.device)
+        # ⚠️ 修复：禁用 *= 和 += 原地操作，防止 TTO 梯度反传时报 RuntimeError
+        X = X * self.scale_.to(X.device)
+        X = X + self.min_.to(X.device)
         if self.clip:
-            torch.clip(X, self.feature_range[0], self.feature_range[1], out=X)
+            X = torch.clip(X, self.feature_range[0], self.feature_range[1])
         return X
 
     def inverse_transform(self, X):
-        X -= self.min_[-X.shape[1] :].to(X.device)
-        X /= self.scale_[-X.shape[1] :].to(X.device)
+        # ⚠️ 修复：移除错误的切片逻辑，直接依赖 PyTorch 最后一维原生广播机制
+        X = X - self.min_.to(X.device)
+        X = X / self.scale_.to(X.device)
         return X

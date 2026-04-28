@@ -93,15 +93,23 @@ def load_bvh_data(bvh_path):
             if rot_order:
                 joint_rot_orders[current_joint] = rot_order
 
+        data_fps = 30  # 移到 for 循环外部
+    raw_fps = 30   
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # ... (前面解析 ROOT/JOINT/CHANNELS 逻辑不变)
         elif line.startswith("MOTION"):
             is_motion = True
             continue
 
-        if is_motion:
+        if is_motion:  # 确保在 for 循环的正确缩进层级
             if line.startswith("Frames:"):
                 seq_len = int(line.split()[1])
             elif line.startswith("Frame Time:"):
-                pass  # FPS 信息暂时忽略
+                frame_time = float(line.split()[2])
+                raw_fps = int(round(1.0 / frame_time))
             else:
                 motion_lines.append([float(x) for x in line.split()])
 
@@ -123,15 +131,23 @@ def load_bvh_data(bvh_path):
         if bvh_name and bvh_name in joint_channels:
             start, end = joint_channels[bvh_name]
             
-            # 如果通道数是 6（通常是 Root，前3是位移，后3是旋转），切出后3个
             if end - start == 6:
                 rot_data = data[:, start+3:end]
             else:
                 rot_data = data[:, start:end]
                 
             bvh_joint_rotations[bvh_name] = rot_data
-            bvh_joint_orders[bvh_name] = joint_rot_orders.get(bvh_name, "zxy") # 默认给个 zxy 保底
+            bvh_joint_orders[bvh_name] = joint_rot_orders.get(bvh_name, "zxy") 
             
+    # 4. 在函数末尾 return 之前执行下采样逻辑
+    stride = max(1, raw_fps // data_fps)
+    if stride > 1:
+        print(f"📉 检测到原始帧率为 {raw_fps}FPS，自动下采样至 {data_fps}FPS (步长: {stride})")
+        bvh_root_pos = bvh_root_pos[::stride]
+        for k in bvh_joint_rotations:
+            bvh_joint_rotations[k] = bvh_joint_rotations[k][::stride]
+        seq_len = bvh_root_pos.shape[0]
+
     return bvh_root_pos, bvh_joint_rotations, bvh_joint_orders, seq_len
 
 
@@ -143,9 +159,11 @@ def process_single_bvh(bvh_file, out_path):
     # ==============================================================================
     bvh_root_pos = bvh_root_pos * 0.01  # 厘米转米
     
-    # 【彻底修复】：把第一帧的 X, Y, Z 全部归零！
-    # 因为 SMPL 骨架的腿会自然向下延伸 -0.9 米，刚好能踩在 -1.0 的地板上！
-    bvh_root_pos -= bvh_root_pos[0]
+    # 🌟 核心修复：仅归零第一帧的 X 和 Z 轴（水平位移），坚决保留真实的 Y 轴（离地高度）
+    offset = bvh_root_pos[0].copy()
+    offset[1] = 0.0  # 保护 Y 轴不被扣减
+    
+    bvh_root_pos -= offset
     aligned_pos = bvh_root_pos
     
     # ==============================================================================

@@ -1,4 +1,5 @@
 import os
+import shlex
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -103,7 +104,71 @@ def get_axrange(poses):
     return biggestdiff
 
 
-def plot_single_pose(num, poses, lines, ax, axrange, scat, contact):
+def audio_output_stem(name):
+    actual_name = name[0] if isinstance(name, (list, tuple)) else name
+    base_name = os.path.splitext(os.path.basename(str(actual_name)))[0]
+    if not base_name:
+        return "sample"
+
+    parts = base_name.split("_")
+    if len(parts) > 1 and parts[-1].startswith("slice"):
+        return "_".join(parts[:-1]) or base_name
+    return base_name
+
+
+def smooth_sequence(sequence, window=5):
+    if window <= 1 or len(sequence) < 3:
+        return sequence
+
+    window = min(window, len(sequence))
+    if window % 2 == 0:
+        window = max(1, window - 1)
+    if window <= 1:
+        return sequence
+
+    pad = window // 2
+    kernel = np.ones(window, dtype=np.float32) / window
+
+    original_shape = sequence.shape
+    flattened = sequence.reshape(sequence.shape[0], -1)
+    padded = np.pad(flattened, ((pad, pad), (0, 0)), mode="edge")
+
+    smoothed = np.empty_like(flattened, dtype=np.float32)
+    for i in range(flattened.shape[1]):
+        smoothed[:, i] = np.convolve(padded[:, i], kernel, mode="valid")
+
+    return smoothed.reshape(original_shape).astype(sequence.dtype, copy=False)
+
+
+def compute_camera_track(vis_poses, mode="follow"):
+    mode = (mode or "follow").lower()
+    # 用根节点(骨盆)作为跟拍中心，比包围盒中心更稳定，不会因为甩手/抬腿把人“挤”到坐标盒边缘。
+    root_centers = vis_poses[:, 0, :2]
+    if mode == "fixed":
+        xy = vis_poses[:, :, :2].reshape(-1, 2)
+        xy_min = np.percentile(xy, 1, axis=0)
+        xy_max = np.percentile(xy, 99, axis=0)
+        xy_min = np.minimum(xy_min, root_centers.min(axis=0))
+        xy_max = np.maximum(xy_max, root_centers.max(axis=0))
+
+        center = ((xy_min + xy_max) * 0.5).astype(vis_poses.dtype, copy=False)
+        half_span = float(np.max((xy_max - xy_min) * 0.5))
+        camera_radius = float(np.clip(half_span * 1.15 + 0.25, 1.35, 20.0))
+        frame_centers = np.repeat(center[None, :], vis_poses.shape[0], axis=0)
+    else:
+        frame_centers = smooth_sequence(root_centers, window=31)
+
+        horizontal_offsets = np.abs(vis_poses[:, :, :2] - frame_centers[:, None, :])
+        frame_half_span = horizontal_offsets.max(axis=1).max(axis=1)
+        body_radius = float(np.percentile(frame_half_span, 98) * 1.2 + 0.15)
+        camera_radius = float(np.clip(body_radius, 1.35, 2.6))
+
+    z_min = float(min(-0.2, np.percentile(vis_poses[:, :, 2], 1) - 0.1))
+    z_max = float(max(2.2, np.percentile(vis_poses[:, :, 2], 99) + 0.2))
+    return frame_centers, camera_radius, (z_min, z_max)
+
+
+def plot_single_pose(num, poses, lines, ax, camera_centers, camera_radius, z_limits, scat, contact):
     pose = poses[num]
     static = contact[num]
     indices = [7, 8, 10, 11]
@@ -119,22 +184,10 @@ def plot_single_pose(num, poses, lines, ax, axrange, scat, contact):
         data = np.stack((pose[i], pose[p]), axis=0)
         set_line_data_3d(line, data)
 
-    if num == 0:
-        if isinstance(axrange, int):
-            axrange = (axrange, axrange, axrange)
-        # ==========================================
-        # 👇 修改点 1：将摄像机对准原点 (0, 0, 0)
-        # ==========================================
-        xcenter, ycenter, zcenter = 0, 0, 0
-        stepx, stepy, stepz = axrange[0] / 2, axrange[1] / 2, axrange[2] / 2
-
-        x_min, x_max = xcenter - stepx, xcenter + stepx
-        y_min, y_max = ycenter - stepy, ycenter + stepy
-        z_min, z_max = zcenter - stepz, zcenter + stepz
-
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_zlim(z_min, z_max)
+    xcenter, ycenter = camera_centers[num]
+    ax.set_xlim(xcenter - camera_radius, xcenter + camera_radius)
+    ax.set_ylim(ycenter - camera_radius, ycenter + camera_radius)
+    ax.set_zlim(*z_limits)
 
 
 def skeleton_render(
@@ -146,28 +199,25 @@ def skeleton_render(
     stitch=False,
     sound_folder="ood_sliced",
     contact=None,
-    render=True
+    render=True,
+    camera_mode="follow",
+    output_path=None,
 ):
     if render:
         Path(out).mkdir(parents=True, exist_ok=True)
         num_steps = poses.shape[0]
-        
-        fig = plt.figure()
+
+        fig = plt.figure(figsize=(6.5, 6.5), dpi=140)
         ax = fig.add_subplot(projection="3d")
-        
-        # ==========================================
-        # 👇 修改点 2：将地板降至 Z = -1.0 (脚底位置)
-        # ==========================================
-        point = np.array([0, 0, -1.0])
-        normal = np.array([0, 0, 1])
-        d = -point.dot(normal)
-        xx, yy = np.meshgrid(np.linspace(-1.5, 1.5, 2), np.linspace(-1.5, 1.5, 2))
-        z = (-normal[0] * xx - normal[1] * yy - d) * 1.0 / normal[2]
-        ax.plot_surface(xx, yy, z, zorder=-11, cmap=cm.twilight)
-        
-        # ==========================================
-        # 👇 修改点 3：设置 45 度绝佳观赏视角
-        # ==========================================
+        if hasattr(ax, "set_proj_type"):
+            ax.set_proj_type("ortho")
+
+        # 定义地板平面：由于 vis_poses 中 Y 和 Z 已交换，地面位于 z=0
+        grid_size = 50.0
+        xx, yy = np.meshgrid(np.linspace(-grid_size, grid_size, 2), np.linspace(-grid_size, grid_size, 2))
+        z_plane = np.zeros_like(xx)
+        ax.plot_surface(xx, yy, z_plane, zorder=-11, cmap=cm.twilight, alpha=0.2)
+
         ax.view_init(elev=20, azim=45)
 
         lines = [
@@ -178,7 +228,6 @@ def skeleton_render(
             ax.scatter([], [], [], zorder=10, s=0, cmap=ListedColormap(["r", "g", "b"]))
             for _ in range(4)
         ]
-        axrange = 3
 
         feet = poses[:, (7, 8, 10, 11)]
         feetv = np.zeros(feet.shape[:2])
@@ -188,29 +237,40 @@ def skeleton_render(
         else:
             contact = contact > 0.95
 
-        # ==========================================
-        # 👇 修改点 4：创建副本进行 Y-Up 到 Z-Up 旋转，绝不污染原始 pkl 数据！
-        # ==========================================
-        vis_poses = poses.copy()
-        vis_poses[:, :, 1] = -poses[:, :, 2]  # Depth
-        vis_poses[:, :, 2] = poses[:, :, 1]   # Height
+        # 对渲染序列做轻量时域平滑，改善观感上的抖动和僵硬感。
+        render_poses = smooth_sequence(poses.copy(), window=9)
+
+        vis_poses = render_poses.copy()
+        vis_poses[:, :, 1] = -render_poses[:, :, 2]  # Depth
+        vis_poses[:, :, 2] = render_poses[:, :, 1]   # Height
+
+        camera_centers, camera_radius, z_limits = compute_camera_track(vis_poses, mode=camera_mode)
+        ax.set_box_aspect((2.0 * camera_radius, 2.0 * camera_radius, z_limits[1] - z_limits[0]))
 
         anim = animation.FuncAnimation(
             fig,
             plot_single_pose,
             num_steps,
-            fargs=(vis_poses, lines, ax, axrange, scat, contact),
+            fargs=(vis_poses, lines, ax, camera_centers, camera_radius, z_limits, scat, contact),
             interval=1000 // 30,
         )
-        
+
     if sound:
         if render:
-            temp_dir = TemporaryDirectory()
-            gifname = os.path.join(temp_dir.name, f"{epoch}.gif")
-            anim.save(gifname)
+            Path(out).mkdir(parents=True, exist_ok=True)
+            temp_dir = TemporaryDirectory(dir=out)
+            videoname = os.path.join(temp_dir.name, f"{epoch}.mp4")
+            writer = animation.FFMpegWriter(
+                fps=30,
+                bitrate=4000,
+                codec="libx264",
+                extra_args=["-pix_fmt", "yuv420p"],
+            )
+            anim.save(videoname, writer=writer)
 
         if stitch:
-            assert type(name) == list
+            assert isinstance(name, (list, tuple)), "For stitching, name must be a list or tuple"
+            output_stem = audio_output_stem(name)
             name_ = [os.path.splitext(x)[0] + ".wav" for x in name]
             audio, sr = lr.load(name_[0], sr=None)
             ll, half = len(audio), len(audio) // 2
@@ -221,29 +281,37 @@ def skeleton_render(
                 audio, sr = lr.load(n_, sr=None)
                 total_wav[idx : idx + half] = audio[half:]
                 idx += half
-            audioname = f"{temp_dir.name}/tempsound.wav" if render else os.path.join(out, f'{epoch}_{"_".join(os.path.splitext(os.path.basename(name[0]))[0].split("_")[:-1])}.wav')
+            audioname = f"{temp_dir.name}/tempsound.wav" if render else os.path.join(out, f"{epoch}_{output_stem}.wav")
             sf.write(audioname, total_wav, sr)
-            outname = os.path.join(
+            outname = output_path or os.path.join(
                 out,
-                f'{epoch}_{"_".join(os.path.splitext(os.path.basename(name[0]))[0].split("_")[:-1])}.mp4',
+                f"{epoch}_{output_stem}.mp4",
             )
         else:
-            assert type(name) == str
-            assert name != "", "Must provide an audio filename"
-            audioname = name
-            outname = os.path.join(
-                out, f"{epoch}_{os.path.splitext(os.path.basename(name))[0]}.mp4"
+            actual_name = name[0] if isinstance(name, (list, tuple)) else name
+            assert isinstance(actual_name, str) and actual_name != "", "Must provide an audio filename"
+            audioname = actual_name
+            outname = output_path or os.path.join(
+                out, f"{epoch}_{os.path.splitext(os.path.basename(actual_name))[0]}.mp4"
             )
+
         if render:
-            out = os.system(
-                f"ffmpeg -loglevel error -stream_loop 0 -y -i {gifname} -i {audioname} -shortest -c:v libx264 -crf 26 -c:a aac -q:a 4 {outname}"
+            Path(os.path.dirname(outname) or ".").mkdir(parents=True, exist_ok=True)
+            out_cmd = os.system(
+                "ffmpeg -loglevel error -y "
+                f"-i {shlex.quote(videoname)} "
+                f"-i {shlex.quote(audioname)} "
+                f"-shortest -c:v copy -c:a aac -q:a 4 {shlex.quote(outname)}"
             )
     else:
         if render:
-            path = os.path.normpath(name)
+            actual_name = name[0] if isinstance(name, (list, tuple)) else name
+            path = os.path.normpath(str(actual_name))
             pathparts = path.split(os.sep)
-            gifname = os.path.join(out, f"{pathparts[-1][:-4]}.gif")
-            anim.save(gifname, savefig_kwargs={"transparent": True, "facecolor": "none"},)
+            base_name = pathparts[-1].replace(".npy", "").replace(".wav", "").replace(".pkl", "")
+            gifname = os.path.join(out, f"{base_name}.gif")
+            anim.save(gifname, savefig_kwargs={"transparent": True, "facecolor": "none"})
+
     plt.close()
 
 

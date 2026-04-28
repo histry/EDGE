@@ -8,17 +8,17 @@ import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.state import AcceleratorState
-from torch.utils.data import DataLoader
+# ✨ 引入 random_split 用于划分验证集
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from dataset.dance_dataset import AISTPPDataset  # 改用我们修复好参数映射和维度的 AISTPP
-
+from dataset.dance_dataset import AISTPPDataset, DunhuangDataset
 from dataset.preprocess import increment_path
 from model.adan import Adan
 from model.diffusion import GaussianDiffusion
 from model.model import DanceDecoder
+from model.mmr_model import CrossModalMMR
 from vis import SMPLSkeleton
-
 
 def move_condition_to_device(cond, device):
     if isinstance(cond, dict):
@@ -28,7 +28,6 @@ def move_condition_to_device(cond, device):
         return moved
     return cond.to(device)
 
-
 def slice_condition(cond, count):
     if isinstance(cond, dict):
         sliced = {}
@@ -37,16 +36,36 @@ def slice_condition(cond, count):
         return sliced
     return cond[:count]
 
-
 def wrap(x):
     return {f"module.{key}": value for key, value in x.items()}
-
 
 def maybe_wrap(x, num):
     return x if num == 1 else wrap(x)
 
-
 class EDGE:
+    @staticmethod
+    def _extract_state_dict_for_load(checkpoint):
+        if isinstance(checkpoint, dict):
+            for key in ("model_state_dict", "state_dict"):
+                value = checkpoint.get(key)
+                if isinstance(value, dict):
+                    return value, key
+            if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+                return checkpoint, "plain_state_dict"
+        raise ValueError("checkpoint 既不是 plain state_dict，也不是包含 model_state_dict/state_dict 的 wrapped checkpoint。")
+
+    @staticmethod
+    def _normalize_state_dict_prefix(state_dict, reference_state_dict):
+        if set(state_dict.keys()) == set(reference_state_dict.keys()):
+            return state_dict, "unchanged"
+
+        if state_dict and all(key.startswith("module.") for key in state_dict.keys()):
+            stripped = {key[len("module."):]: value for key, value in state_dict.items()}
+            if set(stripped.keys()) == set(reference_state_dict.keys()):
+                return stripped, "stripped_module_prefix"
+
+        return state_dict, "unchanged"
+
     def __init__(
         self,
         feature_type,
@@ -62,6 +81,17 @@ class EDGE:
         use_sparse_attn=False,
         sparse_attn_window=24,
         cond_drop_prob=0.25,
+        mmr_loss_weight=0.5,
+        keyframe_condition_prob=0.7,
+        keyframe_condition_width=3,
+        keyframe_loss_weight=2.0,
+        contact_loss_weight=0.8,
+        foot_loss_weight=2.5,
+        sync_loss_weight=1.2,
+        mid_keyframe_condition_prob=-1.0,
+        mid_keyframe_count=2,
+        mid_keyframe_condition_width=1,
+        mid_keyframe_selection="motion_peak",
         train_stage="full",
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -78,6 +108,9 @@ class EDGE:
         self.horizon = horizon = seq_len
         self.train_stage = train_stage
 
+        if mid_keyframe_condition_prob < 0:
+            mid_keyframe_condition_prob = 0.7 if train_stage == "stage2" else 0.0
+
         self.accelerator.wait_for_everyone()
 
         self.normalizer = normalizer
@@ -88,7 +121,19 @@ class EDGE:
                 map_location=self.accelerator.device,
                 weights_only=False
             )
-            self.normalizer = checkpoint["normalizer"]
+            if "normalizer" in checkpoint:
+                norm_data = checkpoint["normalizer"]
+                if isinstance(norm_data, dict) and "mean" in norm_data:
+                    from dataset.preprocess import Normalizer
+                    import numpy as np
+                    dummy = torch.zeros((1, 1, 151))
+                    self.normalizer = Normalizer(dummy)
+                    self.normalizer.mean = np.array(norm_data["mean"])
+                    self.normalizer.std = np.array(norm_data["std"])
+                else:
+                    self.normalizer = norm_data
+            else:
+                self.normalizer = None
 
         model = DanceDecoder(
             nfeats=repr_dim,
@@ -108,6 +153,37 @@ class EDGE:
         self._apply_stage_freezing(model, train_stage)
 
         smpl = SMPLSkeleton(self.accelerator.device)
+        
+        self.mmr_model = None
+        mmr_ckpt_path = "weights/mmr_pretrained.pt"
+        if mmr_loss_weight <= 0:
+            print("⏭️ MMR 跨模态损失权重为 0：已关闭音频-动作对齐监督，适合未配对音乐/动作数据。")
+        else:
+            self.mmr_model = CrossModalMMR(motion_dim=151, audio_dim=803, latent_dim=256).to(self.accelerator.device)
+            if os.path.exists(mmr_ckpt_path):
+                try:
+                    mmr_checkpoint = torch.load(mmr_ckpt_path, map_location=self.accelerator.device)
+                    mmr_state_dict, mmr_format = self._extract_state_dict_for_load(mmr_checkpoint)
+                    mmr_state_dict, prefix_action = self._normalize_state_dict_prefix(
+                        mmr_state_dict, self.mmr_model.state_dict()
+                    )
+                    self.mmr_model.load_state_dict(mmr_state_dict, strict=True)
+
+                    prefix_msg = "" if prefix_action == "unchanged" else "，并已自动去除 module. 前缀"
+                    print(
+                        f"✅ 成功激活 MMR 跨模态引导：已加载预训练权重 {mmr_ckpt_path} "
+                        f"(格式: {mmr_format}{prefix_msg})"
+                    )
+                except Exception as exc:
+                    print(
+                        f"⚠️ 警告：检测到 MMR 权重文件 {mmr_ckpt_path}，"
+                        f"但加载失败（{exc}）。本次训练将临时禁用 MMR 引导。"
+                    )
+                    self.mmr_model = None
+            else:
+                print("⚠️ 警告：未找到 MMR 预训练权重！为防止随机梯度导致扩散模型坍缩，本次训练临时禁用 MMR 引导。")
+                self.mmr_model = None
+        
         diffusion = GaussianDiffusion(
             model,
             horizon,
@@ -120,13 +196,40 @@ class EDGE:
             use_p2=False,
             cond_drop_prob=cond_drop_prob,
             guidance_weight=2,
+            clip_denoised=False,
+            mmr_model=self.mmr_model,
+            mmr_loss_weight=mmr_loss_weight,
+            keyframe_condition_prob=keyframe_condition_prob,
+            keyframe_condition_width=keyframe_condition_width,
+            keyframe_loss_weight=keyframe_loss_weight,
+            contact_loss_weight=contact_loss_weight,
+            foot_loss_weight=foot_loss_weight,
+            sync_loss_weight=sync_loss_weight,
+            mid_keyframe_condition_prob=mid_keyframe_condition_prob,
+            mid_keyframe_count=mid_keyframe_count,
+            mid_keyframe_condition_width=mid_keyframe_condition_width,
+            mid_keyframe_selection=mid_keyframe_selection,
+            data_fps=30
         )
-        if train_stage == "stage1":
-            diffusion.cond_drop_prob = 1.0
+        
+        diffusion.normalizer = self.normalizer
+        
+        if train_stage in ["stage1", "stage2"]:
+            diffusion.cond_drop_prob = 0.0
+            diffusion.force_audio_only_drop = True
+        else:
+            diffusion.force_audio_only_drop = False
 
-        print(
-            "Model has {} parameters".format(sum(y.numel() for y in model.parameters()))
-        )
+        if train_stage == "stage2":
+            print(
+                "🎯 第二阶段多关键帧训练已配置: "
+                f"middle_prob={mid_keyframe_condition_prob}, "
+                f"max_middle={mid_keyframe_count}, "
+                f"width={mid_keyframe_condition_width}, "
+                f"selection={mid_keyframe_selection}"
+            )
+
+        print(f"Model has {sum(y.numel() for y in model.parameters())} parameters")
 
         self.model = self.accelerator.prepare(model)
         self.diffusion = diffusion.to(self.accelerator.device)
@@ -137,12 +240,26 @@ class EDGE:
         self.optim = self.accelerator.prepare(optim)
 
         if checkpoint_path != "":
-            self.model.load_state_dict(
-                maybe_wrap(
-                    checkpoint["ema_state_dict" if EMA else "model_state_dict"],
-                    num_processes,
-                )
+            if EMA and "ema_state_dict" in checkpoint:
+                state_dict = checkpoint["ema_state_dict"]
+            else:
+                state_dict = checkpoint.get("model_state_dict")
+            if state_dict is None:
+                raise ValueError(f"❌ 权重文件 {checkpoint_path} 中既没有 ema_state_dict 也没有 model_state_dict！")
+            
+            wrapped_state_dict = maybe_wrap(state_dict, num_processes)
+            current_state_dict = self.model.state_dict()
+            for key in list(wrapped_state_dict.keys()):
+                if key in current_state_dict and wrapped_state_dict[key].shape != current_state_dict[key].shape:
+                    print(f"⚠️ 维度升级拦截: 参数 {key} 形状从 {wrapped_state_dict[key].shape} 变为 {current_state_dict[key].shape}，将重新初始化。")
+                    del wrapped_state_dict[key]
+
+            missing_keys, unexpected_keys = self.model.load_state_dict(
+                wrapped_state_dict,
+                strict=False
             )
+            if self.accelerator.is_main_process and missing_keys:
+                print(f"⚠️ 注意：由于引入了新架构，以下参数将从头开始随机初始化: {missing_keys}")
 
     @staticmethod
     def _set_requires_grad(module, enabled):
@@ -157,22 +274,88 @@ class EDGE:
             self._set_requires_grad(model.cond_encoder, False)
             self._set_requires_grad(model.non_attn_cond_projection, False)
             if hasattr(model, "trajectory_projection"):
-                self._set_requires_grad(model.trajectory_projection, False)
-            if hasattr(model, "trajectory_root_head"):
-                self._set_requires_grad(model.trajectory_root_head, False)
+                self._set_requires_grad(model.trajectory_projection, True)
+            # if hasattr(model, "trajectory_root_head"):
+            #     self._set_requires_grad(model.trajectory_root_head, True)
             return
         if train_stage == "stage2":
             self._set_requires_grad(model, False)
-            self._set_requires_grad(model.cond_projection, True)
-            self._set_requires_grad(model.cond_encoder, True)
-            self._set_requires_grad(model.non_attn_cond_projection, True)
+            self._set_requires_grad(model.input_projection, True)
+            self._set_requires_grad(model.seqTransDecoder, True)
+            self._set_requires_grad(model.final_layer, True)
             if hasattr(model, "trajectory_projection"):
                 self._set_requires_grad(model.trajectory_projection, True)
-            if hasattr(model, "trajectory_root_head"):
-                self._set_requires_grad(model.trajectory_root_head, True)
+            if hasattr(model, "traj_modulate"):
+                self._set_requires_grad(model.traj_modulate, True)
             return
         raise ValueError(f"Unknown train_stage: {train_stage}")
 
+    @staticmethod
+    def _loss_keys():
+        return [
+            "Recon Loss",
+            "Velocity Loss",
+            "Contact Loss",
+            "FK Loss",
+            "Foot Loss",
+            "Anti-Freeze Loss",
+            "MMR Loss",
+            "Trajectory Loss",
+            "Keyframe Loss",
+            "Kinematic Sync Loss",
+            "Biomech Loss",
+            "Root Turn Loss",
+            "Contact Turn Loss",
+            "Body Stability Loss",
+            "Motion Energy Loss",
+        ]
+
+    def _run_validation(self, data_loader, epoch, max_batches=10):
+        if max_batches <= 0:
+            return None
+
+        self.eval()
+        totals = None
+        counted_batches = 0
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(data_loader):
+                if batch_idx >= max_batches:
+                    break
+
+                x, cond, _, _ = batch
+                x = x.to(self.accelerator.device)
+                cond = move_condition_to_device(cond, self.accelerator.device)
+
+                val_loss, val_losses = self.diffusion(x, cond, current_epoch=epoch)
+
+                metric_tensors = [val_loss.detach()]
+                for item in val_losses:
+                    if torch.is_tensor(item):
+                        metric_tensors.append(item.detach())
+                    else:
+                        metric_tensors.append(
+                            torch.tensor(float(item), device=self.accelerator.device)
+                        )
+
+                stacked = torch.stack(
+                    [metric.float().mean() for metric in metric_tensors], dim=0
+                )
+                gathered = self.accelerator.gather_for_metrics(stacked.unsqueeze(0))
+                batch_metrics = gathered.mean(dim=0)
+
+                totals = batch_metrics if totals is None else totals + batch_metrics
+                counted_batches += 1
+
+        if counted_batches == 0 or totals is None:
+            return None
+
+        averages = totals / counted_batches
+        metrics = {"Val Loss": averages[0].item()}
+        for key, value in zip(self._loss_keys(), averages[1:]):
+            metrics[f"Val {key}"] = value.item()
+        return metrics
+        
     def eval(self):
         self.diffusion.eval()
 
@@ -183,193 +366,326 @@ class EDGE:
         return self.accelerator.prepare(*objects)
 
     def train_loop(self, opt):
-        print("Loading Official AIST++ dataset (with FK & 6D rotations)...")
+        data_path = opt.data_path
+        is_dunhuang = "dunhuang" in data_path.lower()
         
-        data_path = opt.data_path if os.path.exists(os.path.join(opt.data_path, "train")) else "data"
-
-        # 初始化训练集
-        train_dataset = AISTPPDataset(
-            data_path=data_path,
-            train=True,
-            backup_path=os.path.join(data_path, "backup"),
-            feature_type=self.feature_type,
-            seq_len=opt.seq_len, # 将命令行的截断要求传递给数据集底层
-        )
-        
-        # 初始化测试集（添加回代码，用于渲染预览）
-        test_dataset = AISTPPDataset(
-            data_path=data_path,
-            train=False,
-            backup_path=os.path.join(data_path, "backup"),
-            feature_type=self.feature_type,
-            seq_len=opt.seq_len,
-            normalizer=train_dataset.normalizer, # 复用训练集的 normalizer
-        )
-        
-        if len(train_dataset) == 0:
-            raise RuntimeError(
-                f"在 {data_path}/train 目录下没有找到足够长的训练切片！"
+        if is_dunhuang:
+            print(f"\n🪷 检测到敦煌数据集路径 ({data_path})，启动中华古典舞纯视觉微调模式！")
+            
+            # ✨ 核心修复 1：划分独立的训练集与验证集，防止静默过拟合
+            full_dataset = DunhuangDataset(
+                data_path=data_path,
+                seq_len=opt.seq_len,
+                audio_dim=self.audio_dim,
+                normalizer=self.normalizer,
+                return_traj=True
             )
-        self.normalizer = train_dataset.normalizer
+            self.normalizer = full_dataset.normalizer
+            self.diffusion.normalizer = self.normalizer
+            
+            if len(full_dataset) > 1:
+                val_size = max(1, int(0.1 * len(full_dataset)))
+                train_size = len(full_dataset) - val_size
+                train_dataset, test_dataset = random_split(
+                    full_dataset,
+                    [train_size, val_size],
+                    generator=torch.Generator().manual_seed(42)
+                )
+            else:
+                train_dataset = test_dataset = full_dataset
+        else:
+            print("🎶 Loading Official AIST++ dataset (with FK & 6D rotations)...")
+            actual_data_path = data_path if os.path.exists(os.path.join(data_path, "train")) else "data"
+            train_dataset = AISTPPDataset(
+                data_path=actual_data_path,
+                train=True,
+                backup_path=os.path.join(actual_data_path, "backup"),
+                feature_type=self.feature_type,
+                seq_len=opt.seq_len,
+            )
+            test_dataset = AISTPPDataset(
+                data_path=actual_data_path,
+                train=False,
+                backup_path=os.path.join(actual_data_path, "backup"),
+                feature_type=self.feature_type,
+                seq_len=opt.seq_len,
+                normalizer=train_dataset.normalizer,
+            )
+            self.normalizer = train_dataset.normalizer
+            self.diffusion.normalizer = self.normalizer
 
-        # num_cpus = multiprocessing.cpu_count()
-        # # 训练数据加载器
-        # train_data_loader = DataLoader(
-        #     train_dataset,
-        #     batch_size=opt.batch_size,
-        #     shuffle=True,
-        #     num_workers=min(int(num_cpus * 0.75), 32),
-        #     pin_memory=True,
-        #     drop_last=False,
-        # )
-        # ✅ 请替换为更保守、更安全的值（比如固定为 4 或 8）：
+        if len(train_dataset) == 0:
+            raise RuntimeError(f"在 {data_path} 目录下没有找到足够长的训练切片！")
+            
+        num_cpus = multiprocessing.cpu_count()
         train_data_loader = DataLoader(
             train_dataset,
             batch_size=opt.batch_size,
             shuffle=True,
-            num_workers=8,  # 👈 强制锁死在 8，避免撑爆 /tmp
+            num_workers=min(int(num_cpus * 0.75), 16),
             pin_memory=True,
-            drop_last=False,
+            drop_last=True,
         )
-
-        # 测试数据加载器（添加回代码）
         test_data_loader = DataLoader(
             test_dataset,
             batch_size=opt.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=2,
             pin_memory=True,
             drop_last=True,
         )
 
-        train_data_loader = self.accelerator.prepare(train_data_loader)
-        if len(train_data_loader) == 0:
-            raise RuntimeError("DataLoader has zero batches. Reduce --batch_size or add more training data.")
-            
-        load_loop = (
-            partial(tqdm, position=1, desc="Batch")
-            if self.accelerator.is_main_process
-            else lambda x: x
+        train_data_loader, test_data_loader = self.accelerator.prepare(
+            train_data_loader, test_data_loader
         )
-        
+
         if self.accelerator.is_main_process:
             save_dir = str(increment_path(Path(opt.project) / opt.exp_name))
-            opt.exp_name = save_dir.split("/")[-1]
-            wandb.init(project=opt.wandb_pj_name, name=opt.exp_name)
-            save_dir = Path(save_dir)
-            wdir = save_dir / "weights"
-            wdir.mkdir(parents=True, exist_ok=True)
+            opt.exp_name = Path(save_dir).name
+            os.makedirs(save_dir, exist_ok=True)
+            opt.render_dir = os.path.join(save_dir, "renders")
+            os.makedirs(opt.render_dir, exist_ok=True)
+            print(f"Directory created at {save_dir}")
+            wandb.init(project="EDGE", name=opt.exp_name)
 
-        self.accelerator.wait_for_everyone()
+        step = 0
         for epoch in range(1, opt.epochs + 1):
-            avg_loss = 0
-            avg_vloss = 0
-            avg_fkloss = 0
-            avg_footloss = 0
+            train_loss = 0.0
             self.train()
-            
-            for step, (x, cond, filename, wavnames) in enumerate(
-                load_loop(train_data_loader)
-            ):
-                cond = move_condition_to_device(cond, x.device)
-                with self.accelerator.autocast():
-                    total_loss, (loss, v_loss, fk_loss, foot_loss) = self.diffusion(
-                        x, cond, t_override=None
-                    )
-                self.optim.zero_grad(set_to_none=True)
-                self.accelerator.backward(total_loss)
-                self.optim.step()
-
-                if self.accelerator.is_main_process:
-                    avg_loss += loss.detach().cpu().numpy()
-                    avg_vloss += v_loss.detach().cpu().numpy()
-                    if isinstance(fk_loss, torch.Tensor):
-                        avg_fkloss += fk_loss.detach().cpu().numpy()
-                    if isinstance(foot_loss, torch.Tensor):
-                        avg_footloss += foot_loss.detach().cpu().numpy()
+            for batch in tqdm(train_data_loader, leave=False):
+                x, cond, name, wav = batch
+                
+                x = x.to(self.accelerator.device)
+                cond = move_condition_to_device(cond, self.accelerator.device)
+                
+                with self.accelerator.accumulate(self.model):
+                    loss, losses = self.diffusion(x, cond, current_epoch=epoch)
+                    self.accelerator.backward(loss)
                     
-                    if step % opt.ema_interval == 0:
-                        self.diffusion.ema.update_model_average(
-                            self.diffusion.master_model, self.diffusion.model
-                        )
-            
-            # Save model
-            if (epoch % opt.save_interval) == 0:
-                self.accelerator.wait_for_everyone()
-                if self.accelerator.is_main_process:
-                    self.eval()
-                    denom = max(len(train_data_loader), 1)
-                    avg_loss /= denom
-                    avg_vloss /= denom
-                    avg_fkloss /= denom
-                    avg_footloss /= denom
-                    log_dict = {
-                        "Train Loss": avg_loss,
-                        "V Loss": avg_vloss,
-                        "FK Loss": avg_fkloss,
-                        "Foot Loss": avg_footloss,
-                    }
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                        
+                    self.optim.step()
+                    self.optim.zero_grad()
+                    
+                    # ✨ 核心修复 3：应用与更新 EMA 模型权重，锁定生成下限质量
+                    if self.accelerator.is_main_process and step % opt.ema_interval == 0:
+                        unwrapped_model = self.accelerator.unwrap_model(self.model)
+                        self.diffusion.ema.update_model_average(self.diffusion.master_model, unwrapped_model)
+                        
+                train_loss += loss.item()
+                step += 1
+
+                if self.accelerator.is_main_process and step % 10 == 0:
+                    log_dict = {"Train Loss": loss.item(), "Epoch": epoch, "Step": step}
+
+                    for key, val in zip(self._loss_keys(), losses):
+                        log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
                     wandb.log(log_dict)
 
-                    print(f"\n📊 Epoch {epoch} | 总损失(Train Loss): {avg_loss:.4f} | 运动学损失(FK): {avg_fkloss:.4f} | 滑步损失(Foot): {avg_footloss:.4f}")
+            should_validate = (epoch % opt.save_interval == 0) or (epoch == opt.epochs)
+            val_metrics = None
+            if should_validate:
+                val_metrics = self._run_validation(
+                    test_data_loader,
+                    epoch,
+                    max_batches=getattr(opt, "val_batches", 10),
+                )
+                self.accelerator.wait_for_everyone()
 
-                    ckpt = {
-                        "ema_state_dict": self.diffusion.master_model.state_dict(),
-                        "model_state_dict": self.accelerator.unwrap_model(
-                            self.model
-                        ).state_dict(),
-                        "optimizer_state_dict": self.optim.state_dict(),
-                        "normalizer": self.normalizer,
-                    }
-                    torch.save(ckpt, os.path.join(wdir, f"train-{epoch}.pt"))
-                    print(f"[MODEL SAVED at Epoch {epoch}] - 权重已保存: {wdir}/train-{epoch}.pt")
-                    
-                    # ============ 👇 增加验证集渲染测试代码 👇 ============
-                    print("Generating Sample for Visualization...")
-                    try:
-                        # 从测试集抽取一个 batch 的验证数据
-                        (x_test, cond_test, filename_test, wavnames_test) = next(iter(test_data_loader))
-                        cond_test = move_condition_to_device(cond_test, self.accelerator.device)
-                        
-                        # 为了可视化快点，我们每次只抽 2 个样本渲染，如果 batch_size 太小就取实际长度
-                        render_count = min(2, len(x_test)) 
-                        
-                        self.diffusion.render_sample(
-                            (render_count, self.horizon, self.repr_dim),
-                            slice_condition(cond_test, render_count),
-                            self.normalizer,
-                            epoch,
-                            os.path.join(opt.render_dir, "train_" + opt.exp_name),
-                            name=wavnames_test[:render_count],
-                            sound=True,
+            if self.accelerator.is_main_process:
+                train_loss /= len(train_data_loader)
+                print(f"Epoch {epoch} | Train Loss: {train_loss:.6f}")
+
+                if val_metrics is not None:
+                    val_log = {"Epoch": epoch, "Step": step, **val_metrics}
+                    wandb.log(val_log)
+                    print(
+                        "Validation | "
+                        + " | ".join(
+                            [
+                                f"{key}: {value:.6f}"
+                                for key, value in val_metrics.items()
+                                if isinstance(value, (float, int))
+                            ]
                         )
-                        print(f"✅ 渲染完成! 预览文件保存在: {opt.render_dir}")
+                    )
+
+                if should_validate:
+                    weight_dir = os.path.join(save_dir, "weights")
+                    os.makedirs(weight_dir, exist_ok=True)
+                    save_path = os.path.join(weight_dir, f"train-{epoch}.pt")
+                    
+                    unwrapped_model = self.accelerator.unwrap_model(self.model)
+                    
+                    # ✨ 核心修复 3 延续：同步保存 ema_state_dict 以供推理时加载
+                    torch.save(
+                        {
+                            "model_state_dict": unwrapped_model.state_dict(),
+                            "ema_state_dict": self.diffusion.master_model.state_dict(),
+                            "normalizer": {
+                                "mean": self.normalizer.mean.tolist(),
+                                "std": self.normalizer.std.tolist()
+                            },
+                        },
+                        save_path,
+                    )
+                    print(f"✅ [MODEL SAVED at Epoch {epoch}] - 权重已保存: {save_path}")
+
+                    self.eval()
+
+                    # 数据集内 batch 抽查
+                    try:
+                        print("Generating Sample for Visualization...")
+                        batch = next(iter(test_data_loader))
+                        render_count = min(opt.batch_size, 2)
+                        
+                        self.render_sample(
+                            data_tuple=batch,
+                            label=epoch,
+                            render_dir=opt.render_dir,
+                            render_count=render_count,
+                            render=True
+                        )
                     except Exception as e:
                         print(f"⚠️ 渲染测试样本时出错 (但权重已安全保存): {e}")
-                    # ==================================================
+
+                    # OOD 未见音乐抽查默认关闭，避免长音频推理把训练节奏拖得过慢。
+                    if getattr(opt, "enable_ood_eval", False):
+                        try:
+                            print(f"\n🎵 暂停训练，开始执行 OOD 测试曲目自动抽查 (Epoch {epoch})...")
+                            test_music_dir = getattr(opt, "ood_music_dir", "test_music_bank")
+                            ood_out_dir = os.path.join(opt.render_dir, "ood_eval")
+                            os.makedirs(ood_out_dir, exist_ok=True)
+                            
+                            if os.path.exists(test_music_dir):
+                                import glob
+                                import librosa
+                                import torch.nn.functional as F
+                                from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
+                                
+                                test_wavs = sorted(glob.glob(os.path.join(test_music_dir, "*.wav")))
+                                max_ood_files = getattr(opt, "ood_max_files", 0)
+                                if max_ood_files > 0:
+                                    test_wavs = test_wavs[:max_ood_files]
+
+                                if not test_wavs:
+                                    print(f"⚠️ {test_music_dir} 中没有 wav 文件，跳过抽查。")
+                                
+                                for wav_path in test_wavs:
+                                    song_name = os.path.basename(wav_path).replace(".wav", "")
+                                    print(f"   ▶️ 正在推理并渲染测试曲: [{song_name}]")
+                                    
+                                    audio_feat_np, _ = hybrid_extract(wav_path)
+                                    raw_feat_t = torch.from_numpy(audio_feat_np).float().unsqueeze(0).transpose(1, 2)
+
+                                    y, sr = librosa.load(wav_path, sr=None)
+                                    duration = librosa.get_duration(y=y, sr=sr)
+                                    target_frames = int(duration * 30)
+                                    
+                                    print(f"   🎬 正在按完整时长进行推理，总计帧数: {target_frames} (约 {duration:.1f} 秒)")
+                                    aligned_feat = F.interpolate(raw_feat_t, size=target_frames, mode='linear', align_corners=False).transpose(1, 2).squeeze(0)
+                                    
+                                    horizon = self.horizon  
+                                    stride = horizon // 2   
+                                    
+                                    cond_list = []
+                                    if target_frames <= horizon:
+                                        pad_len = horizon - target_frames
+                                        last_frame = aligned_feat[-1:]
+                                        padded_feat = torch.cat([aligned_feat, last_frame.repeat(pad_len, 1)], dim=0)
+                                        cond_list.append(padded_feat)
+                                    else:
+                                        for i in range(0, target_frames, stride):
+                                            chunk = aligned_feat[i : i + horizon]
+                                            if chunk.shape[0] < horizon:
+                                                pad_len = horizon - chunk.shape[0]
+                                                last_frame = chunk[-1:]
+                                                chunk = torch.cat([chunk, last_frame.repeat(pad_len, 1)], dim=0)
+                                            cond_list.append(chunk)
+                                            if i + horizon >= target_frames:
+                                                break
+                                                
+                                    cond_audio = torch.stack(cond_list, dim=0).to(self.accelerator.device)
+                                    
+                                    cond_traj = torch.zeros((cond_audio.shape[0], cond_audio.shape[1], 2), device=self.accelerator.device, dtype=cond_audio.dtype)
+                                    
+                                    if self.normalizer is not None and hasattr(self.normalizer, 'mean'):
+                                        mean_x = self.normalizer.mean[4]
+                                        mean_z = self.normalizer.mean[6]
+                                        std_x = self.normalizer.std[4]
+                                        std_z = self.normalizer.std[6]
+                                        
+                                        cond_traj[:, :, 0] = (cond_traj[:, :, 0] - mean_x) / std_x
+                                        cond_traj[:, :, 1] = (cond_traj[:, :, 1] - mean_z) / std_z
+                                    cond_dict = {"audio": cond_audio, "trajectory": cond_traj}
+                                    
+                                    self.render_sample(
+                                        data_tuple=(None, cond_dict, [song_name], [wav_path]),
+                                        label=f"ood_{epoch}",
+                                        render_dir=ood_out_dir,
+                                        render_count=-1,
+                                        render=True
+                                    )
+                                    
+                                print(f"✅ Epoch {epoch} 的 OOD 抽查视频全部渲染完毕，准备恢复训练！\n")
+                                torch.cuda.empty_cache() 
+                            else:
+                                print(f"⚠️ 未找到 {test_music_dir} 文件夹，请创建并放入测试音乐。")
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                            print(f"⚠️ OOD 抽查执行失败，但不影响训练继续: {e}")
+                    else:
+                        print("⏭️ 已跳过 OOD 未见音乐抽查（默认关闭，可通过 --enable_ood_eval 开启）。")
 
         if self.accelerator.is_main_process:
-            wandb.run.finish()
+            wandb.finish()
 
     def render_sample(
-        self, data_tuple, label, render_dir, render_count=-1, fk_out=None, render=True
+        self, data_tuple, label, render_dir, render_count=-1, fk_out=None, render=True, use_tto=True
     ):
-        _, cond, wavname = data_tuple
+        x, cond, name, wav = data_tuple
+        
         cond_for_len = cond["audio"] if isinstance(cond, dict) else cond
         assert len(cond_for_len.shape) == 3
         if render_count < 0:
             render_count = len(cond_for_len)
-        shape = (render_count, self.horizon, self.repr_dim)
+            
+        seq_len = cond_for_len.shape[1]
+        shape = (render_count, seq_len, self.repr_dim)
+        
         cond = move_condition_to_device(cond, self.accelerator.device)
+        is_dummy_audio = torch.all(cond_for_len == 0).item()
+        
+        target_frames = seq_len 
+        has_real_audio = wav is not None and isinstance(wav, (list, tuple)) and len(wav) > 0 and os.path.exists(wav[0])
+
+        if has_real_audio:
+            sound_dir = os.path.dirname(wav[0])
+            pure_names = [os.path.splitext(w)[0] for w in wav] 
+            import librosa
+            try:
+                y, sr = librosa.load(wav[0], sr=None)
+                target_frames = int(librosa.get_duration(y=y, sr=sr) * 30)
+            except Exception as e:
+                print(f"获取时长失败，回退到默认帧数: {e}")
+        else:
+            sound_dir = "ood_sliced"
+            pure_names = name
+
         self.diffusion.render_sample(
-            shape,
-            slice_condition(cond, render_count),
+            shape, 
+            slice_condition(cond, render_count), 
             self.normalizer,
             label,
             render_dir,
-            name=wavname[:render_count],
-            sound=True,
-            mode="long",
+            name=pure_names[:render_count] if not has_real_audio else pure_names, 
+            sound=has_real_audio, 
+            mode="long" if has_real_audio else "normal",
             fk_out=fk_out,
-            render=render
+            render=render,
+            sound_folder=sound_dir,
+            target_frames=target_frames,
+            use_tto=use_tto
         )

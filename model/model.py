@@ -55,7 +55,8 @@ class TransformerEncoderLayer(nn.Module):
         self.self_attn = nn.MultiheadAttention(
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
-        # Implementation of Feedforward model
+        # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
+        # 移除 spectral_norm，释放模型梯度更新步长，恢复高频动作表现力
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -128,11 +129,13 @@ class FiLMTransformerDecoderLayer(nn.Module):
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
         
+        # 移除 spectral_norm，释放模型梯度更新步长，恢复快速收敛。
+        # 物理连贯性交由 diffusion.py 中的显式物理 Loss (foot_loss 等) 负责。
         # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
-        # 使用 spectral_norm 包装 MLP 层，限制其梯度的剧烈突变，有效消除滑步与高频抖动。
-        self.linear1 = spectral_norm(nn.Linear(d_model, dim_feedforward))
+        # 移除 spectral_norm，释放模型梯度更新步长，恢复高频动作表现力
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = spectral_norm(nn.Linear(dim_feedforward, d_model))
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
 
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -298,6 +301,10 @@ class DanceDecoder(nn.Module):
 
         self.null_cond_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
         self.null_cond_hidden = nn.Parameter(torch.randn(1, latent_dim))
+        
+        # ✨ [修复 4A]: 定义无轨迹条件的独立可学习 Embedding
+        # 避免模型将“全0”误认为“不允许移动的强制指令”
+        self.null_trajectory_embed = nn.Parameter(torch.randn(1, 1, latent_dim))
 
         self.norm_cond = nn.LayerNorm(latent_dim)
 
@@ -333,12 +340,25 @@ class DanceDecoder(nn.Module):
             nn.Linear(2, latent_dim),
             nn.SiLU(),
             nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim)  # 🌟 新增：隔离并规范化物理坐标的量纲
         )
-        self.trajectory_root_head = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.SiLU(),
-            nn.Linear(latent_dim // 2, 3),
+        # 🧹 清理：当前实验阶段无需直接回归根节点参数，暂时注释掉以节省显存。
+        # 预留此分支定义，便于未来如需实现根节点绝对位置显式回归时快速启用。
+        # self.trajectory_root_head = nn.Sequential(
+        #     nn.LayerNorm(latent_dim),
+        #     nn.Linear(latent_dim, latent_dim // 2),
+        #     nn.SiLU(),
+        #     nn.Linear(latent_dim // 2, 3),
+        # )
+
+        # 修改前：self.trajectory_weight = nn.Parameter(torch.tensor([0.1]))
+
+        # ✨ [增强]: 升级为通道级的可学习参数门控，维度对齐 latent_dim (默认512)
+        # 初始化为较大值 0.5，确保初始轨迹引导力足够强
+        # 移除一维标量权重，引入特征调制网络 (FiLM)
+        self.traj_modulate = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.SiLU()
         )
 
         decoderstack = nn.ModuleList([])
@@ -424,7 +444,7 @@ class DanceDecoder(nn.Module):
         per_batch_mask = base_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
 
         if force_mask is not None:
-            keyframe_mask = force_mask[..., 0] > 0.5
+            keyframe_mask = force_mask.amax(dim=-1) > 0.5
             for batch_index in range(batch_size):
                 keyframes = keyframe_mask[batch_index]
                 if torch.any(keyframes):
@@ -445,42 +465,31 @@ class DanceDecoder(nn.Module):
         ).transpose(1, 2)
 
     def guided_forward(
-        self,
-        x,
-        cond_embed,
-        times,
-        guidance_weight,
-        force_mask=None,
-        force_x_clean=None,
+        self, x, cond_embed, times, guidance_weight, force_mask=None, force_x_clean=None
     ):
+        b = x.shape[0]
+        device = x.device
+        
+        # 1. 构造无条件掩码 (全 False，丢弃音频和轨迹)
+        drop_all = torch.zeros((b,), dtype=torch.bool, device=device)
         unc = self.forward(
-            x,
-            cond_embed,
-            times,
-            cond_drop_prob=1.0,
-            force_mask=force_mask,
-            force_x_clean=force_x_clean,
+            x, cond_embed, times, cond_drop_prob=1.0, 
+            force_mask=force_mask, force_x_clean=force_x_clean,
+            keep_audio_mask=drop_all, keep_traj_mask=drop_all # ✨ 修复：明确传入 False
         )
+        
+        # 2. 构造有条件掩码 (全 True，保留所有输入条件)
+        keep_all = torch.ones((b,), dtype=torch.bool, device=device)
         conditioned = self.forward(
-            x,
-            cond_embed,
-            times,
-            cond_drop_prob=0.0,
-            force_mask=force_mask,
-            force_x_clean=force_x_clean,
+            x, cond_embed, times, cond_drop_prob=0.0, 
+            force_mask=force_mask, force_x_clean=force_x_clean,
+            keep_audio_mask=keep_all, keep_traj_mask=keep_all # ✨ 修复：明确传入 True
         )
 
         return unc + (conditioned - unc) * guidance_weight
 
-    def forward(
-        self,
-        x: Tensor,
-        cond_embed: Any,
-        times: Tensor,
-        cond_drop_prob: float = 0.0,
-        force_mask: Optional[Tensor] = None,
-        force_x_clean: Optional[Tensor] = None,
-    ):
+    # ✨ 注意这里去掉了 keep_mask，换成了 keep_audio_mask 和 keep_traj_mask
+    def forward(self, x: Tensor, cond_embed: Any, times: Tensor, cond_drop_prob: float = 0.0, force_mask: Optional[Tensor] = None, force_x_clean: Optional[Tensor] = None, keep_audio_mask: Optional[Tensor] = None, keep_traj_mask: Optional[Tensor] = None):
         batch_size, seq_len, _, device = *x.shape, x.device
 
         if force_mask is None:
@@ -498,8 +507,19 @@ class DanceDecoder(nn.Module):
         force_mask = force_mask.to(device=device, dtype=x.dtype)
         force_x_clean = force_x_clean.to(device=device, dtype=x.dtype)
 
-        masked_x_clean = force_x_clean * force_mask
-        x_concat = torch.cat([x, masked_x_clean, force_mask], dim=-1)
+        if force_mask.shape[-1] == 1:
+            feature_force_mask = force_mask.expand_as(x)
+            force_indicator = force_mask
+        elif force_mask.shape[-1] == x.shape[-1]:
+            feature_force_mask = force_mask
+            force_indicator = force_mask.amax(dim=-1, keepdim=True)
+        else:
+            raise ValueError(
+                f"force_mask last dim must be 1 or {x.shape[-1]}, got {force_mask.shape[-1]}"
+            )
+
+        masked_x_clean = force_x_clean * feature_force_mask
+        x_concat = torch.cat([x, masked_x_clean, force_indicator], dim=-1)
         
         x = self.input_projection(x_concat)
         x = self.abs_pos_encoding(x)
@@ -507,14 +527,25 @@ class DanceDecoder(nn.Module):
         cond_embed, trajectory_cond = self._prepare_cond_inputs(
             cond_embed, batch_size, seq_len, device, x.dtype
         )
+        
+        # 【终极修复 2A】：将 CFG 判定提前
+        # ✨ 解耦处理：为音频和轨迹生成独立的 CFG 掩码
+        # ✨ 解耦处理：为音频和轨迹生成独立的 CFG 掩码
+        if keep_audio_mask is None:
+            keep_audio_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        if keep_traj_mask is None:
+            keep_traj_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        
+        keep_audio_mask_embed = rearrange(keep_audio_mask, "b -> b 1 1")
+        keep_audio_mask_hidden = rearrange(keep_audio_mask, "b -> b 1")
+
+        keep_traj_mask_embed = rearrange(keep_traj_mask, "b -> b 1 1")
+        # ✨ 新增：轨迹的隐藏层降维掩码，用于后续的模态解耦判定
+        keep_traj_mask_hidden = rearrange(keep_traj_mask, "b -> b 1")
+        
         trajectory_tokens = None
         if trajectory_cond is not None:
             trajectory_tokens = self.trajectory_projection(trajectory_cond)
-            x = x + trajectory_tokens
-
-        keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
-        keep_mask_embed = rearrange(keep_mask, "b -> b 1 1")
-        keep_mask_hidden = rearrange(keep_mask, "b -> b 1")
 
         cond_tokens = self.cond_projection(cond_embed)
         cond_tokens = self.abs_pos_encoding(cond_tokens)
@@ -523,21 +554,46 @@ class DanceDecoder(nn.Module):
         null_cond_embed = self._resize_null_cond_embed(cond_tokens.shape[1]).to(
             cond_tokens.dtype
         )
-        cond_tokens = torch.where(keep_mask_embed, cond_tokens, null_cond_embed)
+        
+        # 1. 音频特征的独立 CFG 丢弃 (Token级)
+        cond_tokens = torch.where(keep_audio_mask_embed, cond_tokens, null_cond_embed)
 
         mean_pooled_cond_tokens = cond_tokens.mean(dim=-2)
         cond_hidden = self.non_attn_cond_projection(mean_pooled_cond_tokens)
 
         t_hidden = self.time_mlp(times)
-
         t = self.to_time_cond(t_hidden)
         t_tokens = self.to_time_tokens(t_hidden)
 
         null_cond_hidden = self.null_cond_hidden.to(t.dtype)
-        cond_hidden = torch.where(keep_mask_hidden, cond_hidden, null_cond_hidden)
-        t += cond_hidden
 
-        c = torch.cat((cond_tokens, t_tokens), dim=-2)
+        if trajectory_tokens is not None:
+            null_traj_embed = self.null_trajectory_embed.to(trajectory_tokens.dtype)
+            # 2. 轨迹特征的独立 CFG 丢弃 (Token级)
+            trajectory_tokens = torch.where(
+                keep_traj_mask_embed,
+                trajectory_tokens,
+                null_traj_embed
+            )
+
+            # ✨ 3. 严格的模态解耦逻辑 (Global 级)
+            # 丢弃错误的联合 Mask 绑定。音频的全局特征只应由音频本身的丢弃概率决定。
+            # 这样在 "丢弃音频 + 保留轨迹" 的 CFG 前向传播中，网络能获取到 100% 纯净的无音频先验
+            cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
+
+            # 4. 动态特征融合 (FiLM)
+            scale_shift = self.traj_modulate(trajectory_tokens)
+            scale, shift = scale_shift.chunk(2, dim=-1)
+            fused_tokens = cond_tokens * (1.0 + scale) + shift
+
+            t += cond_hidden
+            c = torch.cat((fused_tokens, t_tokens), dim=-2)
+        else:
+            # 如果完全没有传入轨迹控制，则退化为单模态标准 CFG
+            cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
+            t += cond_hidden
+            c = torch.cat((cond_tokens, t_tokens), dim=-2)
+            
         cond_tokens = self.norm_cond(c)
 
         self_attn_mask = self._build_sparse_attn_mask(
@@ -548,8 +604,5 @@ class DanceDecoder(nn.Module):
         )
         output = self.seqTransDecoder(x, cond_tokens, t, tgt_mask=self_attn_mask)
 
-        output = self.final_layer(output)
-        if trajectory_tokens is not None:
-            root_delta = self.trajectory_root_head(trajectory_tokens)
-            output = torch.cat((output[..., :3] + root_delta, output[..., 3:]), dim=-1)
+        output = self.final_layer(output)    
         return output

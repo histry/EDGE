@@ -3,10 +3,14 @@ from pathlib import Path
 
 import librosa
 import numpy as np
+import scipy.signal
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import Wav2Vec2Processor, Wav2Vec2Model
+
+if not hasattr(scipy.signal, "hann") and hasattr(scipy.signal, "windows"):
+    scipy.signal.hann = scipy.signal.windows.hann
 
 # 动作序列目标帧率
 FPS = 30
@@ -59,6 +63,9 @@ class LightweightAudioExtractor:
         """
         提取高维语义特征并插值对齐到目标 30 FPS 序列长度
         """
+        # 🌟 修复：从 CPU 唤醒模型回 GPU，适配 Gradio 的显存释放机制
+        self.model.to(self.device)
+        
         data, _ = librosa.load(fpath, sr=SR_WAV2VEC)
         inputs = self.processor(data, sampling_rate=SR_WAV2VEC, return_tensors="pt", padding=True)
         

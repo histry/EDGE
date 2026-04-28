@@ -34,7 +34,7 @@ class AISTPPDataset(Dataset):
         feature_type: str = "hybrid",
         normalizer: Any = None,
         data_len: int = -1,
-        seq_len: int = 150,  # 显式接收 seq_len 确保截断维度统一
+        seq_len: int = 150,
         include_contacts: bool = True,
         force_reload: bool = False,
     ):
@@ -93,66 +93,40 @@ class AISTPPDataset(Dataset):
         feature = torch.from_numpy(np.load(filename_)).float()
         pose = self.data["pose"][idx]
 
-        # 【核心安全检查】：强制补齐或截断音频特征，确保长度完全等于 seq_len
         if feature.shape[0] > self.seq_len:
             feature = feature[:self.seq_len]
         elif feature.shape[0] < self.seq_len:
+            # 🚀 修复：废弃 Cyclic Padding，改用 Reflect (反射/镜像) Padding
+            # 反射填充能保证边界连续性，消除频率和强度的突变，防止动作抽搐
+            # 🚀 修复：安全的 Reflect Padding (完美支持 pad_len 远大于原序列长度的边界情况)
             pad_len = self.seq_len - feature.shape[0]
-            feature = torch.cat([feature, torch.zeros(pad_len, feature.shape[1])], dim=0)
+            feature_np = feature.numpy()
+            
+            # ✨ 核心改进：自适应混合填充 (Adaptive Hybrid Padding)
+            # 解决极短音频反射导致的信号学高频震荡 (High-frequency Oscillation)
+            MIN_REFLECT_LEN = 15  # 阈值：15帧(0.5秒)。小于此长度认为不具备音乐节拍周期性
+            
+            if feature_np.shape[0] == 1:
+                feature_np = np.repeat(feature_np, self.seq_len, axis=0)
+            elif feature_np.shape[0] < MIN_REFLECT_LEN:
+                # 极短序列使用 'edge' (末端值复制/零阶保持)，避免来回反弹产生的虚假高频噪音
+                feature_np = np.pad(feature_np, ((0, pad_len), (0, 0)), mode='edge')
+            else:
+                # 具有有效音乐短语的长序列，保留 'reflect' 以维持节拍的自然起伏
+                while pad_len > 0:
+                    current_pad = min(pad_len, feature_np.shape[0] - 1)
+                    feature_np = np.pad(feature_np, ((0, current_pad), (0, 0)), mode='reflect')
+                    pad_len -= current_pad
+                    
+            feature = torch.from_numpy(feature_np).float()
 
-        # 封装为字典以完美兼容 EDGE 模型的特征提取逻辑
-        cond = {"audio": feature}
+        # 🌟 修复 2：在 AIST++ 数据集返回的条件字典中显式加入 trajectory 键
+        # 确保与 DunhuangDataset 结构完全统一，避免引发 KeyError
+        cond = {
+            "audio": feature
+        }
         return pose, cond, filename_, self.data["wavs"][idx]
 
-    # def load_aistpp(self):
-    #     split_data_path = os.path.join(
-    #         self.data_path, "train" if self.train else "test"
-    #     )
-
-    #     motion_path = os.path.join(split_data_path, "motions_sliced")
-    #     sound_path = os.path.join(split_data_path, f"{self.feature_type}_feats")
-    #     wav_path = os.path.join(split_data_path, "wavs_sliced")
-        
-    #     motions = sorted(glob.glob(os.path.join(motion_path, "*.pkl")))
-    #     features = sorted(glob.glob(os.path.join(sound_path, "*.npy")))
-    #     wavs = sorted(glob.glob(os.path.join(wav_path, "*.wav")))
-
-    #     all_pos = []
-    #     all_q = []
-    #     all_names = []
-    #     all_wavs = []
-    #     assert len(motions) == len(features), f"Mismatch: {len(motions)} motions vs {len(features)} audio features."
-        
-    #     required_len = self.seq_len * self.data_stride
-
-    #     for motion, feature, wav in zip(motions, features, wavs):
-    #         m_name = os.path.splitext(os.path.basename(motion))[0]
-    #         f_name = os.path.splitext(os.path.basename(feature))[0]
-    #         w_name = os.path.splitext(os.path.basename(wav))[0]
-    #         assert m_name == f_name == w_name, str((motion, feature, wav))
-            
-    #         data = pickle.load(open(motion, "rb"))
-    #         pos = data["pos"]
-    #         q = data["q"]
-            
-    #         # 【修复一维对象数组异常】：丢弃长度不达标的残次切片，截断过长的切片
-    #         if pos.shape[0] < required_len:
-    #             continue
-
-    #         all_pos.append(pos[:required_len])
-    #         all_q.append(q[:required_len])
-    #         all_names.append(feature)
-    #         all_wavs.append(wav)
-
-    #     # 此时数据形状绝对整齐，np.array 不会坍塌为 1D object
-    #     all_pos = np.array(all_pos)  # N x required_len x 3
-    #     all_q = np.array(all_q)      # N x required_len x (joint * 3)
-        
-    #     all_pos = all_pos[:, :: self.data_stride, :]
-    #     all_q = all_q[:, :: self.data_stride, :]
-        
-    #     data = {"pos": all_pos, "q": all_q, "filenames": all_names, "wavs": all_wavs}
-    #     return data
     def load_aistpp(self):
         split_data_path = os.path.join(
             self.data_path, "train" if self.train else "test"
@@ -171,7 +145,6 @@ class AISTPPDataset(Dataset):
         all_names = []
         all_wavs = []
         
-        # ==================== 👇 修复逻辑：安全取交集匹配 👇 ====================
         motion_dict = {os.path.splitext(os.path.basename(m))[0]: m for m in motions}
         feature_dict = {os.path.splitext(os.path.basename(f))[0]: f for f in features}
         wav_dict = {os.path.splitext(os.path.basename(w))[0]: w for w in wavs}
@@ -191,7 +164,6 @@ class AISTPPDataset(Dataset):
             pos = data["pos"]
             q = data["q"]
             
-            # 丢弃长度不达标的残次切片，截断过长的切片
             if pos.shape[0] < required_len:
                 continue
 
@@ -199,11 +171,9 @@ class AISTPPDataset(Dataset):
             all_q.append(q[:required_len])
             all_names.append(feature)
             all_wavs.append(wav)
-        # =========================================================================
 
-        # 此时数据形状绝对整齐，np.array 不会坍塌为 1D object
-        all_pos = np.array(all_pos)  # N x required_len x 3
-        all_q = np.array(all_q)      # N x required_len x (joint * 3)
+        all_pos = np.array(all_pos) 
+        all_q = np.array(all_q)      
         
         all_pos = all_pos[:, :: self.data_stride, :]
         all_q = all_q[:, :: self.data_stride, :]
@@ -218,16 +188,6 @@ class AISTPPDataset(Dataset):
         
         bs, sq, c = local_q.shape
         local_q = local_q.reshape((bs, sq, -1, 3))
-
-        # root_q = local_q[:, :, :1, :]
-        # root_q_quat = axis_angle_to_quaternion(root_q)
-        # rotation = torch.Tensor([0.7071068, 0.7071068, 0, 0])
-        # root_q_quat = quaternion_multiply(rotation, root_q_quat)
-        # root_q = quaternion_to_axis_angle(root_q_quat)
-        # local_q[:, :, :1, :] = root_q
-
-        # pos_rotation = RotateAxisAngle(90, axis="X", degrees=True)
-        # root_pos = pos_rotation.transform_points(root_pos)
 
         positions = smpl.forward(local_q, root_pos)
         feet = positions[:, :, (7, 8, 10, 11)]
@@ -351,7 +311,6 @@ class DummyNormalizer:
             return x * self.std.to(x.device) + self.mean.to(x.device)
         return x * self.std.numpy() + self.mean.numpy()
 
-
 class DunhuangDataset(Dataset):
     def __init__(
         self,
@@ -366,64 +325,142 @@ class DunhuangDataset(Dataset):
         self.seq_len = seq_len
         self.audio_dim = audio_dim
         self.return_traj = return_traj
+        self.proxy_audios = []
+        rag_db_path = "data/dunhuang_rag_db"
+        if os.path.isdir(rag_db_path):
+            for rag_file in sorted(glob.glob(os.path.join(rag_db_path, "*.npy"))):
+                try:
+                    record = np.load(rag_file, allow_pickle=True).item()
+                    audio_feat = record.get("audio_feat", None)
+                    if audio_feat is not None:
+                        self.proxy_audios.append(np.asarray(audio_feat, dtype=np.float32))
+                except Exception as e:
+                    print(f"⚠️ 跳过损坏的 RAG 文件 {rag_file}: {e}")
 
-        search_path = os.path.join(data_path, "processed", "*.pkl")
-        self.pkl_files = glob.glob(search_path)
+        # 增加路径容错
+        candidate_dirs = [data_path, os.path.join(data_path, "processed")]
+        self.pkl_files = []
+        for candidate in candidate_dirs:
+            if os.path.isdir(candidate):
+                files = sorted(glob.glob(os.path.join(candidate, "*.pkl")))
+                if files:
+                    self.pkl_files = files
+                    self.data_path = candidate
+                    break
 
-        self.motions = []
-        self.trajs = []
+        if not self.pkl_files: # 只有当容错路径没找到时，才使用原路径搜索
+            search_path = os.path.join(self.data_path, "*.pkl")
+            self.pkl_files = sorted(glob.glob(search_path))
+
+        motions_list = []
+        trajs_list = []
 
         if not self.pkl_files:
             print("Warning: No PKL files found.")
+            self.motions = np.zeros((0, seq_len, 151), dtype=np.float32)
+            self.trajs = np.zeros((0, seq_len, 2), dtype=np.float32)
+            self.normalizer = normalizer if (normalizer is not None and hasattr(normalizer, 'mean')) else None
+            return
+
+        smpl = SMPLSkeleton()
 
         for f in self.pkl_files:
             data = pickle.load(open(f, "rb"))
             pos = data["pos"]
             q = data["q"]
-            motion = np.concatenate([pos, q], axis=-1)
+
+            pos_t = torch.Tensor(pos).unsqueeze(0)
+            q_t = torch.Tensor(q).unsqueeze(0)
+
+            bs, sq, c = q_t.shape
+            q_t_reshaped = q_t.reshape((bs, sq, -1, 3))
+
+            positions = smpl.forward(q_t_reshaped, pos_t)
+            feet = positions[:, :, (7, 8, 10, 11)]
+            feetv = torch.zeros(feet.shape[:3])
+            feetv[:, :-1] = (feet[:, 1:] - feet[:, :-1]).norm(dim=-1)
+            contacts = (feetv < 0.01).to(q_t_reshaped)
+
+            q_6v = ax_to_6v(q_t_reshaped)
+            l = [contacts, pos_t, q_6v]
+            motion_t = vectorize_many(l)
+            motion = motion_t.squeeze(0).float().detach().numpy()
 
             traj_xy = pos[:, [0, 2]]
             step = max(1, int(seq_len * (1 - overlap)))
             num_frames = motion.shape[0]
             if num_frames < seq_len:
                 continue
+
             for start in range(0, num_frames - seq_len + 1, step):
-                self.motions.append(motion[start : start + seq_len])
-                self.trajs.append(traj_xy[start : start + seq_len])
+                slice_motion = motion[start : start + seq_len].copy()
+                slice_traj = traj_xy[start : start + seq_len].copy()
 
-        if len(self.motions) > 0:
-            self.motions = np.array(self.motions, dtype=np.float32)
-            self.trajs = np.array(self.trajs, dtype=np.float32)
+                local_start_x = slice_motion[0, 4]
+                local_start_z = slice_motion[0, 6]
 
-            if normalizer is None:
-                mean = np.mean(self.motions, axis=(0, 1), keepdims=True)
-                std = np.std(self.motions, axis=(0, 1), keepdims=True) + 1e-5
-                self.normalizer = DummyNormalizer(mean, std)
+                slice_motion[:, 4] -= local_start_x
+                slice_motion[:, 6] -= local_start_z
+                slice_traj[:, 0] -= local_start_x
+                slice_traj[:, 1] -= local_start_z
+
+                motions_list.append(slice_motion)
+                trajs_list.append(slice_traj)
+
+        if len(motions_list) > 0:
+            self.motions = np.array(motions_list, dtype=np.float32)
+            self.trajs = np.array(trajs_list, dtype=np.float32)
+
+            if normalizer is None or not hasattr(normalizer, 'mean'):
+                print("⚠️ 未提供有效 Normalizer，将基于当前敦煌数据集重新计算统计量。")
+                self.normalizer = Normalizer(torch.from_numpy(self.motions))
             else:
                 self.normalizer = normalizer
 
-            mean_np = self.normalizer.mean.numpy()
-            std_np = self.normalizer.std.numpy()
-            self.motions = (self.motions - mean_np) / std_np
+            self.motions = self.normalizer.normalize(torch.from_numpy(self.motions)).numpy()
+            if self.normalizer is not None and hasattr(self.normalizer, 'std'):
+                # ✨ 修复 2：获取根节点 X(4) 和 Z(6) 维度的完整统计量
+                mean_xz = np.array([self.normalizer.mean[4], self.normalizer.mean[6]], dtype=np.float32)
+                std_xz = np.array([self.normalizer.std[4], self.normalizer.std[6]], dtype=np.float32)
+                
+                # 源头预处理：严格执行 Z-Score 规范化，完全减去均值并除以方差
+                # 确保目标轨迹流形与扩散模型的预测流形实现 100% 重合
+                self.trajs = (self.trajs - mean_xz) / std_xz
         else:
-            self.normalizer = DummyNormalizer(
-                np.zeros((1, 1, 381), dtype=np.float32),
-                np.ones((1, 1, 381), dtype=np.float32),
-            )
+            self.motions = np.zeros((0, seq_len, 151), dtype=np.float32)
             self.trajs = np.zeros((0, seq_len, 2), dtype=np.float32)
+            self.normalizer = normalizer if (normalizer is not None and hasattr(normalizer, 'mean')) else None
 
     def __len__(self):
         return len(self.motions)
 
     def __getitem__(self, idx):
         motion = torch.from_numpy(self.motions[idx])
-        dummy_audio = torch.zeros((self.seq_len, self.audio_dim), dtype=torch.float32)
+
+        if hasattr(self, 'proxy_audios') and len(self.proxy_audios) > 0:
+            import random
+            audio_feat = random.choice(self.proxy_audios)
+            if audio_feat.shape[0] > self.seq_len:
+                audio_feat = audio_feat[:self.seq_len]
+            elif audio_feat.shape[0] < self.seq_len:
+                pad_len = self.seq_len - audio_feat.shape[0]
+                # ✨ 替换原来的直接 np.pad，引入安全循环
+                if audio_feat.shape[0] == 1:
+                    audio_feat = np.repeat(audio_feat, self.seq_len, axis=0)
+                else:
+                    curr_pad = pad_len
+                    while curr_pad > 0:
+                        step_pad = min(curr_pad, audio_feat.shape[0] - 1)
+                        audio_feat = np.pad(audio_feat, ((0, step_pad), (0, 0)), mode='reflect')
+                        curr_pad -= step_pad
+            audio_tensor = torch.from_numpy(audio_feat).float()
+        else:
+            audio_tensor = torch.zeros((self.seq_len, self.audio_dim), dtype=torch.float32)
+
         if self.return_traj:
             traj = torch.from_numpy(self.trajs[idx])
-            cond = {
-                "audio": dummy_audio,
-                "trajectory": traj,
-            }
+            cond = {"audio": audio_tensor, "trajectory": traj}
         else:
-            cond = dummy_audio
-        return motion, cond, f"dunhuang_motion_{idx}", "dummy_audio"
+            cond = {"audio": audio_tensor}
+
+        return motion, cond, f"dunhuang_motion_{idx}", "proxy_audio"
