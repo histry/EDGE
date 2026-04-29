@@ -66,7 +66,7 @@ def parse_train_opt():
     parser.add_argument(
         "--mmr_loss_weight",
         type=float,
-        default=0.5,
+        default=0.0,
         help="maximum MMR audio-motion alignment loss weight; set to 0 for unpaired music/motion data",
     )
     parser.add_argument(

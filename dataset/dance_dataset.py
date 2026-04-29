@@ -3,6 +3,7 @@ import os
 import pickle
 import random
 import sys
+import csv
 from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Dict
@@ -320,12 +321,20 @@ class DunhuangDataset(Dataset):
         overlap=0.5,
         normalizer=None,
         return_traj=False,
+        weak_pairs_path="data/proxy_weak_pairs/weak_pairs.csv",
+        use_weak_pairs=True,
     ):
         self.data_path = data_path
         self.seq_len = seq_len
         self.audio_dim = audio_dim
         self.return_traj = return_traj
         self.proxy_audios = []
+        self.motion_window_ids = []
+        self.weak_pair_map = {}
+        self.weak_pair_audio_cache = {}
+        if use_weak_pairs:
+            self.weak_pair_map = self._load_weak_pairs(weak_pairs_path)
+
         rag_db_path = "data/dunhuang_rag_db"
         if os.path.isdir(rag_db_path):
             for rag_file in sorted(glob.glob(os.path.join(rag_db_path, "*.npy"))):
@@ -406,6 +415,7 @@ class DunhuangDataset(Dataset):
 
                 motions_list.append(slice_motion)
                 trajs_list.append(slice_traj)
+                self.motion_window_ids.append(f"{Path(f).stem}_{start:06d}_{start + seq_len:06d}")
 
         if len(motions_list) > 0:
             self.motions = np.array(motions_list, dtype=np.float32)
@@ -434,12 +444,79 @@ class DunhuangDataset(Dataset):
     def __len__(self):
         return len(self.motions)
 
+    def _resolve_audio_feature_path(self, audio_path):
+        if not audio_path:
+            return None
+
+        candidates = []
+        path = Path(audio_path)
+        if path.suffix == ".npy":
+            candidates.append(path)
+        else:
+            candidates.append(path.with_suffix(".npy"))
+        candidates.append(Path("proxy_music") / f"{path.stem}.npy")
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return None
+
+    def _get_weak_pair_audio(self, audio_path):
+        feature_path = self._resolve_audio_feature_path(audio_path)
+        if feature_path is None:
+            return None
+        if feature_path not in self.weak_pair_audio_cache:
+            try:
+                self.weak_pair_audio_cache[feature_path] = np.asarray(
+                    np.load(feature_path), dtype=np.float32
+                )
+            except Exception as exc:
+                print(f"⚠️ 跳过 weak pair 音频特征 {feature_path}: {exc}")
+                self.weak_pair_audio_cache[feature_path] = None
+        return self.weak_pair_audio_cache[feature_path]
+
+    def _load_weak_pairs(self, weak_pairs_path):
+        if not weak_pairs_path or not os.path.isfile(weak_pairs_path):
+            return {}
+
+        pair_map = {}
+        with open(weak_pairs_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                window_id = row.get("window_id", "")
+                audio_path = row.get("audio_path", "")
+                audio_feat = self._get_weak_pair_audio(audio_path)
+                if not window_id or audio_feat is None:
+                    continue
+                try:
+                    score = max(float(row.get("score", 1.0)), 1e-6)
+                except ValueError:
+                    score = 1.0
+                pair_map.setdefault(window_id, []).append(
+                    {"audio_feat": audio_feat, "score": score, "audio_path": audio_path}
+                )
+
+        if pair_map:
+            print(f"🎵 已加载 weak proxy music 候选: {len(pair_map)} 个动作窗口。")
+        return pair_map
+
+    def _sample_audio_feature(self, idx):
+        window_id = self.motion_window_ids[idx] if idx < len(self.motion_window_ids) else ""
+        weak_candidates = self.weak_pair_map.get(window_id, [])
+        if weak_candidates:
+            weights = [candidate["score"] for candidate in weak_candidates]
+            return random.choices(weak_candidates, weights=weights, k=1)[0]["audio_feat"]
+
+        if hasattr(self, 'proxy_audios') and len(self.proxy_audios) > 0:
+            return random.choice(self.proxy_audios)
+        return None
+
     def __getitem__(self, idx):
         motion = torch.from_numpy(self.motions[idx])
 
-        if hasattr(self, 'proxy_audios') and len(self.proxy_audios) > 0:
-            import random
-            audio_feat = random.choice(self.proxy_audios)
+        audio_feat = self._sample_audio_feature(idx)
+        if audio_feat is not None:
+            audio_feat = np.asarray(audio_feat, dtype=np.float32)
             if audio_feat.shape[0] > self.seq_len:
                 audio_feat = audio_feat[:self.seq_len]
             elif audio_feat.shape[0] < self.seq_len:

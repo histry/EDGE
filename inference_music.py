@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 import scipy.interpolate as spi
 from model.model import DanceDecoder
+from model.checkpoint_compat import adapt_checkpoint_state_dict, summarize_adapt_report
 from model.diffusion import GaussianDiffusion
 from data.audio_extraction.wav2vec_librosa_features import extract 
 from scipy.signal import find_peaks
@@ -547,11 +548,20 @@ def chunk_tensor(tensor, horizon=150, stride=75, target_frames=150, is_mask=Fals
     return torch.stack(chunks, dim=0)
 
 def run_music_driven_inference(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    requested_device = getattr(args, "device", "auto")
+    if requested_device == "auto":
+        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        print("⚠️ 请求使用 cuda，但当前 CUDA 不可用，自动回退到 CPU。")
+        requested_device = "cpu"
+    device = torch.device(requested_device)
+    dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
     
     print(f"🎵 正在提取测试音乐特征: {args.audio}")
-    audio_feat_np, _ = extract(args.audio) 
+    audio_device = getattr(args, "audio_device", "auto")
+    if audio_device == "auto":
+        audio_device = device.type
+    audio_feat_np, _ = extract(args.audio, device=audio_device) 
     audio_seq_len = audio_feat_np.shape[0]
     
     if audio_seq_len % 2 != 0:
@@ -577,6 +587,8 @@ def run_music_driven_inference(args):
     if os.path.exists(args.ckpt):
         checkpoint = torch.load(args.ckpt, map_location=device, weights_only=False)
         state_dict = checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict'))
+        if state_dict is None:
+            raise ValueError(f"❌ 权重文件 {args.ckpt} 中既没有 ema_state_dict 也没有 model_state_dict！")
         
         norm_data = checkpoint.get("normalizer")
         if isinstance(norm_data, dict) and "mean" in norm_data:
@@ -619,7 +631,14 @@ def run_music_driven_inference(args):
             resized_embed = F.interpolate(saved_embed, size=target_shape[1], mode='linear', align_corners=False)
             state_dict['null_cond_embed'] = resized_embed.permute(0, 2, 1)
 
-    model.load_state_dict(state_dict)
+    adapted_state_dict, adapt_report = adapt_checkpoint_state_dict(
+        state_dict,
+        model,
+        log_prefix=f"checkpoint:{os.path.basename(args.ckpt)}",
+    )
+    model.load_state_dict(adapted_state_dict, strict=True)
+    for line in summarize_adapt_report(adapt_report):
+        print(f"⚠️ {line}")
     print("✅ 成功加载权重及 Normalizer")
         
     model.eval()
@@ -955,8 +974,18 @@ def run_music_driven_inference(args):
         current_motion = torch.cat([current_motion[: i * stride], next_chunk], dim=0)
 
     output_np = current_motion[:audio_seq_len].cpu().float().numpy()
+
+    raw_model_out = getattr(args, "raw_model_out", "")
+    if raw_model_out:
+        raw_dir = os.path.dirname(raw_model_out)
+        if raw_dir:
+            os.makedirs(raw_dir, exist_ok=True)
+        np.save(raw_model_out, output_np)
+        print(f"🧪 已保存未做轨迹后处理的模型原始输出: {raw_model_out}")
     
     target_traj_np = physical_target_traj[0, :audio_seq_len].cpu().float().numpy() if has_traj else None
+    if has_traj:
+        print(f"🧭 正在执行轨迹后处理模式: {args.trajectory_post_mode}")
     output_np = apply_trajectory_postprocess(
         output_np,
         target_traj=target_traj_np,
@@ -1008,7 +1037,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="多模态控制编舞推理")
     parser.add_argument("--ckpt", type=str, required=True, help="阶段性权重路径")
     parser.add_argument("--audio", type=str, required=True, help="测试音乐 .wav 路径")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="推理设备；GPU 显存被占满时可设为 cpu")
+    parser.add_argument("--audio_device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="Wav2Vec2 音频特征提取设备；已有 .npy 缓存时不会加载 Wav2Vec2")
     parser.add_argument("--out", type=str, default="output/test_driven.npy", help="输出文件路径")
+    parser.add_argument("--raw_model_out", type=str, default="", help="可选：保存轨迹后处理前的模型原始输出，用于区分模型轨迹能力和后处理锚定效果")
     parser.add_argument("--trajectory", type=str, default="", help="2D (X,Z) 空间走位轨迹")
     parser.add_argument("--start_pose", type=str, default="", help="起始关键帧张量文件路径 (.npy)")
     parser.add_argument("--end_pose", type=str, default="", help="终止关键帧张量文件路径 (.npy)")

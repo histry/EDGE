@@ -15,6 +15,7 @@ from tqdm import tqdm
 from dataset.dance_dataset import AISTPPDataset, DunhuangDataset
 from dataset.preprocess import increment_path
 from model.adan import Adan
+from model.checkpoint_compat import adapt_checkpoint_state_dict, summarize_adapt_report
 from model.diffusion import GaussianDiffusion
 from model.model import DanceDecoder
 from model.mmr_model import CrossModalMMR
@@ -81,7 +82,7 @@ class EDGE:
         use_sparse_attn=False,
         sparse_attn_window=24,
         cond_drop_prob=0.25,
-        mmr_loss_weight=0.5,
+        mmr_loss_weight=0.0,
         keyframe_condition_prob=0.7,
         keyframe_condition_width=3,
         keyframe_loss_weight=2.0,
@@ -246,20 +247,16 @@ class EDGE:
                 state_dict = checkpoint.get("model_state_dict")
             if state_dict is None:
                 raise ValueError(f"❌ 权重文件 {checkpoint_path} 中既没有 ema_state_dict 也没有 model_state_dict！")
-            
-            wrapped_state_dict = maybe_wrap(state_dict, num_processes)
-            current_state_dict = self.model.state_dict()
-            for key in list(wrapped_state_dict.keys()):
-                if key in current_state_dict and wrapped_state_dict[key].shape != current_state_dict[key].shape:
-                    print(f"⚠️ 维度升级拦截: 参数 {key} 形状从 {wrapped_state_dict[key].shape} 变为 {current_state_dict[key].shape}，将重新初始化。")
-                    del wrapped_state_dict[key]
 
-            missing_keys, unexpected_keys = self.model.load_state_dict(
-                wrapped_state_dict,
-                strict=False
+            adapted_state_dict, adapt_report = adapt_checkpoint_state_dict(
+                state_dict,
+                self.model,
+                log_prefix=f"checkpoint:{os.path.basename(checkpoint_path)}",
             )
-            if self.accelerator.is_main_process and missing_keys:
-                print(f"⚠️ 注意：由于引入了新架构，以下参数将从头开始随机初始化: {missing_keys}")
+            self.model.load_state_dict(adapted_state_dict, strict=True)
+            if self.accelerator.is_main_process:
+                for line in summarize_adapt_report(adapt_report):
+                    print(f"⚠️ {line}")
 
     @staticmethod
     def _set_requires_grad(module, enabled):

@@ -57,9 +57,18 @@ class TransformerEncoderLayer(nn.Module):
         )
         # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
         # 移除 spectral_norm，释放模型梯度更新步长，恢复高频动作表现力
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.dropout = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # ================== 替换代码 ==================
+        from torch.nn.utils.parametrizations import spectral_norm # 确保使用最新的参数化方法
+
+        # 【真实实现】：应用谱归一化 (Spectral Norm) 严格限制权重矩阵的最大奇异值，
+        # 从而实现真正的 Lipschitz 约束，确保关键帧之间的隐空间插值绝对平滑。
+        self.linear1 = spectral_norm(nn.Linear(d_model, dim_feedforward))
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear2 = spectral_norm(nn.Linear(dim_feedforward, d_model))
+        # ==============================================
 
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -133,9 +142,18 @@ class FiLMTransformerDecoderLayer(nn.Module):
         # 物理连贯性交由 diffusion.py 中的显式物理 Loss (foot_loss 等) 负责。
         # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
         # 移除 spectral_norm，释放模型梯度更新步长，恢复高频动作表现力
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.dropout = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # ================== 替换代码 ==================
+        from torch.nn.utils.parametrizations import spectral_norm
+        
+        # 【真实实现】：应用谱归一化 (Spectral Norm) 严格限制权重矩阵的最大奇异值，
+        # 从而实现真正的 Lipschitz 约束，确保关键帧之间的隐空间插值绝对平滑。
+        self.linear1 = spectral_norm(nn.Linear(d_model, dim_feedforward))
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear2 = spectral_norm(nn.Linear(dim_feedforward, d_model))
+        # ==============================================
 
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -271,6 +289,7 @@ class DanceDecoder(nn.Module):
         super().__init__()
 
         output_feats = nfeats
+        self.seq_len = seq_len
         self.cond_feature_dim = cond_feature_dim
         self.num_heads = num_heads
         self.use_gradient_checkpointing = use_gradient_checkpointing

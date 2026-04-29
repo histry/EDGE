@@ -1,0 +1,5 @@
+# Optional legacy Jukebox feature extractor path.
+# The current Dunhuang pipeline uses Wav2Vec2 + Librosa features, so this is not
+# required for train.py, inference_music.py, eval_quantitative.py, or gradio_app.py.
+git+https://github.com/rodrigo-castellon/jukebox.git@6b4486164e150286d9d6944797a14b19f31912f0
+git+https://github.com/rodrigo-castellon/jukemirlib.git@a91d87fcae0dd89085752421e794ea7e1b300735

@@ -12,6 +12,10 @@
 # 允许追踪指定的代码和文档文件
 !*.py
 !*.md
+!environment.yml
+!requirements-edge.txt
+!requirements-jukebox-optional.txt
+!setup_edge_env.sh
 
 # 允许追踪 .gitignore 自身
 !.gitignore

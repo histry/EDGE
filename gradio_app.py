@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import pickle
 import math
 from model.model import DanceDecoder
+from model.checkpoint_compat import adapt_checkpoint_state_dict, summarize_adapt_report
 from model.diffusion import GaussianDiffusion
 from data.audio_extraction.wav2vec_librosa_features import extract
 from dataset.quaternion import ax_to_6v, ax_from_6v 
@@ -17,11 +18,26 @@ from trajectory_postprocess import TRAJECTORY_POST_MODES, apply_trajectory_postp
 
 _romp_model = None
 
+DEFAULT_CKPT_CANDIDATES = [
+    os.environ.get("EDGE_GRADIO_CKPT", ""),
+    "runs/train/exp_dunhuang_stage2B_phys_opt/weights/train-20.pt",
+    "runs/train/exp_dunhuang_keyframe_stage2B_stability_from102/weights/train-5.pt",
+    "runs/train/exp16/weights/train-300.pt",
+]
+
+
+def resolve_default_checkpoint():
+    for candidate in DEFAULT_CKPT_CANDIDATES:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return DEFAULT_CKPT_CANDIDATES[-1]
+
+
 class PipelineEngine:
-    def __init__(self, ckpt_path="runs/train/exp16/weights/train-300.pt"):
+    def __init__(self, ckpt_path=None):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-        self.ckpt_path = ckpt_path
+        self.ckpt_path = ckpt_path or resolve_default_checkpoint()
         self.model = None
         self.normalizer = None
         self.is_loaded = False
@@ -47,7 +63,17 @@ class PipelineEngine:
         else:
             self.normalizer = norm_data
             
-        self.model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict')))
+        state_dict = checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict'))
+        if state_dict is None:
+            raise ValueError(f"权重文件 {self.ckpt_path} 中没有 ema_state_dict/model_state_dict")
+        adapted_state_dict, adapt_report = adapt_checkpoint_state_dict(
+            state_dict,
+            self.model,
+            log_prefix=f"checkpoint:{os.path.basename(self.ckpt_path)}",
+        )
+        self.model.load_state_dict(adapted_state_dict, strict=True)
+        for line in summarize_adapt_report(adapt_report):
+            print(f"⚠️ {line}")
         self.model.eval()
         self.is_loaded = True
         print("✅ 模型加载完毕！")

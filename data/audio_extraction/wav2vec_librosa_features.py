@@ -22,7 +22,9 @@ SR_WAV2VEC = 16000
 _EXTRACTOR = None
 
 class LightweightAudioExtractor:
-    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, device=None):
+        if device is None:
+            device = os.environ.get("EDGE_AUDIO_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         print(f"Loading Wav2Vec2 on {self.device}...")
         # 使用基础版 Wav2Vec2，参数量小，非常适合单卡 4090 的显存管理
@@ -109,17 +111,23 @@ class LightweightAudioExtractor:
         return save_path
 
 
-def get_extractor():
+def get_extractor(device=None):
     global _EXTRACTOR
-    if _EXTRACTOR is None:
-        _EXTRACTOR = LightweightAudioExtractor()
+    requested_device = device or os.environ.get("EDGE_AUDIO_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+    if _EXTRACTOR is None or str(getattr(_EXTRACTOR, "device", "")) != str(requested_device):
+        _EXTRACTOR = LightweightAudioExtractor(device=requested_device)
     return _EXTRACTOR
 
 
-def extract(fpath, skip_completed=True, dest_dir=None):
+def extract(fpath, skip_completed=True, dest_dir=None, device=None):
     if dest_dir is None:
         dest_dir = os.path.dirname(fpath)
-    extractor = get_extractor()
+    audio_name = Path(fpath).stem
+    save_path = os.path.join(dest_dir, f"{audio_name}.npy")
+    if os.path.exists(save_path) and skip_completed:
+        return np.load(save_path), save_path
+
+    extractor = get_extractor(device=device)
     save_path = extractor.process(fpath, dest_dir, skip_completed=skip_completed)
     return np.load(save_path), save_path
 
