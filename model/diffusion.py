@@ -329,8 +329,24 @@ class GaussianDiffusion(nn.Module):
         if constraint is not None and constraint.get("mask", None) is not None and constraint.get("value", None) is not None:
             mask = constraint["mask"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
             value = constraint["value"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            key_loss = ((pred_xstart - value) ** 2 * mask).sum() / (mask.sum() * pred_xstart.shape[-1] + 1e-6)
-            loss = loss + 2.0 * key_loss
+
+            if mask.shape[-1] == 1:
+                feature_mask = mask.expand_as(pred_xstart)
+                denom = mask.sum() * pred_xstart.shape[-1]
+            elif mask.shape[-1] == pred_xstart.shape[-1]:
+                feature_mask = mask
+                denom = mask.sum()
+            else:
+                raise ValueError(
+                    f"constraint mask last dim must be 1 or {pred_xstart.shape[-1]}, "
+                    f"got {mask.shape[-1]}"
+                )
+
+            squared_error = (pred_xstart - value) ** 2 * feature_mask
+            key_loss = squared_error.sum() / (denom.clamp_min(1e-6))
+
+            # 不再硬编码 2.0，使用 __init__ 里已经传入的 keyframe_loss_weight
+            loss = loss + float(self.keyframe_loss_weight) * key_loss
 
         if root_xz.shape[1] > 2:
             root_acc = root_xz[:, 2:] - 2.0 * root_xz[:, 1:-1] + root_xz[:, :-2]
