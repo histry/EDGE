@@ -55,7 +55,6 @@ class TransformerEncoderLayer(nn.Module):
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
         
-        # 还原为常规的线性层，释放高频动作表达能力
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -86,19 +85,17 @@ class TransformerEncoderLayer(nn.Module):
 
         return x
 
-    def _sa_block(
-        self, x: Tensor, attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]
-    ) -> Tensor:
-        qk = self.rotary.rotate_queries_or_keys(x) if self.use_rotary else x
-        x = self.self_attn(
-            qk,
-            qk,
+    def _sa_block(self, x, attn_mask, key_padding_mask):
+        # ✨ 修复 1.1：直接传入 x，废弃错误的 RoPE 调用，防止内部 W_q 投影彻底打乱旋转复数对
+        x_out = self.self_attn(
+            x,
+            x,
             x,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )[0]
-        return self.dropout1(x)
+        return self.dropout1(x_out)
 
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
@@ -128,7 +125,6 @@ class FiLMTransformerDecoderLayer(nn.Module):
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
         
-        # 还原为常规的线性层，配合显式物理 Loss 控制平滑
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -187,29 +183,28 @@ class FiLMTransformerDecoderLayer(nn.Module):
         return x
 
     def _sa_block(self, x, attn_mask, key_padding_mask):
-        qk = self.rotary.rotate_queries_or_keys(x) if self.use_rotary else x
-        x = self.self_attn(
-            qk,
-            qk,
+        # ✨ 修复 1.2：直接传入 x，解除对原生 MHA 内部投影的干扰
+        x_out = self.self_attn(
+            x,
+            x,
             x,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )[0]
-        return self.dropout1(x)
+        return self.dropout1(x_out)
 
     def _mha_block(self, x, mem, attn_mask, key_padding_mask):
-        q = self.rotary.rotate_queries_or_keys(x) if self.use_rotary else x
-        k = self.rotary.rotate_queries_or_keys(mem) if self.use_rotary else mem
-        x = self.multihead_attn(
-            q,
-            k,
+        # ✨ 修复 1.3：直接传入 x 和 mem
+        x_out = self.multihead_attn(
+            x,
+            mem,
             mem,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )[0]
-        return self.dropout2(x)
+        return self.dropout2(x_out)
 
     def _ff_block(self, x):
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
@@ -274,15 +269,11 @@ class DanceDecoder(nn.Module):
         self.use_sparse_attn = use_sparse_attn
         self.sparse_attn_window = sparse_attn_window
 
-        self.rotary = None
-        self.abs_pos_encoding = nn.Identity()
-        if use_rotary:
-            self.rotary = RotaryEmbedding(dim=latent_dim)
-        else:
-            self.abs_pos_encoding = PositionalEncoding(
-                latent_dim, dropout, batch_first=True
-            )
-
+        # ✨ 修复：即使开启了 RoPE，也强制保留绝对位置编码，修复模型的时间盲区
+        self.rotary = RotaryEmbedding(dim=latent_dim) if use_rotary else None
+        self.abs_pos_encoding = PositionalEncoding(
+            latent_dim, dropout, batch_first=True
+        )
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(latent_dim),
             nn.Linear(latent_dim, latent_dim * 4),
@@ -335,9 +326,10 @@ class DanceDecoder(nn.Module):
             nn.LayerNorm(latent_dim)
         )
 
+        # ✨ 修复：将 SiLU 移到 Linear 前面，解放轨迹调制层的负数空间表达能力
         self.traj_modulate = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim * 2)
         )
 
         decoderstack = nn.ModuleList([])

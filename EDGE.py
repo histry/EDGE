@@ -369,15 +369,29 @@ class EDGE:
         if is_dunhuang:
             print(f"\n🪷 检测到敦煌数据集路径 ({data_path})，启动中华古典舞纯视觉微调模式！")
             
-            # ✨ 核心修复 1：划分独立的训练集与验证集，防止静默过拟合
-            full_dataset = DunhuangDataset(
+            # ✨ 修复 1：废弃 random_split，改为基于文件级别划分 (File-level split)
+            # 注意：需在 dataset/dance_dataset.py 中的 DunhuangDataset 类里同步增加对 train 参数的支持
+            train_dataset = DunhuangDataset(
                 data_path=data_path,
+                train=True,  # 告知 Dataset 分配前 90% 的原文件进行切片
                 seq_len=opt.seq_len,
                 audio_dim=self.audio_dim,
                 normalizer=self.normalizer,
                 return_traj=True
             )
-            self.normalizer = full_dataset.normalizer
+            self.normalizer = train_dataset.normalizer
+            self.diffusion.normalizer = self.normalizer
+            
+            test_dataset = DunhuangDataset(
+                data_path=data_path,
+                train=False, # 告知 Dataset 分配后 10% 的原文件进行切片
+                seq_len=opt.seq_len,
+                audio_dim=self.audio_dim,
+                normalizer=self.normalizer, # 验证集必须严格复用训练集的归一化参数
+                return_traj=True
+            )
+            
+            self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer
             
             if len(full_dataset) > 1:
