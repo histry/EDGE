@@ -209,7 +209,10 @@ class EDGE:
             mid_keyframe_count=mid_keyframe_count,
             mid_keyframe_condition_width=mid_keyframe_condition_width,
             mid_keyframe_selection=mid_keyframe_selection,
-            data_fps=30
+            data_fps=30,
+            # ✨ 新增：
+            beat_guidance_weight=getattr(opt, "beat_guidance_weight", 0.0),
+            hard_keyframe_project=getattr(opt, "hard_keyframe_project", False)
         )
         
         diffusion.normalizer = self.normalizer
@@ -233,6 +236,8 @@ class EDGE:
 
         self.model = self.accelerator.prepare(model)
         self.diffusion = diffusion.to(self.accelerator.device)
+        # ✨ 新增这行：将 diffusion 内部的模型引用强制替换为被 Accelerator 包装后的 DDP 模型
+        self.diffusion.model = self.model
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if not trainable_params:
             raise RuntimeError("No trainable parameters left after stage freezing.")

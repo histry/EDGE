@@ -404,7 +404,7 @@ class DunhuangDataset(Dataset):
             motion_t = vectorize_many(l)
             motion = motion_t.squeeze(0).float().detach().numpy()
 
-            traj_xy = pos[:, [0, 2]]
+            traj_xz = pos[:, [0, 2]]
             step = max(1, int(seq_len * (1 - overlap)))
             num_frames = motion.shape[0]
             if num_frames < seq_len:
@@ -412,7 +412,7 @@ class DunhuangDataset(Dataset):
 
             for start in range(0, num_frames - seq_len + 1, step):
                 slice_motion = motion[start : start + seq_len].copy()
-                slice_traj = traj_xy[start : start + seq_len].copy()
+                slice_traj = traj_xz[start : start + seq_len].copy() # 对应修改
 
                 local_start_x = slice_motion[0, 4]
                 local_start_z = slice_motion[0, 6]

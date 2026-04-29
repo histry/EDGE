@@ -205,6 +205,18 @@ def parse_train_opt():
     opt = parser.parse_args()
     return opt
 
+# 在 parse_train_opt 和 parse_test_opt 中新增：
+    parser.add_argument(
+        "--beat_guidance_weight",
+        type=float,
+        default=0.0,
+        help="Weight for music beat/onset guidance during inference/TTO",
+    )
+    parser.add_argument(
+        "--hard_keyframe_project",
+        action="store_true",
+        help="Force strict replacement of known keyframes at every diffusion step",
+    )
 
 def parse_test_opt():
     parser = argparse.ArgumentParser()

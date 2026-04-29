@@ -395,7 +395,7 @@ class DanceDecoder(nn.Module):
                 trajectory_cond = trajectory_cond[..., :2]
             if trajectory_cond.shape[-1] != 2:
                 raise ValueError(
-                    f"Trajectory condition must have 2 channels (XY), got {trajectory_cond.shape[-1]}"
+                    f"Trajectory condition must have 2 channels (XZ ground plane), got {trajectory_cond.shape[-1]}"
                 )
             if trajectory_cond.shape[1] != seq_len:
                 trajectory_cond = F.interpolate(
@@ -491,10 +491,11 @@ class DanceDecoder(nn.Module):
             cond_embed, batch_size, seq_len, device, x.dtype
         )
         
+        # ✨ 替换为：
         if keep_audio_mask is None:
-            keep_audio_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
+            keep_audio_mask = prob_mask_like((batch_size,), 1.0 - cond_drop_prob, device=device)
         if keep_traj_mask is None:
-            keep_traj_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
+            keep_traj_mask = prob_mask_like((batch_size,), 1.0 - cond_drop_prob, device=device)
         
         keep_audio_mask_embed = rearrange(keep_audio_mask, "b -> b 1 1")
         keep_audio_mask_hidden = rearrange(keep_audio_mask, "b -> b 1")
