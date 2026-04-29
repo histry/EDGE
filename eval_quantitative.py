@@ -316,7 +316,17 @@ def eval_raw_post_trajectory(args, primary_motion):
 
     raw_metrics = eval_trajectory(raw_motion, args)
     post_metrics = eval_trajectory(post_motion, args)
-    out = {}
+
+    out = {
+        "trajectory_eval_note": (
+            "raw_* metrics evaluate the model output before system postprocessing; "
+            "post_* metrics evaluate the final displayed system output after postprocessing. "
+            "If post trajectory error is near zero but raw error is not, trajectory accuracy mainly comes from postprocessing."
+        ),
+        "raw_motion_path": os.path.abspath(raw_path) if raw_path else os.path.abspath(args.motion),
+        "post_motion_path": os.path.abspath(post_path) if post_path else os.path.abspath(args.motion),
+    }
+
     out.update(prefixed(raw_metrics, "raw_"))
     out.update(prefixed(post_metrics, "post_"))
 
@@ -326,6 +336,7 @@ def eval_raw_post_trajectory(args, primary_motion):
             post_value = post_metrics[key]
             if isinstance(raw_value, float) and isinstance(post_value, float):
                 out[f"post_minus_raw_{key}"] = post_value - raw_value
+
     return out
 
 

@@ -15,7 +15,9 @@
 
 由于当前没有真实的敦煌音乐-动作配对数据集，音乐部分的表述统一为：
 
-> 模型继承原 EDGE/AIST 预训练阶段获得的 audio-conditioned denoising prior；敦煌阶段主要训练姿态、轨迹和关键帧控制，不把 proxy music 当作真实监督配对。推理时从输入音乐提取 Wav2Vec2 + Librosa 混合特征，并使用 onset/beat 强度作为节拍锚点，对轨迹时序和可选姿态锚点进行弱引导。
+模型保留原 EDGE/AIST 的扩散生成框架、动作生成先验和 audio-conditioned 接口结构。需要注意的是，当前敦煌版本使用 803 维 hybrid audio feature（Wav2Vec2 + Librosa）。当该特征维度与原 checkpoint 的音频投影层不一致时，相关音频投影层会重新初始化，因此当前不声称完整继承了原模型的音乐编码能力。
+
+敦煌阶段主要训练姿态风格、关键帧过渡、轨迹控制和物理连续性；音乐部分采用 proxy music 弱节奏候选和推理阶段 onset/beat 锚点引导，不把 proxy music 当作真实监督配对。
 
 因此当前可以说“生成结果对重音和节奏变化有响应趋势”，不说“在敦煌数据上学会了音乐-动作严格对齐”或“完美卡准节拍”。
 

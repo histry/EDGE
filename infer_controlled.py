@@ -307,29 +307,115 @@ def find_contact_segments(contact_mask, min_len=3):
     return segments
 
 
+def height_contact_mask(feet, height_threshold=0.035):
+    """
+    feet: [T, 4, 3]
+    return: [T, 4] bool
+
+    当 contact channel 不可靠时，用脚高度判断接触。
+    """
+    heights = feet[:, :, 1]
+    floor = np.percentile(heights, 2)
+    return heights <= floor + float(height_threshold)
+
+
+def smooth_2d_sequence(x, window=5):
+    """
+    x: [T, 2]
+    简单 moving average，避免 root_delta 抖动。
+    """
+    window = max(1, int(window))
+    if window <= 1 or len(x) < 3:
+        return x
+
+    if window % 2 == 0:
+        window += 1
+
+    pad = window // 2
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    out = np.zeros_like(x, dtype=np.float32)
+
+    for dim in range(x.shape[1]):
+        out[:, dim] = np.convolve(
+            np.pad(x[:, dim], (pad, pad), mode="edge"),
+            kernel,
+            mode="valid",
+        )
+
+    return out.astype(np.float32)
+
+
+def choose_contact_mask(
+    motion,
+    feet,
+    contact_threshold=0.8,
+    contact_source="auto",
+    height_contact_threshold=0.035,
+):
+    """
+    return:
+        contacts: [T, 4] bool
+        actual_source: str
+    """
+    channel_contacts = motion[:, 0:4] > float(contact_threshold)
+    height_contacts = height_contact_mask(
+        feet,
+        height_threshold=height_contact_threshold,
+    )
+
+    if contact_source == "channels":
+        return channel_contacts, "channels"
+
+    if contact_source == "height":
+        return height_contacts, "height"
+
+    # auto: contact channel 太稀疏或太饱和时，认为不可靠，回退到 height-based contact
+    ratio = float(channel_contacts.mean())
+    use_channels = 0.01 <= ratio <= 0.95
+
+    if use_channels:
+        return channel_contacts, "channels"
+
+    return height_contacts, "height"
+
+
 def apply_foot_lock_postprocess(
     motion_physical,
     device,
     strength=0.7,
     contact_threshold=0.8,
     min_segment=3,
+    contact_source="auto",
+    height_contact_threshold=0.035,
+    smooth_window=5,
+    max_root_delta=0.08,
 ):
     """
     Reduce horizontal foot sliding by adjusting root X/Z during contact segments.
 
-    This is a display/system-level postprocess. It may slightly change the root trajectory,
-    so raw_model_motion should still be used for model-only evaluation.
+    改进点：
+    1. 支持 contact_source=auto/channels/height。
+    2. contact channel 饱和或失效时，自动回退到脚高度接触。
+    3. 对 root_delta 做平滑，避免 foot lock 自身造成抖动。
+    4. 限制每帧最大 root 修正量，避免破坏轨迹太多。
     """
     motion = motion_physical.copy().astype(np.float32)
     strength = float(np.clip(strength, 0.0, 1.0))
 
     if strength <= 0:
-        return motion
+        return motion, "disabled"
 
-    joints = motion_to_joints(motion, device=device)  # [T,24,3]
-    contacts = motion[:, 0:4] > contact_threshold
+    joints = motion_to_joints(motion, device=device)  # [T, 24, 3]
+    feet = joints[:, [7, 8, 10, 11], :]               # [T, 4, 3]
 
-    # SMPL foot joint ids used elsewhere in the project: [7, 8, 10, 11]
+    contacts, actual_source = choose_contact_mask(
+        motion=motion,
+        feet=feet,
+        contact_threshold=contact_threshold,
+        contact_source=contact_source,
+        height_contact_threshold=height_contact_threshold,
+    )
+
     foot_joint_ids = [7, 8, 10, 11]
     T = motion.shape[0]
 
@@ -353,21 +439,35 @@ def apply_foot_lock_postprocess(
 
     valid = delta_count[:, 0] > 0
     if not np.any(valid):
-        return motion
+        return motion, actual_source
 
     root_delta = np.zeros((T, 2), dtype=np.float32)
     root_delta[valid] = delta_sum[valid] / np.maximum(delta_count[valid], 1e-6)
 
+    # 限制单帧 root 修正幅度，避免把轨迹拉坏。
+    max_root_delta = float(max_root_delta)
+    if max_root_delta > 0:
+        delta_norm = np.linalg.norm(root_delta, axis=1, keepdims=True)
+        scale = np.minimum(1.0, max_root_delta / np.maximum(delta_norm, 1e-8))
+        root_delta = root_delta * scale
+
+    root_delta = smooth_2d_sequence(root_delta, window=smooth_window)
+
     motion[:, ROOT_X_IDX] += strength * root_delta[:, 0]
     motion[:, ROOT_Z_IDX] += strength * root_delta[:, 1]
 
-    return motion.astype(np.float32)
+    return motion.astype(np.float32), actual_source
 
 def main():
     parser = argparse.ArgumentParser("Controlled EDGE inference")
 
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--music", required=True)
+    parser.add_argument(
+        "--use_raw_weights",
+        action="store_true",
+        help="Use raw model_state_dict instead of ema_state_dict. Default inference uses EMA weights.",
+    )
     parser.add_argument("--feature_type", default="hybrid", choices=["hybrid", "baseline", "jukebox"])
     parser.add_argument("--audio_dim", type=int, default=803)
 
@@ -399,7 +499,41 @@ def main():
     parser.add_argument("--foot_lock_strength", type=float, default=0.7)
     parser.add_argument("--foot_lock_contact_threshold", type=float, default=0.8)
     parser.add_argument("--foot_lock_min_segment", type=int, default=3)
-
+    parser.add_argument(
+        "--foot_lock_contact_source",
+        choices=["auto", "channels", "height"],
+        default="auto",
+        help="Contact source for foot lock. auto falls back to height contact when contact channels are saturated or unreliable.",
+    )
+    parser.add_argument(
+        "--foot_lock_height_threshold",
+        type=float,
+        default=0.035,
+        help="Height threshold in meters for height-based foot contact.",
+    )
+    parser.add_argument(
+        "--foot_lock_smooth_window",
+        type=int,
+        default=5,
+        help="Temporal smoothing window for root delta in foot lock.",
+    )
+    parser.add_argument(
+        "--foot_lock_max_root_delta",
+        type=float,
+        default=0.08,
+        help="Maximum per-frame root XZ correction in meters. Set <=0 to disable clipping.",
+    )
+    parser.add_argument(
+        "--restore_trajectory_after_foot_lock",
+        action="store_true",
+        help="After foot lock, softly blend root X/Z back to the target trajectory.",
+    )
+    parser.add_argument(
+        "--restore_trajectory_strength",
+        type=float,
+        default=0.25,
+        help="Soft trajectory restoration strength after foot lock. Use small value to avoid reintroducing sliding.",
+    )
     parser.add_argument("--postprocess_trajectory", action="store_true")
     parser.add_argument("--postprocess_strength", type=float, default=1.0)
 
@@ -419,7 +553,7 @@ def main():
         checkpoint_path=args.checkpoint,
         audio_dim=args.audio_dim,
         seq_len=args.model_seq_len,
-        EMA=False,
+        EMA=not args.use_raw_weights,
         beat_guidance_weight=args.beat_guidance_weight,
         hard_keyframe_project=args.hard_keyframe_project,
     )
@@ -505,31 +639,60 @@ def main():
         )
 
     if args.foot_lock_postprocess:
-        final_motion = apply_foot_lock_postprocess(
+        final_motion, actual_contact_source = apply_foot_lock_postprocess(
             motion_physical=final_motion,
             device=model.accelerator.device,
             strength=args.foot_lock_strength,
             contact_threshold=args.foot_lock_contact_threshold,
             min_segment=args.foot_lock_min_segment,
+            contact_source=args.foot_lock_contact_source,
+            height_contact_threshold=args.foot_lock_height_threshold,
+            smooth_window=args.foot_lock_smooth_window,
+            max_root_delta=args.foot_lock_max_root_delta,
         )
+
         postprocess_steps.append(
             {
                 "name": "foot_lock_postprocess",
                 "strength": float(args.foot_lock_strength),
                 "contact_threshold": float(args.foot_lock_contact_threshold),
+                "contact_source_requested": args.foot_lock_contact_source,
+                "contact_source_actual": actual_contact_source,
+                "height_contact_threshold": float(args.foot_lock_height_threshold),
+                "smooth_window": int(args.foot_lock_smooth_window),
+                "max_root_delta": float(args.foot_lock_max_root_delta),
                 "min_segment": int(args.foot_lock_min_segment),
                 "note": (
                     "Root X/Z is adjusted during detected foot-contact segments to reduce sliding. "
-                    "This may slightly trade off trajectory accuracy for visual physical plausibility."
+                    "This may trade off trajectory accuracy for visual physical plausibility. "
+                    "Use raw_model_motion for model-only evaluation and final_system_motion for system display."
                 ),
             }
         )
+
+        if args.restore_trajectory_after_foot_lock and traj_physical is not None:
+            final_motion = apply_trajectory_postprocess(
+                motion_physical=final_motion,
+                traj_physical=traj_physical,
+                strength=args.restore_trajectory_strength,
+            )
+            postprocess_steps.append(
+                {
+                    "name": "restore_trajectory_after_foot_lock",
+                    "strength": float(args.restore_trajectory_strength),
+                    "note": (
+                        "Softly blends root X/Z back toward target trajectory after foot lock. "
+                        "Use a small strength; too large a value may reintroduce foot sliding."
+                    ),
+                }
+            )
 
     final_motion_path = os.path.join(args.out_dir, f"{args.out_name}_final_system.npy")
     np.save(final_motion_path, final_motion.astype(np.float32))
 
     metadata = {
         "checkpoint": args.checkpoint,
+        "weight_source": "model_state_dict" if args.use_raw_weights else "ema_state_dict",
         "music": args.music,
         "frames": args.frames,
         "feature_type": args.feature_type,
