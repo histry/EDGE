@@ -274,15 +274,31 @@ class GaussianDiffusion(nn.Module):
         # ====================================================================
 
         if isinstance(cond, dict) and cond.get("trajectory", None) is not None:
-            target_traj = cond["trajectory"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            if target_traj.shape[1] != root_xz.shape[1]:
-                target_traj = F.interpolate(
-                    target_traj.transpose(1, 2),
+            target_traj_norm = cond["trajectory"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+            if target_traj_norm.shape[1] != root_xz.shape[1]:
+                target_traj_norm = F.interpolate(
+                    target_traj_norm.transpose(1, 2),
                     size=root_xz.shape[1],
                     mode="linear",
                     align_corners=False,
                 ).transpose(1, 2)
-            target_traj = target_traj[..., :2]
+            target_traj_norm = target_traj_norm[..., :2]
+            
+            # ======= 修复：将条件轨迹反归一化到物理空间 =======
+            normalizer = getattr(self, "normalizer", None)
+            if normalizer is not None and hasattr(normalizer, "mean"):
+                mean_x = target_traj_norm.new_tensor(normalizer.mean[4])
+                mean_z = target_traj_norm.new_tensor(normalizer.mean[6])
+                std_x = target_traj_norm.new_tensor(normalizer.std[4])
+                std_z = target_traj_norm.new_tensor(normalizer.std[6])
+                
+                target_traj = target_traj_norm.clone()
+                target_traj[..., 0] = target_traj_norm[..., 0] * std_x + mean_x
+                target_traj[..., 1] = target_traj_norm[..., 1] * std_z + mean_z
+            else:
+                target_traj = target_traj_norm
+            # ===================================================
+
             traj_loss = F.mse_loss(root_xz, target_traj)
             traj_velocity_loss = F.mse_loss(root_xz[:, 1:] - root_xz[:, :-1], target_traj[:, 1:] - target_traj[:, :-1])
             loss = loss + 4.0 * traj_loss + 0.5 * traj_velocity_loss
@@ -965,12 +981,16 @@ class GaussianDiffusion(nn.Module):
                 dist_wrists = torch.norm(l_wrist - r_wrist, dim=-1)
                 asymmetry_loss_raw = F.relu(0.02 - dist_wrists)
                 
-                # ✨ 核心修复：确保哪怕没有强制关键帧掩码，该 Loss 也能照常生效并被聚合！
+                # ✨ 核心修复：严密的生物力学掩码逻辑。无关键帧干预时，对全序列无差别施加物理先验。
                 if force_mask is not None:
                     mask_inv = (1.0 - force_mask[:, global_s_idx, 0])
-                    scurve_loss_raw = scurve_loss_raw * mask_inv
-                    hunchback_loss_raw = hunchback_loss_raw * mask_inv
-                    asymmetry_loss_raw = asymmetry_loss_raw * mask_inv
+                else:
+                    # 如果不存在关键帧强制掩码，则物理约束 100% 作用于全序列
+                    mask_inv = torch.ones_like(scurve_loss_raw)
+                    
+                scurve_loss_raw = scurve_loss_raw * mask_inv
+                hunchback_loss_raw = hunchback_loss_raw * mask_inv
+                asymmetry_loss_raw = asymmetry_loss_raw * mask_inv
                     
                 scurve_loss = reduce(scurve_loss_raw, "b ... -> b (...)", "mean")
                 scurve_loss = scurve_loss * extract(self.p2_loss_weight, t_sub, scurve_loss.shape) * biomech_weight
@@ -1070,19 +1090,32 @@ class GaussianDiffusion(nn.Module):
                     mmr_loss = (weighted_mmr_loss * valid_audio_mask).sum() / (valid_audio_mask.sum() + 1e-6)
 
             traj_loss = torch.tensor(0.0, device=x_start.device)
-            target_traj = cond.get("trajectory", None) if isinstance(cond, dict) else None
+            raw_target_traj = cond.get("trajectory", None) if isinstance(cond, dict) else None
             
-            if target_traj is not None:
-                target_traj = target_traj.to(device=model_out_main.device, dtype=model_out_main.dtype)
+            if raw_target_traj is not None:
+                target_traj_norm = raw_target_traj.to(device=model_out_main.device, dtype=model_out_main.dtype)
                 
-                if target_traj.shape[1] != s:
-                    target_traj = F.interpolate(
-                        target_traj.transpose(1, 2), size=s, mode="linear", align_corners=False
+                if target_traj_norm.shape[1] != s:
+                    target_traj_norm = F.interpolate(
+                        target_traj_norm.transpose(1, 2), size=s, mode="linear", align_corners=False
                     ).transpose(1, 2)
                     
-                # ======= 修复 2：使用真实的物理输出计算轨迹误差 =======
-                # model_out_main 是你在前面代码 (约530行) 经过正常化逆运算推导出的真实物理 x0
-                # 取前三维 [X, Y, Z] 中的 X 和 Z (即 0 和 2)
+                # ======= 修复 2：将 Target Trajectory 转换为物理量纲 =======
+                normalizer = getattr(self, "normalizer", None)
+                if normalizer is not None and hasattr(normalizer, "mean"):
+                    mean_x = target_traj_norm.new_tensor(normalizer.mean[4])
+                    mean_z = target_traj_norm.new_tensor(normalizer.mean[6])
+                    std_x = target_traj_norm.new_tensor(normalizer.std[4])
+                    std_z = target_traj_norm.new_tensor(normalizer.std[6])
+                    
+                    target_traj = target_traj_norm.clone()
+                    target_traj[..., 0] = target_traj_norm[..., 0] * std_x + mean_x
+                    target_traj[..., 1] = target_traj_norm[..., 1] * std_z + mean_z
+                else:
+                    target_traj = target_traj_norm
+                # ========================================================
+                
+                # 使用真实的物理输出计算轨迹误差
                 pred_traj = model_out_main[:, :, [0, 2]]
                 # ===================================================
                 
