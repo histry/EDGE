@@ -6,7 +6,7 @@ import sys
 import csv
 from functools import cmp_to_key
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -316,6 +316,7 @@ class DunhuangDataset(Dataset):
     def __init__(
         self,
         data_path,
+        train: Optional[bool] = None,
         seq_len=150,
         audio_dim=803,
         overlap=0.5,
@@ -323,11 +324,16 @@ class DunhuangDataset(Dataset):
         return_traj=False,
         weak_pairs_path="data/proxy_weak_pairs/weak_pairs.csv",
         use_weak_pairs=True,
+        split_ratio=0.9,
+        split_seed=42,
+        audio_sample_mode="random",
     ):
         self.data_path = data_path
+        self.train = train
         self.seq_len = seq_len
         self.audio_dim = audio_dim
         self.return_traj = return_traj
+        self.audio_sample_mode = audio_sample_mode
         self.proxy_audios = []
         self.motion_window_ids = []
         self.weak_pair_map = {}
@@ -360,6 +366,9 @@ class DunhuangDataset(Dataset):
         if not self.pkl_files: # 只有当容错路径没找到时，才使用原路径搜索
             search_path = os.path.join(self.data_path, "*.pkl")
             self.pkl_files = sorted(glob.glob(search_path))
+
+        self.all_pkl_files = list(self.pkl_files)
+        self.split_source_files(train=train, split_ratio=split_ratio, split_seed=split_seed)
 
         motions_list = []
         trajs_list = []
@@ -441,6 +450,31 @@ class DunhuangDataset(Dataset):
             self.trajs = np.zeros((0, seq_len, 2), dtype=np.float32)
             self.normalizer = normalizer if (normalizer is not None and hasattr(normalizer, 'mean')) else None
 
+    def split_source_files(self, train, split_ratio=0.9, split_seed=42):
+        if train is None or len(self.pkl_files) <= 1:
+            self.split_name = "all" if train is None else ("train" if train else "val")
+            if train is not None and len(self.pkl_files) <= 1:
+                print("⚠️ 敦煌源文件少于 2 个，训练/验证将复用同一源文件。")
+            return
+
+        split_ratio = float(np.clip(split_ratio, 0.0, 1.0))
+        rng = random.Random(split_seed)
+        files = list(self.pkl_files)
+        rng.shuffle(files)
+
+        split_idx = int(round(len(files) * split_ratio))
+        split_idx = max(1, min(len(files) - 1, split_idx))
+        train_files = sorted(files[:split_idx])
+        val_files = sorted(files[split_idx:])
+
+        self.pkl_files = train_files if train else val_files
+        self.split_name = "train" if train else "val"
+        print(
+            f"📦 DunhuangDataset file-level split [{self.split_name}]: "
+            f"{len(self.pkl_files)}/{len(files)} source files, "
+            f"split_ratio={split_ratio:.2f}, seed={split_seed}"
+        )
+
     def __len__(self):
         return len(self.motions)
 
@@ -501,13 +535,20 @@ class DunhuangDataset(Dataset):
         return pair_map
 
     def _sample_audio_feature(self, idx):
+        if self.audio_sample_mode == "zero":
+            return None
+
         window_id = self.motion_window_ids[idx] if idx < len(self.motion_window_ids) else ""
         weak_candidates = self.weak_pair_map.get(window_id, [])
         if weak_candidates:
+            if self.audio_sample_mode == "best":
+                return max(weak_candidates, key=lambda candidate: candidate["score"])["audio_feat"]
             weights = [candidate["score"] for candidate in weak_candidates]
             return random.choices(weak_candidates, weights=weights, k=1)[0]["audio_feat"]
 
         if hasattr(self, 'proxy_audios') and len(self.proxy_audios) > 0:
+            if self.audio_sample_mode == "best":
+                return self.proxy_audios[0]
             return random.choice(self.proxy_audios)
         return None
 

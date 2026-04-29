@@ -2,6 +2,7 @@ import os
 import argparse
 import glob
 from contextlib import nullcontext
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -868,7 +869,9 @@ def run_music_driven_inference(args):
         smpl=active_smpl,      
         n_timestep=1000,       
         predict_epsilon=False,
-        guidance_weight=2.5  
+        guidance_weight=2.5,
+        hard_keyframe_project=bool(getattr(args, "hard_keyframe_project", False)),
+        beat_guidance_weight=float(getattr(args, "beat_guidance_weight", 0.0)),
     ).to(device)
     
     diffusion.normalizer = normalizer
@@ -976,6 +979,9 @@ def run_music_driven_inference(args):
     output_np = current_motion[:audio_seq_len].cpu().float().numpy()
 
     raw_model_out = getattr(args, "raw_model_out", "")
+    if raw_model_out == "auto":
+        out_root, out_ext = os.path.splitext(args.out)
+        raw_model_out = f"{out_root}_raw{out_ext or '.npy'}"
     if raw_model_out:
         raw_dir = os.path.dirname(raw_model_out)
         if raw_dir:
@@ -992,6 +998,47 @@ def run_music_driven_inference(args):
         mode=args.trajectory_post_mode,
         device=device,
     )
+
+    if bool(getattr(args, "foot_lock_post", False)):
+        from foot_lock_postprocess import apply_foot_lock
+
+        foot_args = SimpleNamespace(
+            fps=30.0,
+            device=str(device),
+            protected_frames=",".join(str(frame) for frame in sorted(set(protected_filter_frames))),
+            protect_endpoints=True,
+            protected_radius=int(getattr(args, "foot_lock_protected_radius", 8)),
+            contact_threshold=float(getattr(args, "foot_lock_contact_threshold", 0.8)),
+            height_threshold=float(getattr(args, "foot_lock_height_threshold", 0.06)),
+            max_lock_speed=float(getattr(args, "foot_lock_max_lock_speed", 0.8)),
+            min_contact_frames=int(getattr(args, "foot_lock_min_contact_frames", 4)),
+            steps=int(getattr(args, "foot_lock_steps", 120)),
+            lr=float(getattr(args, "foot_lock_lr", 0.03)),
+            strength=float(getattr(args, "foot_lock_strength", 0.75)),
+            lock_weight=float(getattr(args, "foot_lock_weight", 6.0)),
+            trajectory_weight=float(getattr(args, "foot_lock_trajectory_weight", 18.0)),
+            velocity_weight=float(getattr(args, "foot_lock_velocity_weight", 2.0)),
+            smooth_weight=float(getattr(args, "foot_lock_smooth_weight", 0.25)),
+            protected_weight=float(getattr(args, "foot_lock_protected_weight", 200.0)),
+            max_root_shift=float(getattr(args, "foot_lock_max_root_shift", 0.12)),
+            correction_smooth_window=int(getattr(args, "foot_lock_correction_smooth_window", 9)),
+            update_contact_channels=bool(getattr(args, "foot_lock_update_contact_channels", True)),
+        )
+        output_np, foot_stats = apply_foot_lock(output_np, foot_args)
+        stats_path = getattr(args, "foot_lock_stats_json", "")
+        if stats_path:
+            import json
+
+            stats_dir = os.path.dirname(stats_path)
+            if stats_dir:
+                os.makedirs(stats_dir, exist_ok=True)
+            with open(stats_path, "w", encoding="utf-8") as f:
+                json.dump(foot_stats, f, indent=2, ensure_ascii=False)
+        print(
+            f"🦶 已执行脚底锁定优化: applied={foot_stats.get('applied')}, "
+            f"lock_frames={foot_stats.get('lock_frame_count', 0)}, "
+            f"max_shift={foot_stats.get('max_root_shift_m', 0.0):.4f}m"
+        )
 
     if bool(getattr(args, "motion_spike_filter", False)):
         output_np, spike_frames, spike_threshold = suppress_motion_spikes(
@@ -1040,7 +1087,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="推理设备；GPU 显存被占满时可设为 cpu")
     parser.add_argument("--audio_device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="Wav2Vec2 音频特征提取设备；已有 .npy 缓存时不会加载 Wav2Vec2")
     parser.add_argument("--out", type=str, default="output/test_driven.npy", help="输出文件路径")
-    parser.add_argument("--raw_model_out", type=str, default="", help="可选：保存轨迹后处理前的模型原始输出，用于区分模型轨迹能力和后处理锚定效果")
+    parser.add_argument("--raw_model_out", type=str, default="", help="可选：保存轨迹后处理前的模型原始输出；设为 auto 时保存为 <out>_raw.npy")
     parser.add_argument("--trajectory", type=str, default="", help="2D (X,Z) 空间走位轨迹")
     parser.add_argument("--start_pose", type=str, default="", help="起始关键帧张量文件路径 (.npy)")
     parser.add_argument("--end_pose", type=str, default="", help="终止关键帧张量文件路径 (.npy)")
@@ -1073,6 +1120,26 @@ if __name__ == "__main__":
         help="trajectory postprocess mode: hard is strict path, optimize balances trajectory and foot contact",
     )
     parser.add_argument("--use_tto", action="store_true", help="enable lightweight test-time optimization during inpainting sampling")
+    parser.add_argument("--hard_keyframe_project", action="store_true", help="hard-project constrained keyframes during every denoising step")
+    parser.add_argument("--beat_guidance_weight", type=float, default=0.0, help="TTO beat guidance weight; requires --use_tto to affect sampling")
+    parser.add_argument("--foot_lock_post", action="store_true", help="apply conservative contact-aware foot lock after trajectory postprocess")
+    parser.add_argument("--foot_lock_stats_json", default="", help="optional JSON path for foot-lock postprocess stats")
+    parser.add_argument("--foot_lock_strength", type=float, default=0.75)
+    parser.add_argument("--foot_lock_trajectory_weight", type=float, default=18.0)
+    parser.add_argument("--foot_lock_max_root_shift", type=float, default=0.12)
+    parser.add_argument("--foot_lock_contact_threshold", type=float, default=0.8)
+    parser.add_argument("--foot_lock_height_threshold", type=float, default=0.06)
+    parser.add_argument("--foot_lock_max_lock_speed", type=float, default=0.8)
+    parser.add_argument("--foot_lock_min_contact_frames", type=int, default=4)
+    parser.add_argument("--foot_lock_steps", type=int, default=120)
+    parser.add_argument("--foot_lock_lr", type=float, default=0.03)
+    parser.add_argument("--foot_lock_weight", type=float, default=6.0)
+    parser.add_argument("--foot_lock_velocity_weight", type=float, default=2.0)
+    parser.add_argument("--foot_lock_smooth_weight", type=float, default=0.25)
+    parser.add_argument("--foot_lock_protected_weight", type=float, default=200.0)
+    parser.add_argument("--foot_lock_protected_radius", type=int, default=8)
+    parser.add_argument("--foot_lock_correction_smooth_window", type=int, default=9)
+    parser.add_argument("--foot_lock_update_contact_channels", action="store_true", default=True)
     parser.add_argument("--enable_rag", action="store_true", help="enable retrieved Dunhuang motion priors at audio peaks")
     parser.add_argument("--disable_rag", action="store_true", help="disable retrieved Dunhuang motion priors at audio peaks")
     parser.add_argument("--rag_db_dir", type=str, default="data/dunhuang_rag_db", help="directory containing Dunhuang RAG prior .npy files")

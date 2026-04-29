@@ -1,22 +1,20 @@
 import os
 from contextlib import nullcontext
-import cv2
 import torch
 import gradio as gr
 import numpy as np
 import scipy.interpolate as spi
 import torch.nn.functional as F
-import pickle
 import math
+import pose_keyframe as pose_keyframe_module
 from model.model import DanceDecoder
 from model.checkpoint_compat import adapt_checkpoint_state_dict, summarize_adapt_report
 from model.diffusion import GaussianDiffusion
 from data.audio_extraction.wav2vec_librosa_features import extract
-from dataset.quaternion import ax_to_6v, ax_from_6v 
+from dataset.quaternion import ax_from_6v
+from pose_keyframe import build_pose_151
 from vis import skeleton_render, SMPLSkeleton
 from trajectory_postprocess import TRAJECTORY_POST_MODES, apply_trajectory_postprocess
-
-_romp_model = None
 
 DEFAULT_CKPT_CANDIDATES = [
     os.environ.get("EDGE_GRADIO_CKPT", ""),
@@ -129,63 +127,16 @@ def generate_trajectory_tensor(control_points_str, seq_len, device, dtype, audio
 # 🌟 核心找回 2：FK 高度预结算 + 专家 PKL 混合通道
 # -----------------------------------------------------
 def estimate_3d_pose_hybrid(image_path, pkl_file, normalizer, device='cuda', target_trans_xz=None, is_flying=False):
-    contacts = torch.zeros(1, 4).to(device)
-    rot_144 = None
-    
-    pkl_path = pkl_file.name if hasattr(pkl_file, 'name') else pkl_file
-
-    if pkl_path is not None and os.path.exists(pkl_path):
-        with open(pkl_path, 'rb') as f:
-            data = pickle.load(f)
-        temp_q = torch.tensor(data['q'][0]).float().view(1, 24, 3).to(device)
-        rot_144 = ax_to_6v(temp_q).view(1, 144)
-        
-    elif image_path is not None and os.path.exists(image_path):
-        global _romp_model
-        if _romp_model is None:
-            import romp
-            settings = romp.main.default_settings
-            _romp_model = romp.ROMP(settings)
-
-        image = cv2.imread(image_path)
-        outputs = _romp_model(image) 
-        
-        if outputs is not None and 'smpl_thetas' in outputs:
-            smpl_72 = outputs['smpl_thetas'][0:1, :72].to(device) 
-            smpl_24_3 = smpl_72.view(1, 24, 3) 
-            rot_144 = ax_to_6v(smpl_24_3).view(1, 144)
-            
-    if rot_144 is None:
-        rot_144 = ax_to_6v(torch.zeros(1, 24, 3).to(device)).view(1, 144)
-
-    smpl = SMPLSkeleton(device=device)
-    temp_pos = torch.zeros(1, 1, 3).to(device)
-    
-    if target_trans_xz is not None:
-        temp_pos[0, 0, 0] = target_trans_xz[0]
-        temp_pos[0, 0, 2] = target_trans_xz[1]
-        
-    # FK 预演算并反向拉平脚部贴地高度
-    temp_q = ax_from_6v(rot_144.view(1, 1, 24, 6))
-    joints_3d = smpl.forward(temp_q, temp_pos)
-    foot_y = joints_3d[0, 0, [7, 8, 10, 11], 1]
-    
-    # 🌟 核心修复 2：严格贴地演算并自动打上物理 Contact 标签
-    min_foot_y = torch.min(foot_y)
-    
-    if not is_flying:
-        temp_pos[0, 0, 1] = -min_foot_y # 正常贴地
-        contact_mask = (foot_y - min_foot_y < 0.02).float().view(1, 4)
-    else:
-        # 飞天姿态：给予默认的离地高度（如 0.5m），且接触概率强制设为 0
-        temp_pos[0, 0, 1] = -min_foot_y + 0.5 
-        contact_mask = torch.zeros(1, 4).to(device)
-        print("🕊️ 收到飞天指令，已解除地面吸附锁定！")
-        
-    contacts = contact_mask 
-    pose_151 = torch.cat([contacts, temp_pos.squeeze(0), rot_144], dim=1)
-    pose_norm = normalizer.normalize(pose_151).squeeze(0).squeeze(0)
-    return pose_norm
+    pose_np = build_pose_151(
+        image_path=image_path,
+        pkl_path=pkl_file,
+        normalizer=normalizer,
+        device=device,
+        target_trans_xz=target_trans_xz,
+        is_flying=is_flying,
+        normalize=True,
+    )
+    return torch.tensor(pose_np, device=device, dtype=torch.float32)
 
 # -----------------------------------------------------
 # 🌟 核心保留 3：带 is_mask 的智能切块器
@@ -224,7 +175,7 @@ def chunk_tensor(tensor, horizon=150, stride=75, target_frames=150, is_mask=Fals
                 break
     return torch.stack(chunks, dim=0) 
 
-def run_choreography_pipeline(audio_file, img_start_in, pkl_start_in, img_end_in, pkl_end_in, trajectory_str, trajectory_post_mode, use_tto, is_flying):
+def run_choreography_pipeline(audio_file, img_start_in, pkl_start_in, img_end_in, pkl_end_in, trajectory_str, trajectory_post_mode, use_tto, hard_keyframe_project, is_flying):
     if not engine.is_loaded: engine.load_models()
 
     print("🎵 Pipeline Step 1: 提取多模态特征...")
@@ -313,10 +264,9 @@ def run_choreography_pipeline(audio_file, img_start_in, pkl_start_in, img_end_in
     # ==========================================
     print("🧹 正在清理特征提取器显存，为扩散模型极限腾出空间...")
     import gc
-    global _romp_model
-    if _romp_model is not None:
-        del _romp_model
-        _romp_model = None
+    if pose_keyframe_module._ROMP_MODEL is not None:
+        del pose_keyframe_module._ROMP_MODEL
+        pose_keyframe_module._ROMP_MODEL = None
         
     from data.audio_extraction.wav2vec_librosa_features import _EXTRACTOR
     if _EXTRACTOR is not None and hasattr(_EXTRACTOR, 'model'):
@@ -332,7 +282,8 @@ def run_choreography_pipeline(audio_file, img_start_in, pkl_start_in, img_end_in
         model=engine.model, horizon=horizon, repr_dim=151, 
         smpl=active_smpl, n_timestep=1000, 
         predict_epsilon=False,
-        guidance_weight=2.5
+        guidance_weight=2.5,
+        hard_keyframe_project=hard_keyframe_project,
     ).to(engine.device)
     diffusion.normalizer = engine.normalizer 
     
@@ -473,6 +424,7 @@ with gr.Blocks(title="敦煌数字编舞引擎") as app:
                     label="轨迹后处理",
                 )
                 use_tto_in = gr.Checkbox(label="🔥 开启 TTO 物理运动学优化 (建议开启，如需极速预览请关闭)", value=False)
+                hard_keyframe_project_in = gr.Checkbox(label="🎯 硬投影关键帧 (严格贴合起止姿态)", value=False)
                 is_flying_in = gr.Checkbox(label="🕊️ 开启滞空/飞天模式 (关闭则信任 ROMP 强制贴地)", value=False)
             run_btn = gr.Button("🚀 一键生成编舞视频", variant="primary")
             with gr.Column():
@@ -489,6 +441,7 @@ with gr.Blocks(title="敦煌数字编舞引擎") as app:
             traj_in, 
             trajectory_post_mode_in,
             use_tto_in, 
+            hard_keyframe_project_in,
             is_flying_in
         ], 
         outputs=video_out

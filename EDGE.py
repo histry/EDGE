@@ -8,8 +8,7 @@ import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.state import AcceleratorState
-# ✨ 引入 random_split 用于划分验证集
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset.dance_dataset import AISTPPDataset, DunhuangDataset
@@ -368,42 +367,44 @@ class EDGE:
         
         if is_dunhuang:
             print(f"\n🪷 检测到敦煌数据集路径 ({data_path})，启动中华古典舞纯视觉微调模式！")
-            
-            # ✨ 修复 1：废弃 random_split，改为基于文件级别划分 (File-level split)
-            # 注意：需在 dataset/dance_dataset.py 中的 DunhuangDataset 类里同步增加对 train 参数的支持
+
             train_dataset = DunhuangDataset(
                 data_path=data_path,
-                train=True,  # 告知 Dataset 分配前 90% 的原文件进行切片
+                train=True,
                 seq_len=opt.seq_len,
                 audio_dim=self.audio_dim,
                 normalizer=self.normalizer,
-                return_traj=True
+                return_traj=True,
+                split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
+                split_seed=getattr(opt, "dunhuang_split_seed", 42),
+                audio_sample_mode="random",
             )
             self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer
-            
+
             test_dataset = DunhuangDataset(
                 data_path=data_path,
-                train=False, # 告知 Dataset 分配后 10% 的原文件进行切片
+                train=False,
                 seq_len=opt.seq_len,
                 audio_dim=self.audio_dim,
-                normalizer=self.normalizer, # 验证集必须严格复用训练集的归一化参数
-                return_traj=True
+                normalizer=self.normalizer,
+                return_traj=True,
+                split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
+                split_seed=getattr(opt, "dunhuang_split_seed", 42),
+                audio_sample_mode=getattr(opt, "dunhuang_val_audio_mode", "best"),
             )
-            
+
             self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer
-            
-            if len(full_dataset) > 1:
-                val_size = max(1, int(0.1 * len(full_dataset)))
-                train_size = len(full_dataset) - val_size
-                train_dataset, test_dataset = random_split(
-                    full_dataset,
-                    [train_size, val_size],
-                    generator=torch.Generator().manual_seed(42)
-                )
-            else:
-                train_dataset = test_dataset = full_dataset
+
+            print(
+                f"✅ 敦煌数据已按源文件划分: "
+                f"train_windows={len(train_dataset)}, val_windows={len(test_dataset)}, "
+                f"val_audio_mode={getattr(opt, 'dunhuang_val_audio_mode', 'best')}"
+            )
+            if len(test_dataset) == 0:
+                print("⚠️ 敦煌验证集没有足够长的切片，将临时复用训练集做运行期 sanity check。")
+                test_dataset = train_dataset
         else:
             print("🎶 Loading Official AIST++ dataset (with FK & 6D rotations)...")
             actual_data_path = data_path if os.path.exists(os.path.join(data_path, "train")) else "data"
@@ -443,7 +444,7 @@ class EDGE:
             shuffle=False,
             num_workers=2,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
         )
 
         train_data_loader, test_data_loader = self.accelerator.prepare(

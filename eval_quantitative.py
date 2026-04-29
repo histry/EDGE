@@ -301,6 +301,34 @@ def eval_trajectory(motion, args):
     }
 
 
+def prefixed(metrics, prefix):
+    return {f"{prefix}{key}": value for key, value in metrics.items()}
+
+
+def eval_raw_post_trajectory(args, primary_motion):
+    raw_path = getattr(args, "raw_motion", "")
+    post_path = getattr(args, "post_motion", "")
+    if not raw_path and not post_path:
+        return {}
+
+    raw_motion = load_motion(raw_path) if raw_path else primary_motion
+    post_motion = load_motion(post_path) if post_path else primary_motion
+
+    raw_metrics = eval_trajectory(raw_motion, args)
+    post_metrics = eval_trajectory(post_motion, args)
+    out = {}
+    out.update(prefixed(raw_metrics, "raw_"))
+    out.update(prefixed(post_metrics, "post_"))
+
+    if raw_metrics and post_metrics:
+        for key in sorted(set(raw_metrics) & set(post_metrics)):
+            raw_value = raw_metrics[key]
+            post_value = post_metrics[key]
+            if isinstance(raw_value, float) and isinstance(post_value, float):
+                out[f"post_minus_raw_{key}"] = post_value - raw_value
+    return out
+
+
 def contact_mask_from_height(feet, height_threshold):
     heights = feet[:, :, 1]
     floor = np.percentile(heights, 2)
@@ -463,6 +491,8 @@ def write_outputs(args, metrics, keyframe_rows):
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate generated EDGE 151-D .npy motions.")
     parser.add_argument("--motion", required=True, help="Generated 151-D motion .npy")
+    parser.add_argument("--raw_motion", default="", help="Optional pre-trajectory-postprocess .npy for raw/post trajectory comparison")
+    parser.add_argument("--post_motion", default="", help="Optional postprocessed .npy for raw/post trajectory comparison")
     parser.add_argument("--checkpoint", default="", help="Checkpoint with normalizer for normalized keyframe .npy files")
     parser.add_argument("--audio", default="", help="Audio .wav for BeatAlign and audio-timed trajectory reconstruction")
     parser.add_argument("--trajectory", default="", help="Control points like '0,0;1,2;-1,4'")
@@ -506,6 +536,7 @@ def main():
     keyframe_summary, keyframe_rows = eval_keyframes(motion, args, normalizer=normalizer)
     metrics.update(keyframe_summary)
     metrics.update(eval_trajectory(motion, args))
+    metrics.update(eval_raw_post_trajectory(args, motion))
     metrics.update(eval_foot_sliding(motion, joints, args))
     metrics.update(eval_beatalign(joints, args))
 

@@ -131,6 +131,25 @@ def parse_train_opt():
         help="how to choose middle keyframes: motion peaks are safest for unpaired Dunhuang motion data",
     )
     parser.add_argument(
+        "--dunhuang_split_ratio",
+        type=float,
+        default=0.9,
+        help="source-file split ratio for Dunhuang train/validation data",
+    )
+    parser.add_argument(
+        "--dunhuang_split_seed",
+        type=int,
+        default=42,
+        help="random seed for Dunhuang source-file split",
+    )
+    parser.add_argument(
+        "--dunhuang_val_audio_mode",
+        type=str,
+        default="best",
+        choices=["best", "zero", "random"],
+        help="deterministic validation audio selection for weak proxy pairs; random is not recommended for validation",
+    )
+    parser.add_argument(
         "--train_stage",
         type=str,
         default="full",

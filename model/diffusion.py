@@ -91,6 +91,8 @@ class GaussianDiffusion(nn.Module):
         contact_loss_weight=0.8,
         foot_loss_weight=2.5,
         sync_loss_weight=1.2,
+        hard_keyframe_project=False,
+        beat_guidance_weight=0.0,
         force_audio_only_drop=False
     ):
         super().__init__()
@@ -107,6 +109,8 @@ class GaussianDiffusion(nn.Module):
         self.contact_loss_weight = contact_loss_weight
         self.foot_loss_weight = foot_loss_weight
         self.sync_loss_weight = sync_loss_weight
+        self.hard_keyframe_project = hard_keyframe_project
+        self.beat_guidance_weight = beat_guidance_weight
         self.tto_interval = 50
         self.tto_steps = 1
         self.tto_lr = 0.03
@@ -303,6 +307,25 @@ class GaussianDiffusion(nn.Module):
             traj_velocity_loss = F.mse_loss(root_xz[:, 1:] - root_xz[:, :-1], target_traj[:, 1:] - target_traj[:, :-1])
             loss = loss + 4.0 * traj_loss + 0.5 * traj_velocity_loss
 
+        if self.beat_guidance_weight > 0 and isinstance(cond, dict) and cond.get("audio", None) is not None:
+            audio_feat = cond["audio"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+            if audio_feat.shape[1] != pred_xstart.shape[1]:
+                audio_feat = F.interpolate(
+                    audio_feat.transpose(1, 2),
+                    size=pred_xstart.shape[1],
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+
+            if audio_feat.shape[-1] > 768 and pred_xstart.shape[1] > 2:
+                onset = audio_feat[:, 1:, 768].clamp_min(0.0)
+                onset = onset / (onset.amax(dim=1, keepdim=True).clamp_min(1e-6))
+
+                motion_delta = physical_xstart[:, 1:, 7:] - physical_xstart[:, :-1, 7:]
+                motion_energy = safe_norm(motion_delta, dim=-1)
+                motion_energy = motion_energy / motion_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+                loss = loss + float(self.beat_guidance_weight) * F.mse_loss(motion_energy, onset)
+
         if constraint is not None and constraint.get("mask", None) is not None and constraint.get("value", None) is not None:
             mask = constraint["mask"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
             value = constraint["value"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
@@ -349,6 +372,29 @@ class GaussianDiffusion(nn.Module):
                 x_opt = x_opt - self.tto_lr * grad
         return x_opt.detach()
 
+    def _project_known_keyframes(self, x, constraint, t):
+        if (not self.hard_keyframe_project) or constraint is None:
+            return x
+        if constraint.get("mask", None) is None or constraint.get("value", None) is None:
+            return x
+
+        mask = constraint["mask"].to(device=x.device, dtype=x.dtype)
+        value = constraint["value"].to(device=x.device, dtype=x.dtype)
+
+        if mask.shape[-1] == 1:
+            feature_mask = mask.expand_as(x)
+        elif mask.shape[-1] == x.shape[-1]:
+            feature_mask = mask
+        else:
+            raise ValueError(
+                f"constraint mask last dim must be 1 or {x.shape[-1]}, got {mask.shape[-1]}"
+            )
+
+        known_t = self.q_sample(value, t)
+        clean_t = (t == 0).to(dtype=x.dtype).reshape(x.shape[0], *((1,) * (x.ndim - 1)))
+        known_t = known_t * (1.0 - clean_t) + value * clean_t
+        return x * (1.0 - feature_mask) + known_t * feature_mask
+
     def p_sample(self, x, cond, t, constraint=None, use_tto=True):
         b, *_, device = *x.shape, x.device
 
@@ -363,6 +409,7 @@ class GaussianDiffusion(nn.Module):
             noise = torch.randn_like(model_mean)
             nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(noise.shape) - 1)))
             x_out = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+            x_out = self._project_known_keyframes(x_out, constraint, t)
         return x_out, pred_xstart
 
     @torch.no_grad()
@@ -416,6 +463,8 @@ class GaussianDiffusion(nn.Module):
 
             if time_next < 0:
                 x = x_start
+                final_time_cond = torch.zeros((batch,), device=device, dtype=torch.long)
+                x = self._project_known_keyframes(x, constraint, final_time_cond)
                 continue
 
             alpha = self.alphas_cumprod[time]
@@ -425,6 +474,8 @@ class GaussianDiffusion(nn.Module):
 
             noise = torch.randn_like(x)
             x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+            next_time_cond = torch.full((batch,), max(time_next, 0), device=device, dtype=torch.long)
+            x = self._project_known_keyframes(x, constraint, next_time_cond)
         return x
 
     @torch.no_grad()
@@ -456,6 +507,8 @@ class GaussianDiffusion(nn.Module):
 
             if time_next < 0:
                 x = x_start
+                final_time_cond = torch.zeros((batch,), device=device, dtype=torch.long)
+                x = self._project_known_keyframes(x, constraint, final_time_cond)
                 continue
 
             alpha = self.alphas_cumprod[time]
@@ -466,6 +519,8 @@ class GaussianDiffusion(nn.Module):
             noise = torch.randn_like(x)
 
             x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+            next_time_cond = torch.full((batch,), max(time_next, 0), device=device, dtype=torch.long)
+            x = self._project_known_keyframes(x, constraint, next_time_cond)
 
             if time > 0:
                 x[1:, :half] = x[:-1, half:]
