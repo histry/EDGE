@@ -147,29 +147,33 @@ def test(opt):
 
     print("Generating dances")
     for i in range(len(all_cond)):
-        # 封装为字典推入显卡，匹配模型 bf16 精度
-        # ❌ 原代码：
-        # cond_dict = {"audio": all_cond[i].to(model.accelerator.device).to(torch.bfloat16)}
-            
-        # ✅ 替换为：
         audio_tensor = all_cond[i].to(model.accelerator.device).to(torch.bfloat16)
-        traj_tensor = torch.zeros(audio_tensor.shape[0], audio_tensor.shape[1], 2, device=model.accelerator.device, dtype=torch.bfloat16)
-            
-        # 补齐在标准化流形下的绝对零点
-        if model.normalizer is not None:
-            mean_x = model.normalizer.mean[4]
-            mean_z = model.normalizer.mean[6]
-            std_x = model.normalizer.std[4]
-            std_z = model.normalizer.std[6]
-            traj_tensor[..., 0] = (traj_tensor[..., 0] - mean_x) / (std_x + 1e-6)
-            traj_tensor[..., 1] = (traj_tensor[..., 1] - mean_z) / (std_z + 1e-6)
-            
-        cond_dict = {"audio": audio_tensor, "trajectory": traj_tensor}
+
+        # 默认只传 audio，让模型自由生成 root X/Z；
+        # 只有显式指定 --use_zero_trajectory 时，才额外传入零轨迹约束。
+        cond_dict = {"audio": audio_tensor}
+
+        if getattr(opt, "use_zero_trajectory", False):
+            traj_tensor = torch.zeros(
+                audio_tensor.shape[0],
+                audio_tensor.shape[1],
+                2,
+                device=model.accelerator.device,
+                dtype=audio_tensor.dtype,
+            )
+
+            if model.normalizer is not None:
+                mean_x = model.normalizer.mean[4]
+                mean_z = model.normalizer.mean[6]
+                std_x = model.normalizer.std[4]
+                std_z = model.normalizer.std[6]
+                traj_tensor[..., 0] = (traj_tensor[..., 0] - mean_x) / (std_x + 1e-6)
+                traj_tensor[..., 1] = (traj_tensor[..., 1] - mean_z) / (std_z + 1e-6)
+
+            cond_dict["trajectory"] = traj_tensor
         
-        # 🌟 修复：将 all_filenames[i] 同时传给 name 和 wav 槽位，彻底唤醒底层的音频拼接引擎
         data_tuple = (None, cond_dict, all_filenames[i], all_filenames[i]) 
         
-        # 严禁在推理期使用 autocast，避免精度坍塌
         with torch.no_grad():
             model.render_sample(
                 data_tuple, "test", opt.render_dir, render_count=-1, fk_out=fk_out, render=not opt.no_render

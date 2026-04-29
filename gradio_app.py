@@ -275,7 +275,7 @@ def run_choreography_pipeline(audio_file, img_start_in, pkl_start_in, img_end_in
     mask = torch.zeros(1, audio_seq_len, 151).to(engine.device).to(engine.dtype)
     value = torch.zeros(1, audio_seq_len, 151).to(engine.device).to(engine.dtype)
 
-        mask, value = apply_hybrid_keyframe_mask(
+    mask, value = apply_hybrid_keyframe_mask(
         mask,
         value,
         start_pose_norm,

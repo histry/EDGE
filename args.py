@@ -1,6 +1,17 @@
 import argparse
 
 def add_control_sampling_args(parser):
+    parser.add_argument(
+        "--beat_guidance_weight",
+        type=float,
+        default=0.0,
+        help="Weight for music beat/onset guidance during inference/TTO",
+    )
+    parser.add_argument(
+        "--hard_keyframe_project",
+        action="store_true",
+        help="Force strict replacement of known keyframes at every diffusion step",
+    )
     return parser
 
 def parse_train_opt():
@@ -208,19 +219,6 @@ def parse_train_opt():
     opt = parser.parse_args()
     return opt
 
-# 在 parse_train_opt 和 parse_test_opt 中新增：
-    parser.add_argument(
-        "--beat_guidance_weight",
-        type=float,
-        default=0.0,
-        help="Weight for music beat/onset guidance during inference/TTO",
-    )
-    parser.add_argument(
-        "--hard_keyframe_project",
-        action="store_true",
-        help="Force strict replacement of known keyframes at every diffusion step",
-    )
-
 def parse_test_opt():
     parser = argparse.ArgumentParser()
     
@@ -282,6 +280,11 @@ def parse_test_opt():
         type=str,
         default="cached_features/",
         help="Where to save/load the features",
+    )
+    parser.add_argument(
+        "--use_zero_trajectory",
+        action="store_true",
+        help="Use a normalized zero XZ trajectory during test generation",
     )
     add_control_sampling_args(parser)
     opt = parser.parse_args()
