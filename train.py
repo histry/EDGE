@@ -26,6 +26,8 @@ def train(opt):
         mid_keyframe_count=opt.mid_keyframe_count,
         mid_keyframe_condition_width=opt.mid_keyframe_condition_width,
         mid_keyframe_selection=opt.mid_keyframe_selection,
+        beat_guidance_weight=opt.beat_guidance_weight,
+        hard_keyframe_project=opt.hard_keyframe_project,
         train_stage=opt.train_stage,
     )
     model.train_loop(opt)

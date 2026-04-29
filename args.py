@@ -1,5 +1,7 @@
 import argparse
 
+def add_control_sampling_args(parser):
+    return parser
 
 def parse_train_opt():
     parser = argparse.ArgumentParser()
@@ -202,6 +204,7 @@ def parse_train_opt():
     parser.add_argument(
         "--checkpoint", type=str, default="", help="trained checkpoint path (optional)"
     )
+    add_control_sampling_args(parser)
     opt = parser.parse_args()
     return opt
 
@@ -280,5 +283,6 @@ def parse_test_opt():
         default="cached_features/",
         help="Where to save/load the features",
     )
+    add_control_sampling_args(parser)
     opt = parser.parse_args()
     return opt

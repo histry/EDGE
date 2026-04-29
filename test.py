@@ -56,10 +56,12 @@ def test(opt):
     # ==========================================
     print("🚀 正在初始化模型 (已强制加载健康的 Active 权重，抛弃损坏的 EMA)...")
     model = EDGE(
-        opt.feature_type, 
-        opt.checkpoint, 
+        opt.feature_type,
+        opt.checkpoint,
         audio_dim=opt.audio_dim,
-        EMA=False,  # <--- 就是这一句救命代码！
+        EMA=False,
+        beat_guidance_weight=opt.beat_guidance_weight,
+        hard_keyframe_project=opt.hard_keyframe_project,
     )
     model.eval()
 

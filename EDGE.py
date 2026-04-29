@@ -92,6 +92,8 @@ class EDGE:
         mid_keyframe_count=2,
         mid_keyframe_condition_width=1,
         mid_keyframe_selection="motion_peak",
+        beat_guidance_weight=0.0,
+        hard_keyframe_project=False,
         train_stage="full",
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -210,9 +212,8 @@ class EDGE:
             mid_keyframe_condition_width=mid_keyframe_condition_width,
             mid_keyframe_selection=mid_keyframe_selection,
             data_fps=30,
-            # ✨ 新增：
-            beat_guidance_weight=getattr(opt, "beat_guidance_weight", 0.0),
-            hard_keyframe_project=getattr(opt, "hard_keyframe_project", False)
+            beat_guidance_weight=beat_guidance_weight,
+            hard_keyframe_project=hard_keyframe_project,
         )
         
         diffusion.normalizer = self.normalizer
@@ -258,6 +259,28 @@ class EDGE:
                 log_prefix=f"checkpoint:{os.path.basename(checkpoint_path)}",
             )
             self.model.load_state_dict(adapted_state_dict, strict=True)
+
+            # 同步 EMA master_model，避免续训时 EMA 从随机初始化开始
+            unwrapped_loaded_model = self.accelerator.unwrap_model(self.model)
+            if EMA and isinstance(checkpoint, dict) and "ema_state_dict" in checkpoint:
+                ema_adapted_state_dict, ema_adapt_report = adapt_checkpoint_state_dict(
+                    checkpoint["ema_state_dict"],
+                    self.diffusion.master_model,
+                    log_prefix=f"ema_checkpoint:{os.path.basename(checkpoint_path)}",
+                )
+                self.diffusion.master_model.load_state_dict(
+                    ema_adapted_state_dict,
+                    strict=True,
+                )
+                if self.accelerator.is_main_process:
+                    for line in summarize_adapt_report(ema_adapt_report):
+                        print(f"⚠️ EMA {line}")
+            else:
+                self.diffusion.master_model.load_state_dict(
+                    unwrapped_loaded_model.state_dict(),
+                    strict=True,
+                )
+
             if self.accelerator.is_main_process:
                 for line in summarize_adapt_report(adapt_report):
                     print(f"⚠️ {line}")

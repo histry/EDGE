@@ -491,11 +491,14 @@ class DanceDecoder(nn.Module):
             cond_embed, batch_size, seq_len, device, x.dtype
         )
         
-        # ✨ 替换为：
+        cond_drop_prob = float(max(0.0, min(1.0, cond_drop_prob)))
+        keep_prob = 1.0 - cond_drop_prob
+
         if keep_audio_mask is None:
-            keep_audio_mask = prob_mask_like((batch_size,), 1.0 - cond_drop_prob, device=device)
+            keep_audio_mask = prob_mask_like((batch_size,), keep_prob, device=device)
+
         if keep_traj_mask is None:
-            keep_traj_mask = prob_mask_like((batch_size,), 1.0 - cond_drop_prob, device=device)
+            keep_traj_mask = prob_mask_like((batch_size,), keep_prob, device=device)
         
         keep_audio_mask_embed = rearrange(keep_audio_mask, "b -> b 1 1")
         keep_audio_mask_hidden = rearrange(keep_audio_mask, "b -> b 1")

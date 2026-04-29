@@ -78,17 +78,57 @@ class PipelineEngine:
 
 engine = PipelineEngine()
 
-def apply_hybrid_keyframe_mask(mask, value, target_pose_norm, peak_idx, is_start=True, window_size=3):
+def apply_hybrid_keyframe_mask(
+    mask,
+    value,
+    target_pose_norm,
+    peak_idx,
+    is_start=True,
+    window_size=3,
+    trajectory_norm=None,
+    lock_root_xz_endpoint_only=True,
+):
     device = mask.device
     dtype = mask.dtype
-    target_pose = target_pose_norm.to(device).to(dtype)
+    target_pose = target_pose_norm.to(device=device, dtype=dtype)
     seq_len = mask.shape[1]
-    
+
+    # 姿态关键帧默认只锁：
+    # 0:4 contacts, 5 root_y, 7:151 local rotations
+    # root_x/root_z 由 trajectory 控制，避免双重约束冲突
+    local_feature_mask = torch.zeros((151,), device=device, dtype=dtype)
+    local_feature_mask[:4] = 1.0
+    local_feature_mask[5] = 1.0
+    local_feature_mask[7:] = 1.0
+
     for i in range(window_size):
         frame_idx = peak_idx + i if is_start else peak_idx - i
-        if 0 <= frame_idx < seq_len:
-            mask[:, frame_idx, :] = 1.0  # ✅ 修复：采用 1.0 的绝对硬约束
-            value[:, frame_idx, :] = target_pose
+        if not (0 <= frame_idx < seq_len):
+            continue
+
+        frame_mask = local_feature_mask.clone()
+        frame_value = target_pose.clone()
+
+        # root X/Z 不在整个窗口重复锁死；
+        # 如果有轨迹，则每一帧 root X/Z 使用轨迹对应点。
+        if trajectory_norm is not None:
+            frame_mask[4] = 1.0
+            frame_mask[6] = 1.0
+            frame_value[4] = trajectory_norm[0, frame_idx, 0].to(dtype)
+            frame_value[6] = trajectory_norm[0, frame_idx, 1].to(dtype)
+        elif (not lock_root_xz_endpoint_only) or frame_idx in (0, seq_len - 1):
+            frame_mask[4] = 1.0
+            frame_mask[6] = 1.0
+
+        prev_mask = mask[:, frame_idx, :]
+        use_new = frame_mask.view(1, -1) >= prev_mask
+        mask[:, frame_idx, :] = torch.maximum(prev_mask, frame_mask.view(1, -1))
+        value[:, frame_idx, :] = torch.where(
+            (frame_mask.view(1, -1) > 0) & use_new,
+            frame_value.view(1, -1),
+            value[:, frame_idx, :],
+        )
+
     return mask, value
 
 
@@ -235,8 +275,24 @@ def run_choreography_pipeline(audio_file, img_start_in, pkl_start_in, img_end_in
     mask = torch.zeros(1, audio_seq_len, 151).to(engine.device).to(engine.dtype)
     value = torch.zeros(1, audio_seq_len, 151).to(engine.device).to(engine.dtype)
 
-    mask, value = apply_hybrid_keyframe_mask(mask, value, start_pose_norm, 0, is_start=True, window_size=3)
-    mask, value = apply_hybrid_keyframe_mask(mask, value, end_pose_norm, audio_seq_len - 1, is_start=False, window_size=3)
+        mask, value = apply_hybrid_keyframe_mask(
+        mask,
+        value,
+        start_pose_norm,
+        0,
+        is_start=True,
+        window_size=3,
+        trajectory_norm=normalized_cond_traj if has_traj else None,
+    )
+    mask, value = apply_hybrid_keyframe_mask(
+        mask,
+        value,
+        end_pose_norm,
+        audio_seq_len - 1,
+        is_start=False,
+        window_size=3,
+        trajectory_norm=normalized_cond_traj if has_traj else None,
+    )
     
     horizon = engine.model.seq_len
     stride = horizon // 2
