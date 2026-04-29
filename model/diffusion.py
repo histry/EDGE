@@ -19,20 +19,17 @@ from tqdm import tqdm
 from dataset.quaternion import ax_from_6v, quat_slerp
 from vis import audio_output_stem, skeleton_render
 
-# ✨ 新增导入 prob_mask_like 用于生成 CFG 掩码
 from .utils import extract, make_beta_schedule, prob_mask_like
 from model.mmr_model import CrossModalMMR
 
 def identity(t, *args, **kwargs):
     return t
 
-
 def rotation_angle_between(rot_mats):
     rel = torch.matmul(rot_mats[:, :-1].transpose(-1, -2), rot_mats[:, 1:])
     trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
     cos_angle = torch.clamp((trace - 1.0) * 0.5, -1.0 + 1e-4, 1.0 - 1e-4)
     return torch.acos(cos_angle)
-
 
 def move_condition_to_device(cond, device):
     if isinstance(cond, dict):
@@ -41,7 +38,6 @@ def move_condition_to_device(cond, device):
             moved[key] = value.to(device) if torch.is_tensor(value) else value
         return moved
     return cond.to(device)
-
 
 class EMA:
     def __init__(self, beta):
@@ -59,7 +55,6 @@ class EMA:
         if old is None:
             return new
         return old * self.beta + (1 - self.beta) * new
-
 
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -89,11 +84,11 @@ class GaussianDiffusion(nn.Module):
         contact_loss_weight=0.8,
         foot_loss_weight=2.5,
         sync_loss_weight=1.2,
-        force_audio_only_drop=False  # ✅ 修复：去掉 self.
+        force_audio_only_drop=False
     ):
         super().__init__()
         self.dt = 1.0 / data_fps 
-        self.force_audio_only_drop = force_audio_only_drop # ✅ 修复：在内部赋值
+        self.force_audio_only_drop = force_audio_only_drop
         self.mmr_loss_weight = mmr_loss_weight
         self.keyframe_condition_prob = keyframe_condition_prob
         self.keyframe_condition_width = keyframe_condition_width
@@ -195,12 +190,22 @@ class GaussianDiffusion(nn.Module):
         if isinstance(cond, dict) and "trajectory" in cond:
             cond_input = cond.copy() 
 
+        # 网络输出：取决于 predict_epsilon，它可能是 Noise，也可能是 x0
         model_output = self.model.guided_forward(
             x, cond_input, t, weight, force_mask=force_mask, force_x_clean=force_x_clean
         )
 
-        x_start = model_output
+        # ======= 核心修复：统一预测空间的数学语义 =======
+        if self.predict_epsilon:
+            pred_noise = model_output
+            # 如果网络预测的是噪声，必须先逆向推导出物理的 x0
+            x_start = self.predict_start_from_noise(x, t, pred_noise)
+        else:
+            # 如果网络直接预测 x0，则直接赋值
+            x_start = model_output
+        # ===============================================
         
+        # 物理边界截断 (只对真正的物理 x0 进行截断才有意义)
         if clip_x_start:
             if x_start.shape[-1] > 7:
                 x_start = torch.cat(
@@ -210,6 +215,7 @@ class GaussianDiffusion(nn.Module):
             else:
                 x_start = x_start.clamp(-1.0, 1.0)
         
+        # 统一出口：无论上面是怎么计算的，最终基于合法/截断后的 x_start，重新推导出一致的 pred_noise
         pred_noise = self.predict_noise_from_start(x, t, x_start)
 
         return pred_noise, x_start
@@ -256,7 +262,16 @@ class GaussianDiffusion(nn.Module):
 
     def _tto_loss(self, pred_xstart, cond, constraint=None):
         loss = pred_xstart.new_tensor(0.0)
-        root_xz = pred_xstart[:, :, [4, 6]] if pred_xstart.shape[-1] == 151 else pred_xstart[:, :, [0, 2]]
+        
+        # ======= 修复 1：统一物理空间尺度 (Physical Space Unnormalization) =======
+        if getattr(self, "normalizer", None) is not None:
+            physical_xstart = self.normalizer.unnormalize(pred_xstart)
+        else:
+            physical_xstart = pred_xstart
+            
+        # 必须从物理坐标 (physical_xstart) 中提取根节点轨迹，不能用归一化的 pred_xstart
+        root_xz = physical_xstart[:, :, [4, 6]] if physical_xstart.shape[-1] == 151 else physical_xstart[:, :, [0, 2]]
+        # ====================================================================
 
         if isinstance(cond, dict) and cond.get("trajectory", None) is not None:
             target_traj = cond["trajectory"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
@@ -275,6 +290,7 @@ class GaussianDiffusion(nn.Module):
         if constraint is not None and constraint.get("mask", None) is not None and constraint.get("value", None) is not None:
             mask = constraint["mask"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
             value = constraint["value"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+            # 注意：关键帧的 value 本身就是归一化的，所以这里直接用 pred_xstart 算误差是对的
             key_loss = ((pred_xstart - value) ** 2 * mask).sum() / (mask.sum() * pred_xstart.shape[-1] + 1e-6)
             loss = loss + 2.0 * key_loss
 
@@ -283,12 +299,12 @@ class GaussianDiffusion(nn.Module):
             loss = loss + 0.05 * root_acc.pow(2).mean()
 
         if pred_xstart.shape[-1] == 151 and getattr(self, "normalizer", None) is not None:
-            physical = self.normalizer.unnormalize(pred_xstart)
-            contacts = physical[:, :, 0:4] > self.tto_contact_threshold
+            # 物理空间已在上面统一解算，直接复用 physical_xstart 计算脚面接触
+            contacts = physical_xstart[:, :, 0:4] > self.tto_contact_threshold
             contact_pairs = contacts[:, 1:] & contacts[:, :-1]
             if bool(contact_pairs.any().item()):
-                pos = physical[:, :, 4:7]
-                q = ax_from_6v(physical[:, :, 7:].reshape(physical.shape[0], physical.shape[1], 24, 6))
+                pos = physical_xstart[:, :, 4:7]
+                q = ax_from_6v(physical_xstart[:, :, 7:].reshape(physical_xstart.shape[0], physical_xstart.shape[1], 24, 6))
                 feet = self.smpl.forward(q, pos)[:, :, [7, 8, 10, 11], :]
                 feet_delta = feet[:, 1:] - feet[:, :-1]
                 foot_error = feet_delta[..., [0, 2]].pow(2).sum(dim=-1)
@@ -363,12 +379,16 @@ class GaussianDiffusion(nn.Module):
             x, _ = self.p_sample(x, cond, timesteps, constraint=constraint, use_tto=use_tto)
 
             if mask is not None and value is not None:
-                # ✨ 修复：掩码晚期释放 (Harmonization Release)
-                # 当去噪进入最后 20% 阶段时，彻底丢弃掩码约束。
-                # 给模型留出足够的步数，利用自身学到的骨骼先验去平滑“已知姿态”和“生成姿态”之间的物理拼缝。
-                if i > int(self.n_timestep * 0.2):
-                    value_ = self.q_sample(value, timesteps - 1) if (i > 0) else value
-                    x = value_ * mask + (1.0 - mask) * x
+                value_ = self.q_sample(value, timesteps - 1) if (i > 0) else value
+                progress = 1.0 - (i / self.n_timestep)
+                
+                if progress < 0.8:
+                    blend_weight = 0.85
+                else:
+                    blend_weight = 0.85 + 0.15 * ((progress - 0.8) / 0.2)
+                
+                x = (value_ * blend_weight + x * (1.0 - blend_weight)) * mask + (1.0 - mask) * x
+
             if return_diffusion:
                 diffusion.append(x)
 
@@ -479,7 +499,14 @@ class GaussianDiffusion(nn.Module):
 
             if mask is not None and value is not None:
                 value_ = self.q_sample(value, timesteps - 1) if (i > 0) else value
-                x = value_ * mask + (1.0 - mask) * x
+                progress = 1.0 - (i / self.n_timestep)
+                
+                if progress < 0.8:
+                    blend_weight = 0.85
+                else:
+                    blend_weight = 0.85 + 0.15 * ((progress - 0.8) / 0.2)
+                
+                x = (value_ * blend_weight + x * (1.0 - blend_weight)) * mask + (1.0 - mask) * x
 
             if return_diffusion:
                 diffusion.append(x)
@@ -520,7 +547,14 @@ class GaussianDiffusion(nn.Module):
 
             if mask is not None and value is not None:
                 value_ = self.q_sample(value, timesteps - 1) if (i > 0) else value
-                x = value_ * mask + (1.0 - mask) * x
+                progress = 1.0 - (i / self.n_timestep)
+                
+                if progress < 0.8:
+                    blend_weight = 0.85
+                else:
+                    blend_weight = 0.85 + 0.15 * ((progress - 0.8) / 0.2)
+                
+                x = (value_ * blend_weight + x * (1.0 - blend_weight)) * mask + (1.0 - mask) * x
 
             x[1:, :half] = x[:-1, half:].clone()
 
@@ -698,14 +732,12 @@ class GaussianDiffusion(nn.Module):
             keep_audio_mask[uncond_mask | drop_audio_mask] = False
             keep_traj_mask[uncond_mask | drop_traj_mask] = False
 
-        # ✅ 修复：必须在送入网络前，强制接管掩码
         if getattr(self, "force_audio_only_drop", False):
             keep_audio_mask[:] = False
             keep_traj_mask[:] = True
 
         force_mask, force_x_clean = self._build_keyframe_condition(x_start, cond_input)
 
-        # ✨ 【修复 1】：强制传入 keep_mask，并关掉模型内部的随机 drop
         x_recon = self.model(
             x_noisy,
             cond_input,
@@ -713,7 +745,7 @@ class GaussianDiffusion(nn.Module):
             cond_drop_prob=0.0, 
             force_mask=force_mask,
             force_x_clean=force_x_clean,
-            keep_audio_mask=keep_audio_mask, # 传入双掩码
+            keep_audio_mask=keep_audio_mask,
             keep_traj_mask=keep_traj_mask  
         )
 
@@ -729,12 +761,16 @@ class GaussianDiffusion(nn.Module):
         loss = reduce(loss, "b ... -> b (...)", "mean")
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
 
+        # ======= 修复 1：激活失效的 Keyframe 强制对齐 Loss =======
         keyframe_loss = torch.tensor(0.0, device=x_start.device)
-        if force_mask is not None and not self.predict_epsilon:
-            keyframe_error = self.loss_fn(model_out, x_start, reduction="none") * force_mask
+        if force_mask is not None:
+            # 无论底层预测的是 noise 还是 x0，统一利用重构出的物理 x0 来计算关键帧误差
+            pred_x0_for_key = self.predict_start_from_noise(x_noisy, t, model_out) if self.predict_epsilon else model_out
+            keyframe_error = self.loss_fn(pred_x0_for_key, x_start, reduction="none") * force_mask
             keyframe_loss = keyframe_error.sum() / (
                 force_mask.sum() * model_out.shape[-1] + 1e-6
             )
+        # ==========================================================
 
         if model_out.shape[2] == 381:
             target_v = target[:, 1:] - target[:, :-1]
@@ -772,8 +808,6 @@ class GaussianDiffusion(nn.Module):
             v_loss = reduce(v_loss, "b ... -> b (...)", "mean")
             v_loss = v_loss * extract(self.p2_loss_weight, t, v_loss.shape)
 
-            # 物理类损失必须在反归一化后的真实运动空间里计算。
-            # 否则 root 位移、6D rotation 和 contact 都会被 z-score 数值扭曲，foot loss 的梯度方向会失真。
             model_motion_x0 = self.predict_start_from_noise(x_noisy, t, model_out) if self.predict_epsilon else model_out
             target_motion_x0 = x_start
             normalizer = getattr(self, "normalizer", None)
@@ -819,56 +853,55 @@ class GaussianDiffusion(nn.Module):
             turn_smooth_loss = turn_velocity_loss + 0.35 * turn_acc_loss
 
             # =========================================================================
-            # ✅ OOM 防御与物理守恒设计 (重点展示代码段)
-            # 采用【连续局部截断 (Continuous Local Truncation)】替代【稀疏隔帧采样】
-            # 数学依据：foot_loss / anti_freeze_loss 需要计算一阶导数(速度)和二阶导数(加速度)
-            # 连续切片能保证积分的时间常量 Δt = 1/30s 不变，从而精准捕获并惩罚高频滑步(高频噪声)
+            # ✅ OOM 防御与物理守恒设计 (修复：双轨分辨率切片)
             # =========================================================================
             chunk_len = min(30, s) # 锁定视野为连续 30 帧 (1秒)
             start_idx = torch.randint(0, s - chunk_len + 1, (1,), device=x_start.device).item()
-            
-            # 使用 arange 保证帧的绝对连续性，拒绝 ::5 这种破坏频率特征的切片
             sub_s_idx = torch.arange(start_idx, start_idx + chunk_len, device=x_start.device)
+            
+            # ✨ 修复：使用严格的向上取整逻辑，保证任何序列长度下 len(global_s_idx) <= 30
+            sparse_step = (s + 29) // 30 
+            global_s_idx = torch.arange(0, s, sparse_step, device=x_start.device)
 
-            # 保留完整的 Batch 维度，只在 Sequence 维度做连续切片
+            # 保留完整的 Batch 维度，分别获取连续局部和稀疏全局的状态
             model_q_sub = model_q[:, sub_s_idx]
             model_x_sub = model_x[:, sub_s_idx]
             target_q_sub = target_q[:, sub_s_idx]
             target_x_sub = target_x[:, sub_s_idx]
             t_sub = t
 
-            # 注意：后续用到 sub_idx 的地方也要对应修改
-            # 例如 mask_inv = (1.0 - force_mask[:, sub_s_idx, 0])
-            
+            # 微观物理正向传播 (用于脚滑、防冻结)
             model_xp = self.smpl.forward(model_q_sub, model_x_sub)
             target_xp = self.smpl.forward(target_q_sub, target_x_sub)
+            
+            # 宏观物理正向传播 (用于躯干、S曲线)
+            model_xp_global = self.smpl.forward(model_q[:, global_s_idx], model_x[:, global_s_idx])
+            target_xp_global = self.smpl.forward(target_q[:, global_s_idx], target_x[:, global_s_idx])
 
-            # ✨ 以下所有自定义的物理损失全部基于 model_xp，均自动继承了下采样
-            pelvis = model_xp[:, :, 0, :]
-            spine = model_xp[:, :, 6, :]
-            neck = model_xp[:, :, 12, :]
-            target_pelvis = target_xp[:, :, 0, :]
-            target_spine = target_xp[:, :, 6, :]
-            target_neck = target_xp[:, :, 12, :]
-	            
-            # 【修复1】：提取脚部 4 个关键节点 (左踝7, 右踝8, 左脚尖10, 右脚尖11)
+            # ---> 局部微观特征提取
             model_feet = model_xp[:, :, [7, 8, 10, 11], :]
-	            
-            vec_lower = spine - pelvis
-            vec_upper = neck - spine
-            target_vec_lower = target_spine - target_pelvis
-            target_vec_upper = target_neck - target_spine
+            
+            # ---> 宏观全局特征提取
+            pelvis_global = model_xp_global[:, :, 0, :]
+            spine_global = model_xp_global[:, :, 6, :]
+            neck_global = model_xp_global[:, :, 12, :]
+            target_pelvis_global = target_xp_global[:, :, 0, :]
+            target_neck_global = target_xp_global[:, :, 12, :]
+                
+            vec_lower_global = spine_global - pelvis_global
+            vec_upper_global = neck_global - spine_global
 
-            model_torso = F.normalize(neck - pelvis, dim=-1, eps=1e-6)
-            target_torso = F.normalize(target_neck - target_pelvis, dim=-1, eps=1e-6)
+            # 躯干稳定性和跨度改用全局特征计算
+            model_torso = F.normalize(neck_global - pelvis_global, dim=-1, eps=1e-6)
+            target_torso = F.normalize(target_neck_global - target_pelvis_global, dim=-1, eps=1e-6)
             torso_dir_loss_raw = 1.0 - F.cosine_similarity(model_torso, target_torso, dim=-1)
 
-            model_height = model_xp[..., 1].amax(dim=2) - model_xp[..., 1].amin(dim=2)
-            target_height = target_xp[..., 1].amax(dim=2) - target_xp[..., 1].amin(dim=2)
+            model_height = model_xp_global[..., 1].amax(dim=2) - model_xp_global[..., 1].amin(dim=2)
+            target_height = target_xp_global[..., 1].amax(dim=2) - target_xp_global[..., 1].amin(dim=2)
             height_loss_raw = self.loss_fn(model_height, target_height, reduction="none")
 
-            model_span = torch.norm(model_xp.amax(dim=2) - model_xp.amin(dim=2), dim=-1)
-            target_span = torch.norm(target_xp.amax(dim=2) - target_xp.amin(dim=2), dim=-1)
+            model_span = torch.norm(model_xp_global.amax(dim=2) - model_xp_global.amin(dim=2), dim=-1)
+            target_span = torch.norm(target_xp_global.amax(dim=2) - target_xp_global.amin(dim=2), dim=-1)
             span_loss_raw = self.loss_fn(model_span, target_span, reduction="none")
 
             body_stability_raw = (
@@ -877,6 +910,8 @@ class GaussianDiffusion(nn.Module):
                 + 0.25 * span_loss_raw
             )
             body_stability_loss = body_stability_raw.mean(dim=1)
+            
+            # 注意：这里的 root_y 加速度依然用局部的，因为加速度是高频特征
             if chunk_len > 2:
                 model_root_y_acc = model_x_sub[:, 2:, 1] - 2.0 * model_x_sub[:, 1:-1, 1] + model_x_sub[:, :-2, 1]
                 target_root_y_acc = target_x_sub[:, 2:, 1] - 2.0 * target_x_sub[:, 1:-1, 1] + target_x_sub[:, :-2, 1]
@@ -895,52 +930,56 @@ class GaussianDiffusion(nn.Module):
             motion_energy_loss = motion_energy_loss * extract(self.p2_loss_weight, t_sub, motion_energy_loss.shape)
 
             # ==========================================================
-            # ✨ 修复 1：符合真实人体解剖学的脊柱物理学约束
+            # ✨ 修复：符合真实人体解剖学的脊柱物理学约束 (修复平滑退火 + 修复掩码黑洞)
             # ==========================================================
-            # 1. 矢状面 (YZ面) 生理S型曲线保护 (人体真正的生理曲度)
-            vec_lower_yz = vec_lower[..., [1, 2]]
-            vec_upper_yz = vec_upper[..., [1, 2]]
-            # 【修复3】：使用布尔开关隔离未启用的生物力学惩罚，阻断梯度追踪
-            enable_biomech_loss = (current_epoch is not None) and (current_epoch > 400)
+            biomech_weight = 0.0
+            if current_epoch is not None:
+                # 使用相对进度的平滑退火，摒弃硬编码 > 400
+                biomech_start = 100.0
+                biomech_duration = 100.0
+                if current_epoch > biomech_start:
+                    biomech_weight = min(1.0, (current_epoch - biomech_start) / biomech_duration)
+            else:
+                biomech_weight = 1.0
             
             scurve_loss = torch.tensor(0.0, device=x_start.device)
             hunchback_loss = torch.tensor(0.0, device=x_start.device)
             asymmetry_loss = torch.tensor(0.0, device=x_start.device)
 
-            if enable_biomech_loss:
-                # 矢状面 (YZ面) 生理S型曲线保护
-                vec_lower_yz = vec_lower[..., [1, 2]]
-                vec_upper_yz = vec_upper[..., [1, 2]]
+            if biomech_weight > 0.0:
+                # 矢状面 (YZ面) 生理S型曲线保护，基于宏观全局视野计算
+                vec_lower_yz = vec_lower_global[..., [1, 2]]
+                vec_upper_yz = vec_upper_global[..., [1, 2]]
                 cos_sim_yz = torch.nn.functional.cosine_similarity(vec_lower_yz, vec_upper_yz, dim=-1)
                 
                 loss_too_straight = F.relu(cos_sim_yz - 0.985)
                 loss_too_bent = F.relu(0.866 - cos_sim_yz)
                 scurve_loss_raw = loss_too_straight + loss_too_bent
                 
-                hunchback_penalty = F.relu(-vec_lower[..., 2] - 0.05) + F.relu(-vec_upper[..., 2] - 0.05)
-                scoliosis_penalty = torch.abs(vec_lower[..., 0]) + torch.abs(vec_upper[..., 0])
+                hunchback_penalty = F.relu(-vec_lower_global[..., 2] - 0.05) + F.relu(-vec_upper_global[..., 2] - 0.05)
+                scoliosis_penalty = torch.abs(vec_lower_global[..., 0]) + torch.abs(vec_upper_global[..., 0])
                 hunchback_loss_raw = hunchback_penalty + scoliosis_penalty
                 
-                l_wrist = model_xp[:, :, 20, :]
-                r_wrist = model_xp[:, :, 21, :]
+                l_wrist = model_xp_global[:, :, 20, :]
+                r_wrist = model_xp_global[:, :, 21, :]
                 dist_wrists = torch.norm(l_wrist - r_wrist, dim=-1)
                 asymmetry_loss_raw = F.relu(0.02 - dist_wrists)
                 
+                # ✨ 核心修复：确保哪怕没有强制关键帧掩码，该 Loss 也能照常生效并被聚合！
                 if force_mask is not None:
-                    mask_inv = (1.0 - force_mask[:, sub_s_idx, 0])
+                    mask_inv = (1.0 - force_mask[:, global_s_idx, 0])
                     scurve_loss_raw = scurve_loss_raw * mask_inv
                     hunchback_loss_raw = hunchback_loss_raw * mask_inv
                     asymmetry_loss_raw = asymmetry_loss_raw * mask_inv
                     
-                    # ✨ 修复 Tensor Broadcasting (b, b) 串音 Bug
-                    scurve_loss = reduce(scurve_loss_raw, "b ... -> b (...)", "mean")
-                    scurve_loss = scurve_loss * extract(self.p2_loss_weight, t_sub, scurve_loss.shape)
-                    
-                    hunchback_loss = reduce(hunchback_loss_raw, "b ... -> b (...)", "mean")
-                    hunchback_loss = hunchback_loss * extract(self.p2_loss_weight, t_sub, hunchback_loss.shape)
-                    
-                    asymmetry_loss = reduce(asymmetry_loss_raw, "b ... -> b (...)", "mean")
-                    asymmetry_loss = asymmetry_loss * extract(self.p2_loss_weight, t_sub, asymmetry_loss.shape)
+                scurve_loss = reduce(scurve_loss_raw, "b ... -> b (...)", "mean")
+                scurve_loss = scurve_loss * extract(self.p2_loss_weight, t_sub, scurve_loss.shape) * biomech_weight
+                
+                hunchback_loss = reduce(hunchback_loss_raw, "b ... -> b (...)", "mean")
+                hunchback_loss = hunchback_loss * extract(self.p2_loss_weight, t_sub, hunchback_loss.shape) * biomech_weight
+                
+                asymmetry_loss = reduce(asymmetry_loss_raw, "b ... -> b (...)", "mean")
+                asymmetry_loss = asymmetry_loss * extract(self.p2_loss_weight, t_sub, asymmetry_loss.shape) * biomech_weight
 
             # FK 骨架距离与滑动惩罚
             fk_loss = self.loss_fn(model_xp, target_xp, reduction="none")
@@ -949,49 +988,30 @@ class GaussianDiffusion(nn.Module):
 
             # ==========================================================
             # 脚滑惩罚使用「目标接触 ∪ 预测接触」作为锁脚区间。
-            # 仅使用预测接触时，模型可能通过降低接触概率绕开 foot loss；
-            # 合并目标接触后，foot loss 与 contact loss 的优化方向保持一致。
             # ==========================================================
             model_contact_sub = model_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
             target_contact_sub = target_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
             static_idx = ((model_contact_sub > 0.5) | (target_contact_sub > 0.5)).detach()
             
-            # 1. 只有当前采样点和下一个采样点都判定为“接触”，才说明脚在这段时间内是踩实的
             static_continuous = static_idx[:, :-1, :] & static_idx[:, 1:, :]
-            # ==============================================
             
-            # ==========================================================
-            # 1. 物理计算：脚部滑步惩罚 (Foot Slide Penalty)
-            # ==========================================================
             foot_dist_vec = model_feet[:, 1:] - model_feet[:, :-1]
             foot_dist_norm = torch.norm(foot_dist_vec, dim=-1)
-            # 引入 1cm 宽容度
             slide_penalty = F.relu(foot_dist_norm - 0.01)
             
-            # 仅惩罚接触区间内的超额滑动，并按有效接触数量归一化，避免被非接触帧稀释。
             static_weight = static_continuous.float()
             foot_loss_raw = slide_penalty * static_weight
             foot_loss = foot_loss_raw.sum(dim=(1, 2)) / static_weight.sum(dim=(1, 2)).clamp_min(1.0)
             foot_loss = foot_loss * extract(self.p2_loss_weight, t_sub, foot_loss.shape)
 
-            # ==========================================================
-            # 2. 物理计算：防冻结惩罚 (Anti-freeze Penalty)
-            # ==========================================================
             model_extremities = model_xp[:, :, [20, 21], :] 
             model_extremities_v = (model_extremities[:, 1:] - model_extremities[:, :-1]) / self.dt
             model_v_norm = torch.norm(model_extremities_v, dim=-1).mean(dim=(1, 2))
             
-            # base_threshold = 0.005
-            # dynamic_threshold = torch.full_like(model_v_norm, base_threshold)
-            
-            # audio_feat = cond.get("audio", None) if isinstance(cond, dict) else None
-            # if audio_feat is not None and audio_feat.shape[-1] > 768:
-            #     onset = audio_feat[:, sub_s_idx[:-1], 768]
             base_threshold = 0.005
             dynamic_threshold = torch.full_like(model_v_norm, base_threshold)
             
             audio_feat = cond.get("audio", None) if isinstance(cond, dict) else None
-            # ✨ 关键修复：防止原始条件与动作序列 s 长度不一致，导致切片越界或后续 MMR 崩溃
             if audio_feat is not None:
                 audio_feat = audio_feat.to(device=x_start.device).float()
                 if audio_feat.shape[1] != s:
@@ -1008,9 +1028,6 @@ class GaussianDiffusion(nn.Module):
             anti_freeze_loss = F.relu(dynamic_threshold - model_v_norm)
             anti_freeze_loss = anti_freeze_loss * extract(self.p2_loss_weight, t_sub, anti_freeze_loss.shape)
             
-            # ==========================================================
-            # 3. 宏观轨迹与微观步频的交叉正则化 (Kinematic Sync Loss)
-            # ==========================================================
             root_xz = model_xp[:, :, 0, [0, 2]]
             root_v = torch.norm(root_xz[:, 1:] - root_xz[:, :-1], dim=-1) / self.dt
             
@@ -1031,16 +1048,11 @@ class GaussianDiffusion(nn.Module):
             contact_turn_loss = contact_turn_raw.sum(dim=-1) / (grounded_mask.sum(dim=-1) + 1e-6)
             contact_turn_loss = contact_turn_loss * extract(self.p2_loss_weight, t_sub, contact_turn_loss.shape)
 
-            # ==========================================================
-            # 4. MMR 跨模态引导损失
-            # ==========================================================
             mmr_loss = torch.tensor(0.0, device=x_start.device)
             if audio_feat is not None and self.mmr_model is not None and self.mmr_loss_weight > 0:
                 valid_audio_mask = keep_audio_mask.float()
                 if valid_audio_mask.bool().any():
                     physical_out = model_motion_phys
-                    
-                    # 🗑️ 删除这里的 if getattr(self, "force_audio_only_drop", False): ...
                     
                     with torch.no_grad():
                         audio_latent = self.mmr_model.encode_audio(audio_feat)
@@ -1057,31 +1069,22 @@ class GaussianDiffusion(nn.Module):
                     )
                     mmr_loss = (weighted_mmr_loss * valid_audio_mask).sum() / (valid_audio_mask.sum() + 1e-6)
 
-            # ==========================================================
-            # 5. 轨迹对齐损失 (Trajectory Loss)
-            # ==========================================================
-            # traj_loss = torch.tensor(0.0, device=x_start.device)
-            # target_traj = cond.get("trajectory", None) if isinstance(cond, dict) else None
-            
-            # if target_traj is not None:
-            #     target_traj = target_traj.to(device=model_out_main_norm.device, dtype=model_out_main_norm.dtype)
-            #     pred_traj = model_out_main_norm[:, :, [0, 2]]
-                
-            #     pos_traj_loss = self.loss_fn(pred_traj, target_traj, reduction="none").mean(dim=(1, 2))
-            # ================== 替换代码 ==================
             traj_loss = torch.tensor(0.0, device=x_start.device)
             target_traj = cond.get("trajectory", None) if isinstance(cond, dict) else None
             
             if target_traj is not None:
-                target_traj = target_traj.to(device=model_out_main_norm.device, dtype=model_out_main_norm.dtype)
+                target_traj = target_traj.to(device=model_out_main.device, dtype=model_out_main.dtype)
                 
-                # ✨ 关键修复：保证真实轨迹与预测轨迹的序列长度绝对一致，防止 MSE Loss 张量不匹配
                 if target_traj.shape[1] != s:
                     target_traj = F.interpolate(
                         target_traj.transpose(1, 2), size=s, mode="linear", align_corners=False
                     ).transpose(1, 2)
                     
-                pred_traj = model_out_main_norm[:, :, [0, 2]]
+                # ======= 修复 2：使用真实的物理输出计算轨迹误差 =======
+                # model_out_main 是你在前面代码 (约530行) 经过正常化逆运算推导出的真实物理 x0
+                # 取前三维 [X, Y, Z] 中的 X 和 Z (即 0 和 2)
+                pred_traj = model_out_main[:, :, [0, 2]]
+                # ===================================================
                 
                 pos_traj_loss = self.loss_fn(pred_traj, target_traj, reduction="none").mean(dim=(1, 2))
                 vel_traj_loss = self.loss_fn(
@@ -1114,15 +1117,13 @@ class GaussianDiffusion(nn.Module):
                 valid_traj_mask = keep_traj_mask.float()
                 if valid_traj_mask.bool().any():
                     traj_loss = (weighted_traj_loss * valid_traj_mask).sum() / (valid_traj_mask.sum() + 1e-6)
-        # 并在最终 return 的 losses 组合中，将 foot_loss 的权重从 0.5 提升至 1.5，补偿时间维度分辨率的降低
+
         warmup_epochs = 10.0
         if current_epoch is not None:
-            # 物理约束权重从 0 线性增加到 1
             physics_weight = min(1.0, current_epoch / warmup_epochs)
         else:
-            physics_weight = 1.0 # 推理时默认全量开启
+            physics_weight = 1.0 
 
-        # MMR 采用更保守的弱监督策略，并单独做 warmup。
         mmr_target_weight = self.mmr_loss_weight
         mmr_warmup_epochs = 20.0
         if current_epoch is not None:
@@ -1140,7 +1141,6 @@ class GaussianDiffusion(nn.Module):
             0.5 * v_loss.mean(),      
             self.contact_loss_weight * contact_loss.mean(),
             1.0 * fk_loss.mean(),     
-            # ✅ 为高级物理约束应用退火系数
             self.foot_loss_weight * physics_weight * foot_loss.mean(),  
             0.01 * physics_weight * anti_freeze_loss.mean(),  
             mmr_weight * mmr_loss,   
@@ -1341,10 +1341,8 @@ class GaussianDiffusion(nn.Module):
                 outname = f"{epoch}_{audio_output_stem(name)}.pkl"
                 Path(fk_out).mkdir(parents=True, exist_ok=True)
                 
-                # ✨ 新增：提取目标轨迹，用于后续的 FTD/轨迹误差评估
                 target_traj_np = None
                 if isinstance(cond, dict) and "trajectory" in cond:
-                    # 提取实际使用的物理量纲轨迹并对齐长度
                     target_traj_np = cond["trajectory"][0].detach().cpu().numpy()
                 
                 pickle.dump(
@@ -1352,7 +1350,7 @@ class GaussianDiffusion(nn.Module):
                         "smpl_poses": full_q.squeeze(0).reshape((-1, 72)).cpu().numpy(),
                         "smpl_trans": full_pos.squeeze(0).cpu().numpy(),
                         "full_pose": full_pose[0],
-                        "target_trajectory": target_traj_np, # ✅ 将目标轨迹一并封入 PKL
+                        "target_trajectory": target_traj_np, 
                     },
                     open(os.path.join(fk_out, outname), "wb"),
                 )

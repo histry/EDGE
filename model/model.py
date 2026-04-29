@@ -7,7 +7,6 @@ from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
 from torch import Tensor
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm  # 引入用于 Lipschitz 约束的谱归一化
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from model.rotary_embedding_torch import RotaryEmbedding
@@ -55,20 +54,11 @@ class TransformerEncoderLayer(nn.Module):
         self.self_attn = nn.MultiheadAttention(
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
-        # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
-        # 移除 spectral_norm，释放模型梯度更新步长，恢复高频动作表现力
-        # self.linear1 = nn.Linear(d_model, dim_feedforward)
-        # self.dropout = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(dim_feedforward, d_model)
-        # ================== 替换代码 ==================
-        from torch.nn.utils.parametrizations import spectral_norm # 确保使用最新的参数化方法
-
-        # 【真实实现】：应用谱归一化 (Spectral Norm) 严格限制权重矩阵的最大奇异值，
-        # 从而实现真正的 Lipschitz 约束，确保关键帧之间的隐空间插值绝对平滑。
-        self.linear1 = spectral_norm(nn.Linear(d_model, dim_feedforward))
+        
+        # 还原为常规的线性层，释放高频动作表达能力
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = spectral_norm(nn.Linear(dim_feedforward, d_model))
-        # ==============================================
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
 
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -138,22 +128,10 @@ class FiLMTransformerDecoderLayer(nn.Module):
             d_model, nhead, dropout=dropout, batch_first=batch_first
         )
         
-        # 移除 spectral_norm，释放模型梯度更新步长，恢复快速收敛。
-        # 物理连贯性交由 diffusion.py 中的显式物理 Loss (foot_loss 等) 负责。
-        # 【核心创新】：引入 Lipschitz 约束，强制让关键帧之间的插值过渡平滑。
-        # 移除 spectral_norm，释放模型梯度更新步长，恢复高频动作表现力
-        # self.linear1 = nn.Linear(d_model, dim_feedforward)
-        # self.dropout = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(dim_feedforward, d_model)
-        # ================== 替换代码 ==================
-        from torch.nn.utils.parametrizations import spectral_norm
-        
-        # 【真实实现】：应用谱归一化 (Spectral Norm) 严格限制权重矩阵的最大奇异值，
-        # 从而实现真正的 Lipschitz 约束，确保关键帧之间的隐空间插值绝对平滑。
-        self.linear1 = spectral_norm(nn.Linear(d_model, dim_feedforward))
+        # 还原为常规的线性层，配合显式物理 Loss 控制平滑
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = spectral_norm(nn.Linear(dim_feedforward, d_model))
-        # ==============================================
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
 
         self.norm_first = norm_first
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
@@ -321,14 +299,10 @@ class DanceDecoder(nn.Module):
         self.null_cond_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
         self.null_cond_hidden = nn.Parameter(torch.randn(1, latent_dim))
         
-        # ✨ [修复 4A]: 定义无轨迹条件的独立可学习 Embedding
-        # 避免模型将“全0”误认为“不允许移动的强制指令”
         self.null_trajectory_embed = nn.Parameter(torch.randn(1, 1, latent_dim))
 
         self.norm_cond = nn.LayerNorm(latent_dim)
 
-        # 【核心创新】：改变模型的输入投影层以接收联合条件输入
-        # 输入维度 = nfeats(去噪过程的随机动作) + nfeats(约束条件下的真实动作) + 1(指示哪些帧是约束条件的掩码)
         expanded_input_dim = nfeats * 2 + 1
         self.input_projection = nn.Linear(expanded_input_dim, latent_dim)
         
@@ -354,27 +328,13 @@ class DanceDecoder(nn.Module):
             nn.Linear(latent_dim, latent_dim),
         )
 
-        # Optional ControlNet-style trajectory branch.
         self.trajectory_projection = nn.Sequential(
             nn.Linear(2, latent_dim),
             nn.SiLU(),
             nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim)  # 🌟 新增：隔离并规范化物理坐标的量纲
+            nn.LayerNorm(latent_dim)
         )
-        # 🧹 清理：当前实验阶段无需直接回归根节点参数，暂时注释掉以节省显存。
-        # 预留此分支定义，便于未来如需实现根节点绝对位置显式回归时快速启用。
-        # self.trajectory_root_head = nn.Sequential(
-        #     nn.LayerNorm(latent_dim),
-        #     nn.Linear(latent_dim, latent_dim // 2),
-        #     nn.SiLU(),
-        #     nn.Linear(latent_dim // 2, 3),
-        # )
 
-        # 修改前：self.trajectory_weight = nn.Parameter(torch.tensor([0.1]))
-
-        # ✨ [增强]: 升级为通道级的可学习参数门控，维度对齐 latent_dim (默认512)
-        # 初始化为较大值 0.5，确保初始轨迹引导力足够强
-        # 移除一维标量权重，引入特征调制网络 (FiLM)
         self.traj_modulate = nn.Sequential(
             nn.Linear(latent_dim, latent_dim * 2),
             nn.SiLU()
@@ -489,25 +449,22 @@ class DanceDecoder(nn.Module):
         b = x.shape[0]
         device = x.device
         
-        # 1. 构造无条件掩码 (全 False，丢弃音频和轨迹)
         drop_all = torch.zeros((b,), dtype=torch.bool, device=device)
         unc = self.forward(
             x, cond_embed, times, cond_drop_prob=1.0, 
             force_mask=force_mask, force_x_clean=force_x_clean,
-            keep_audio_mask=drop_all, keep_traj_mask=drop_all # ✨ 修复：明确传入 False
+            keep_audio_mask=drop_all, keep_traj_mask=drop_all
         )
         
-        # 2. 构造有条件掩码 (全 True，保留所有输入条件)
         keep_all = torch.ones((b,), dtype=torch.bool, device=device)
         conditioned = self.forward(
             x, cond_embed, times, cond_drop_prob=0.0, 
             force_mask=force_mask, force_x_clean=force_x_clean,
-            keep_audio_mask=keep_all, keep_traj_mask=keep_all # ✨ 修复：明确传入 True
+            keep_audio_mask=keep_all, keep_traj_mask=keep_all
         )
 
         return unc + (conditioned - unc) * guidance_weight
 
-    # ✨ 注意这里去掉了 keep_mask，换成了 keep_audio_mask 和 keep_traj_mask
     def forward(self, x: Tensor, cond_embed: Any, times: Tensor, cond_drop_prob: float = 0.0, force_mask: Optional[Tensor] = None, force_x_clean: Optional[Tensor] = None, keep_audio_mask: Optional[Tensor] = None, keep_traj_mask: Optional[Tensor] = None):
         batch_size, seq_len, _, device = *x.shape, x.device
 
@@ -518,11 +475,6 @@ class DanceDecoder(nn.Module):
         if force_x_clean is None:
             force_x_clean = torch.zeros_like(x)
 
-        # =========================================================================
-        # 【修复核心】：强制设备对齐与精度对齐
-        # 无论 force_mask 和 force_x_clean 是从外部（diffusion_loop）传进来的，
-        # 还是内部生成的，在进行数学计算前，强制拉到与动作序列 x 同一个 GPU 节点和混合精度上。
-        # =========================================================================
         force_mask = force_mask.to(device=device, dtype=x.dtype)
         force_x_clean = force_x_clean.to(device=device, dtype=x.dtype)
 
@@ -547,9 +499,6 @@ class DanceDecoder(nn.Module):
             cond_embed, batch_size, seq_len, device, x.dtype
         )
         
-        # 【终极修复 2A】：将 CFG 判定提前
-        # ✨ 解耦处理：为音频和轨迹生成独立的 CFG 掩码
-        # ✨ 解耦处理：为音频和轨迹生成独立的 CFG 掩码
         if keep_audio_mask is None:
             keep_audio_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
         if keep_traj_mask is None:
@@ -559,7 +508,6 @@ class DanceDecoder(nn.Module):
         keep_audio_mask_hidden = rearrange(keep_audio_mask, "b -> b 1")
 
         keep_traj_mask_embed = rearrange(keep_traj_mask, "b -> b 1 1")
-        # ✨ 新增：轨迹的隐藏层降维掩码，用于后续的模态解耦判定
         keep_traj_mask_hidden = rearrange(keep_traj_mask, "b -> b 1")
         
         trajectory_tokens = None
@@ -574,7 +522,6 @@ class DanceDecoder(nn.Module):
             cond_tokens.dtype
         )
         
-        # 1. 音频特征的独立 CFG 丢弃 (Token级)
         cond_tokens = torch.where(keep_audio_mask_embed, cond_tokens, null_cond_embed)
 
         mean_pooled_cond_tokens = cond_tokens.mean(dim=-2)
@@ -588,19 +535,14 @@ class DanceDecoder(nn.Module):
 
         if trajectory_tokens is not None:
             null_traj_embed = self.null_trajectory_embed.to(trajectory_tokens.dtype)
-            # 2. 轨迹特征的独立 CFG 丢弃 (Token级)
             trajectory_tokens = torch.where(
                 keep_traj_mask_embed,
                 trajectory_tokens,
                 null_traj_embed
             )
 
-            # ✨ 3. 严格的模态解耦逻辑 (Global 级)
-            # 丢弃错误的联合 Mask 绑定。音频的全局特征只应由音频本身的丢弃概率决定。
-            # 这样在 "丢弃音频 + 保留轨迹" 的 CFG 前向传播中，网络能获取到 100% 纯净的无音频先验
             cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
 
-            # 4. 动态特征融合 (FiLM)
             scale_shift = self.traj_modulate(trajectory_tokens)
             scale, shift = scale_shift.chunk(2, dim=-1)
             fused_tokens = cond_tokens * (1.0 + scale) + shift
@@ -608,7 +550,6 @@ class DanceDecoder(nn.Module):
             t += cond_hidden
             c = torch.cat((fused_tokens, t_tokens), dim=-2)
         else:
-            # 如果完全没有传入轨迹控制，则退化为单模态标准 CFG
             cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
             t += cond_hidden
             c = torch.cat((cond_tokens, t_tokens), dim=-2)
