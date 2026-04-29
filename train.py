@@ -15,6 +15,7 @@ def train(opt):
         use_sparse_attn=opt.use_sparse_attn,
         sparse_attn_window=opt.sparse_attn_window,
         cond_drop_prob=opt.cond_drop_prob,
+        audio_pairing_mode=opt.audio_pairing_mode,
         mmr_loss_weight=opt.mmr_loss_weight,
         keyframe_condition_prob=opt.keyframe_condition_prob,
         keyframe_condition_width=opt.keyframe_condition_width,

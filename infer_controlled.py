@@ -141,6 +141,27 @@ def load_keyframe(path, normalizer, keyframe_space):
 
     raise ValueError(f"Unknown keyframe_space: {keyframe_space}")
 
+def keyframe_window(frame, seq_len, width):
+    """
+    Return frame indices around a keyframe.
+    width=1 means only the exact frame.
+    width=3 means frame-1, frame, frame+1 when possible.
+    """
+    width = max(1, int(width))
+    half = width // 2
+
+    if frame <= 0:
+        start = 0
+        end = min(seq_len, width)
+    elif frame >= seq_len - 1:
+        start = max(0, seq_len - width)
+        end = seq_len
+    else:
+        start = max(0, frame - half)
+        end = min(seq_len, start + width)
+        start = max(0, end - width)
+
+    return range(start, end)
 
 def build_keyframe_constraint(args, seq_len, normalizer, traj_norm=None):
     """
@@ -188,16 +209,17 @@ def build_keyframe_constraint(args, seq_len, normalizer, traj_norm=None):
     for frame, path in keyframes:
         pose = load_keyframe(path, normalizer, args.keyframe_space)
 
-        # 避免关键帧 root X/Z 和轨迹控制互相打架。
-        # 姿态关键帧主要控制 root_y + local rotations；
-        # root X/Z 交给 trajectory 控制。
-        if traj_norm is not None and not args.preserve_keyframe_root_xz:
-            pose[ROOT_X_IDX] = traj_norm[frame, 0]
-            pose[ROOT_Z_IDX] = traj_norm[frame, 1]
+        for target_frame in keyframe_window(frame, seq_len, args.keyframe_width):
+            pose_for_frame = pose.copy()
 
-        value[0, frame] = torch.from_numpy(pose)
-        mask[0, frame, 0] = 1.0
+            # Avoid conflict between pose keyframes and trajectory control.
+            # Root X/Z is controlled by trajectory unless explicitly preserved.
+            if traj_norm is not None and not args.preserve_keyframe_root_xz:
+                pose_for_frame[ROOT_X_IDX] = traj_norm[target_frame, 0]
+                pose_for_frame[ROOT_Z_IDX] = traj_norm[target_frame, 1]
 
+            value[0, target_frame] = torch.from_numpy(pose_for_frame)
+            mask[0, target_frame, 0] = 1.0
     return {"mask": mask, "value": value}
 
 
@@ -263,6 +285,83 @@ def apply_trajectory_postprocess(motion_physical, traj_physical, strength=1.0):
     out[:, ROOT_Z_IDX] = (1.0 - strength) * out[:, ROOT_Z_IDX] + strength * traj_physical[:, 1]
     return out.astype(np.float32)
 
+def find_contact_segments(contact_mask, min_len=3):
+    """
+    contact_mask: [T] bool
+    return list of (start, end), end is exclusive
+    """
+    segments = []
+    start = None
+
+    for i, active in enumerate(contact_mask):
+        if active and start is None:
+            start = i
+        elif not active and start is not None:
+            if i - start >= min_len:
+                segments.append((start, i))
+            start = None
+
+    if start is not None and len(contact_mask) - start >= min_len:
+        segments.append((start, len(contact_mask)))
+
+    return segments
+
+
+def apply_foot_lock_postprocess(
+    motion_physical,
+    device,
+    strength=0.7,
+    contact_threshold=0.8,
+    min_segment=3,
+):
+    """
+    Reduce horizontal foot sliding by adjusting root X/Z during contact segments.
+
+    This is a display/system-level postprocess. It may slightly change the root trajectory,
+    so raw_model_motion should still be used for model-only evaluation.
+    """
+    motion = motion_physical.copy().astype(np.float32)
+    strength = float(np.clip(strength, 0.0, 1.0))
+
+    if strength <= 0:
+        return motion
+
+    joints = motion_to_joints(motion, device=device)  # [T,24,3]
+    contacts = motion[:, 0:4] > contact_threshold
+
+    # SMPL foot joint ids used elsewhere in the project: [7, 8, 10, 11]
+    foot_joint_ids = [7, 8, 10, 11]
+    T = motion.shape[0]
+
+    delta_sum = np.zeros((T, 2), dtype=np.float32)
+    delta_count = np.zeros((T, 1), dtype=np.float32)
+
+    for foot_channel, joint_id in enumerate(foot_joint_ids):
+        segments = find_contact_segments(
+            contacts[:, foot_channel],
+            min_len=min_segment,
+        )
+
+        for start, end in segments:
+            anchor_xz = joints[start, joint_id, [0, 2]].copy()
+
+            for t in range(start, end):
+                current_xz = joints[t, joint_id, [0, 2]]
+                delta = anchor_xz - current_xz
+                delta_sum[t] += delta.astype(np.float32)
+                delta_count[t, 0] += 1.0
+
+    valid = delta_count[:, 0] > 0
+    if not np.any(valid):
+        return motion
+
+    root_delta = np.zeros((T, 2), dtype=np.float32)
+    root_delta[valid] = delta_sum[valid] / np.maximum(delta_count[valid], 1e-6)
+
+    motion[:, ROOT_X_IDX] += strength * root_delta[:, 0]
+    motion[:, ROOT_Z_IDX] += strength * root_delta[:, 1]
+
+    return motion.astype(np.float32)
 
 def main():
     parser = argparse.ArgumentParser("Controlled EDGE inference")
@@ -281,6 +380,12 @@ def main():
     parser.add_argument("--mid_pose_frames", default="")
     parser.add_argument("--keyframe_space", default="normalized", choices=["normalized", "physical"])
     parser.add_argument("--preserve_keyframe_root_xz", action="store_true")
+    parser.add_argument(
+        "--keyframe_width",
+        type=int,
+        default=3,
+        help="Number of frames around each keyframe to constrain during inference.",
+    )
 
     parser.add_argument("--trajectory", default="")
     parser.add_argument("--target_traj", default="")
@@ -289,6 +394,11 @@ def main():
     parser.add_argument("--beat_guidance_weight", type=float, default=0.0)
     parser.add_argument("--hard_keyframe_project", action="store_true")
     parser.add_argument("--no_tto", action="store_true")
+
+    parser.add_argument("--foot_lock_postprocess", action="store_true")
+    parser.add_argument("--foot_lock_strength", type=float, default=0.7)
+    parser.add_argument("--foot_lock_contact_threshold", type=float, default=0.8)
+    parser.add_argument("--foot_lock_min_segment", type=int, default=3)
 
     parser.add_argument("--postprocess_trajectory", action="store_true")
     parser.add_argument("--postprocess_strength", type=float, default=1.0)
@@ -335,6 +445,7 @@ def main():
         cond["trajectory"] = traj_tensor
 
     print("Preparing keyframe constraints...")
+
     constraint = build_keyframe_constraint(
         args=args,
         seq_len=args.frames,
@@ -369,19 +480,52 @@ def main():
     else:
         sample_physical = sample_norm.numpy()
 
-    raw_motion_path = os.path.join(args.out_dir, f"{args.out_name}_raw.npy")
+    raw_motion_path = os.path.join(args.out_dir, f"{args.out_name}_raw_model.npy")
     np.save(raw_motion_path, sample_physical.astype(np.float32))
 
-    final_motion = sample_physical
+    final_motion = sample_physical.copy()
+    postprocess_steps = []
 
     if args.postprocess_trajectory and traj_physical is not None:
         final_motion = apply_trajectory_postprocess(
-            motion_physical=sample_physical,
+            motion_physical=final_motion,
             traj_physical=traj_physical,
             strength=args.postprocess_strength,
         )
+        postprocess_steps.append(
+            {
+                "name": "trajectory_postprocess",
+                "strength": float(args.postprocess_strength),
+                "note": (
+                    "Root X/Z is blended toward the target trajectory. "
+                    "When strength=1.0, final trajectory error mainly reflects system-level anchoring, "
+                    "not pure model prediction."
+                ),
+            }
+        )
 
-    final_motion_path = os.path.join(args.out_dir, f"{args.out_name}.npy")
+    if args.foot_lock_postprocess:
+        final_motion = apply_foot_lock_postprocess(
+            motion_physical=final_motion,
+            device=model.accelerator.device,
+            strength=args.foot_lock_strength,
+            contact_threshold=args.foot_lock_contact_threshold,
+            min_segment=args.foot_lock_min_segment,
+        )
+        postprocess_steps.append(
+            {
+                "name": "foot_lock_postprocess",
+                "strength": float(args.foot_lock_strength),
+                "contact_threshold": float(args.foot_lock_contact_threshold),
+                "min_segment": int(args.foot_lock_min_segment),
+                "note": (
+                    "Root X/Z is adjusted during detected foot-contact segments to reduce sliding. "
+                    "This may slightly trade off trajectory accuracy for visual physical plausibility."
+                ),
+            }
+        )
+
+    final_motion_path = os.path.join(args.out_dir, f"{args.out_name}_final_system.npy")
     np.save(final_motion_path, final_motion.astype(np.float32))
 
     metadata = {
@@ -399,8 +543,13 @@ def main():
         "hard_keyframe_project": args.hard_keyframe_project,
         "use_tto": not args.no_tto,
         "postprocess_trajectory": args.postprocess_trajectory,
-        "raw_motion": raw_motion_path,
-        "final_motion": final_motion_path,
+        "raw_model_motion": raw_motion_path,
+        "final_system_motion": final_motion_path,
+        "postprocess_steps": postprocess_steps,
+        "interpretation": {
+            "raw_model_motion": "Use this file to evaluate the model's own keyframe/trajectory following ability.",
+            "final_system_motion": "Use this file for final controlled choreography display.",
+        },
     }
 
     with open(os.path.join(args.out_dir, f"{args.out_name}_meta.json"), "w", encoding="utf-8") as f:

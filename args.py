@@ -77,10 +77,26 @@ def parse_train_opt():
         help="classifier-free guidance drop probability during training",
     )
     parser.add_argument(
+        "--audio_pairing_mode",
+        type=str,
+        default="proxy",
+        choices=["none", "proxy", "paired"],
+        help=(
+            "Audio-motion pairing mode. "
+            "'none' means no audio supervision; "
+            "'proxy' means weak rhythm proxy only; "
+            "'paired' means real paired audio-motion supervision is available."
+        ),
+    )
+
+    parser.add_argument(
         "--mmr_loss_weight",
         type=float,
         default=0.0,
-        help="maximum MMR audio-motion alignment loss weight; set to 0 for unpaired music/motion data",
+        help=(
+            "Weight for MMR audio-motion alignment loss. "
+            "Should be >0 only when --audio_pairing_mode paired."
+        ),
     )
     parser.add_argument(
         "--keyframe_condition_prob",
@@ -161,6 +177,33 @@ def parse_train_opt():
         default="best",
         choices=["best", "zero", "random"],
         help="deterministic validation audio selection for weak proxy pairs; random is not recommended for validation",
+    )
+    parser.add_argument(
+        "--traj_aug_prob",
+        type=float,
+        default=0.3,
+        help="Probability of applying geometric trajectory augmentation to Dunhuang motion windows.",
+    )
+
+    parser.add_argument(
+        "--traj_aug_scale_min",
+        type=float,
+        default=0.8,
+        help="Minimum scale for trajectory/root XZ augmentation.",
+    )
+
+    parser.add_argument(
+        "--traj_aug_scale_max",
+        type=float,
+        default=1.25,
+        help="Maximum scale for trajectory/root XZ augmentation.",
+    )
+
+    parser.add_argument(
+        "--traj_aug_rot_deg",
+        type=float,
+        default=30.0,
+        help="Maximum absolute rotation angle in degrees for trajectory/root XZ augmentation.",
     )
     parser.add_argument(
         "--train_stage",

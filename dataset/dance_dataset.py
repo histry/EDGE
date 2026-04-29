@@ -38,7 +38,9 @@ class AISTPPDataset(Dataset):
         seq_len: int = 150,
         include_contacts: bool = True,
         force_reload: bool = False,
+        return_traj: bool = False,
     ):
+        self.return_traj = return_traj
         self.data_path = data_path
         self.raw_fps = 60
         self.data_fps = 30
@@ -121,11 +123,13 @@ class AISTPPDataset(Dataset):
                     
             feature = torch.from_numpy(feature_np).float()
 
-        # 🌟 修复 2：在 AIST++ 数据集返回的条件字典中显式加入 trajectory 键
-        # 确保与 DunhuangDataset 结构完全统一，避免引发 KeyError
-        cond = {
-            "audio": feature
-        }
+        cond = {"audio": feature}
+
+        if self.return_traj:
+            # pose is already normalized; root X/Z are dimensions 4 and 6.
+            # This keeps trajectory condition in the same normalized space as motion.
+            cond["trajectory"] = pose[:, [4, 6]].float()
+
         return pose, cond, filename_, self.data["wavs"][idx]
 
     def load_aistpp(self):
@@ -327,6 +331,9 @@ class DunhuangDataset(Dataset):
         split_ratio=0.9,
         split_seed=42,
         audio_sample_mode="random",
+        traj_aug_prob=0.0,
+        traj_aug_scale_range=(1.0, 1.0),
+        traj_aug_rot_deg=0.0,
     ):
         self.data_path = data_path
         self.train = train
@@ -334,6 +341,13 @@ class DunhuangDataset(Dataset):
         self.audio_dim = audio_dim
         self.return_traj = return_traj
         self.audio_sample_mode = audio_sample_mode
+
+        # Trajectory augmentation is enabled only for training.
+        # Validation/test data should remain deterministic.
+        self.traj_aug_prob = float(traj_aug_prob) if train else 0.0
+        self.traj_aug_scale_range = traj_aug_scale_range
+        self.traj_aug_rot_deg = float(traj_aug_rot_deg)
+
         self.proxy_audios = []
         self.motion_window_ids = []
         self.weak_pair_map = {}
@@ -412,7 +426,7 @@ class DunhuangDataset(Dataset):
 
             for start in range(0, num_frames - seq_len + 1, step):
                 slice_motion = motion[start : start + seq_len].copy()
-                slice_traj = traj_xz[start : start + seq_len].copy() # 对应修改
+                slice_traj = traj_xz[start : start + seq_len].copy()
 
                 local_start_x = slice_motion[0, 4]
                 local_start_z = slice_motion[0, 6]
@@ -421,6 +435,13 @@ class DunhuangDataset(Dataset):
                 slice_motion[:, 6] -= local_start_z
                 slice_traj[:, 0] -= local_start_x
                 slice_traj[:, 1] -= local_start_z
+
+                # Apply geometric trajectory augmentation in physical space.
+                # Important: motion root X/Z and trajectory condition must be transformed together.
+                slice_motion, slice_traj = self._augment_motion_traj_physical(
+                    slice_motion,
+                    slice_traj,
+                )
 
                 motions_list.append(slice_motion)
                 trajs_list.append(slice_traj)
@@ -449,7 +470,61 @@ class DunhuangDataset(Dataset):
             self.motions = np.zeros((0, seq_len, 151), dtype=np.float32)
             self.trajs = np.zeros((0, seq_len, 2), dtype=np.float32)
             self.normalizer = normalizer if (normalizer is not None and hasattr(normalizer, 'mean')) else None
+    def _augment_motion_traj_physical(self, motion, traj):
+        """
+        Apply the same geometric transform to motion root X/Z and trajectory X/Z.
 
+        motion: [T, 151], physical-space motion before normalization
+        traj:   [T, 2],   physical-space trajectory before normalization
+
+        Important:
+        We must transform motion root X/Z and trajectory condition together.
+        Otherwise, the model would receive one trajectory but be trained to
+        reconstruct a different root path, which is wrong supervision.
+        """
+        if self.traj_aug_prob <= 0:
+            return motion, traj
+
+        if random.random() > self.traj_aug_prob:
+            return motion, traj
+
+        motion = motion.copy()
+        traj = traj.copy()
+
+        scale_min, scale_max = self.traj_aug_scale_range
+        scale = random.uniform(float(scale_min), float(scale_max))
+
+        angle = random.uniform(
+            -self.traj_aug_rot_deg,
+            self.traj_aug_rot_deg,
+        ) * np.pi / 180.0
+
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        rot = np.array(
+            [
+                [cos_a, -sin_a],
+                [sin_a, cos_a],
+            ],
+            dtype=np.float32,
+        )
+
+        # Root X/Z in the 151-D representation are dim 4 and dim 6.
+        root_xz = motion[:, [4, 6]].astype(np.float32)
+        root_xz = root_xz @ rot.T
+        root_xz = root_xz * scale
+
+        traj_xz = traj.astype(np.float32)
+        traj_xz = traj_xz @ rot.T
+        traj_xz = traj_xz * scale
+
+        motion[:, 4] = root_xz[:, 0]
+        motion[:, 6] = root_xz[:, 1]
+
+        traj[:, 0] = traj_xz[:, 0]
+        traj[:, 1] = traj_xz[:, 1]
+
+        return motion, traj
     def split_source_files(self, train, split_ratio=0.9, split_seed=42):
         if train is None or len(self.pkl_files) <= 1:
             self.split_name = "all" if train is None else ("train" if train else "val")

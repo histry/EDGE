@@ -20,6 +20,28 @@ from model.model import DanceDecoder
 from model.mmr_model import CrossModalMMR
 from vis import SMPLSkeleton
 
+def _print_trainable_summary(self, model):
+    if not self.accelerator.is_main_process:
+        return
+
+    total = 0
+    trainable = 0
+    module_rows = []
+
+    for name, module in model.named_children():
+        module_total = sum(p.numel() for p in module.parameters())
+        module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        total += module_total
+        trainable += module_trainable
+        module_rows.append((name, module_trainable, module_total))
+
+    print("📊 Trainable parameter summary:")
+    for name, module_trainable, module_total in module_rows:
+        ratio = 0.0 if module_total == 0 else module_trainable / module_total * 100.0
+        print(f"  - {name}: {module_trainable}/{module_total} ({ratio:.2f}%)")
+
+    print(f"  Total trainable: {trainable}/{total} ({trainable / max(total, 1) * 100.0:.2f}%)")
+
 def move_condition_to_device(cond, device):
     if isinstance(cond, dict):
         moved = {}
@@ -81,6 +103,7 @@ class EDGE:
         use_sparse_attn=False,
         sparse_attn_window=24,
         cond_drop_prob=0.25,
+        audio_pairing_mode="proxy",
         mmr_loss_weight=0.0,
         keyframe_condition_prob=0.7,
         keyframe_condition_width=3,
@@ -107,6 +130,14 @@ class EDGE:
 
         self.repr_dim = repr_dim = 151
         self.audio_dim = audio_dim
+        self.audio_pairing_mode = audio_pairing_mode
+
+        if audio_pairing_mode != "paired" and mmr_loss_weight > 0:
+            print(
+                f"⚠️ audio_pairing_mode={audio_pairing_mode}，当前没有真实音乐-动作配对监督；"
+                f"将 mmr_loss_weight 从 {mmr_loss_weight} 强制设为 0，避免把 proxy music 当作真标签。"
+            )
+            mmr_loss_weight = 0.0
         self.horizon = horizon = seq_len
         self.train_stage = train_stage
 
@@ -153,6 +184,7 @@ class EDGE:
         )
 
         self._apply_stage_freezing(model, train_stage)
+        self._print_trainable_summary(model)
 
         smpl = SMPLSkeleton(self.accelerator.device)
         
@@ -161,7 +193,11 @@ class EDGE:
         if mmr_loss_weight <= 0:
             print("⏭️ MMR 跨模态损失权重为 0：已关闭音频-动作对齐监督，适合未配对音乐/动作数据。")
         else:
-            self.mmr_model = CrossModalMMR(motion_dim=151, audio_dim=803, latent_dim=256).to(self.accelerator.device)
+            self.mmr_model = CrossModalMMR(
+                motion_dim=151,
+                audio_dim=self.audio_dim,
+                latent_dim=256,
+            ).to(self.accelerator.device)
             if os.path.exists(mmr_ckpt_path):
                 try:
                     mmr_checkpoint = torch.load(mmr_ckpt_path, map_location=self.accelerator.device)
@@ -291,27 +327,63 @@ class EDGE:
             parameter.requires_grad = enabled
 
     def _apply_stage_freezing(self, model, train_stage):
+        """
+        Training stages:
+        - full:
+            Train all modules.
+        - stage1:
+            Control-adaptation stage. Keep audio encoder frozen to preserve the
+            pretrained audio prior, and train motion/control-side modules.
+        - stage2:
+            Multi-keyframe refinement stage. Train decoder and control-related
+            modules for stronger inpainting/keyframe adaptation.
+        """
         if train_stage == "full":
+            print("🧩 train_stage=full: all modules are trainable.")
             return
+
         if train_stage == "stage1":
+            # Preserve audio prior.
             self._set_requires_grad(model.cond_projection, False)
             self._set_requires_grad(model.cond_encoder, False)
             self._set_requires_grad(model.non_attn_cond_projection, False)
-            if hasattr(model, "trajectory_projection"):
-                self._set_requires_grad(model.trajectory_projection, True)
-            # if hasattr(model, "trajectory_root_head"):
-            #     self._set_requires_grad(model.trajectory_root_head, True)
-            return
-        if train_stage == "stage2":
-            self._set_requires_grad(model, False)
+
+            # Adapt motion/control path.
             self._set_requires_grad(model.input_projection, True)
             self._set_requires_grad(model.seqTransDecoder, True)
             self._set_requires_grad(model.final_layer, True)
+
             if hasattr(model, "trajectory_projection"):
                 self._set_requires_grad(model.trajectory_projection, True)
             if hasattr(model, "traj_modulate"):
                 self._set_requires_grad(model.traj_modulate, True)
+
+            print(
+                "🧩 train_stage=stage1: frozen audio condition encoder; "
+                "training decoder + input projection + trajectory/control branches."
+            )
             return
+
+        if train_stage == "stage2":
+            # Start from a clean frozen state.
+            self._set_requires_grad(model, False)
+
+            # Refine inpainting/control path.
+            self._set_requires_grad(model.input_projection, True)
+            self._set_requires_grad(model.seqTransDecoder, True)
+            self._set_requires_grad(model.final_layer, True)
+
+            if hasattr(model, "trajectory_projection"):
+                self._set_requires_grad(model.trajectory_projection, True)
+            if hasattr(model, "traj_modulate"):
+                self._set_requires_grad(model.traj_modulate, True)
+
+            print(
+                "🧩 train_stage=stage2: frozen audio encoder and non-control modules; "
+                "training decoder + keyframe/trajectory control path."
+            )
+            return
+
         raise ValueError(f"Unknown train_stage: {train_stage}")
 
     @staticmethod
@@ -406,6 +478,12 @@ class EDGE:
                 split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
                 split_seed=getattr(opt, "dunhuang_split_seed", 42),
                 audio_sample_mode="random",
+                traj_aug_prob=getattr(opt, "traj_aug_prob", 0.3),
+                traj_aug_scale_range=(
+                    getattr(opt, "traj_aug_scale_min", 0.8),
+                    getattr(opt, "traj_aug_scale_max", 1.25),
+                ),
+                traj_aug_rot_deg=getattr(opt, "traj_aug_rot_deg", 30.0),
             )
             self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer
@@ -420,6 +498,7 @@ class EDGE:
                 split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
                 split_seed=getattr(opt, "dunhuang_split_seed", 42),
                 audio_sample_mode=getattr(opt, "dunhuang_val_audio_mode", "best"),
+                traj_aug_prob=0.0,
             )
 
             self.normalizer = train_dataset.normalizer
@@ -442,6 +521,7 @@ class EDGE:
                 backup_path=os.path.join(actual_data_path, "backup"),
                 feature_type=self.feature_type,
                 seq_len=opt.seq_len,
+                return_traj=True,
             )
             test_dataset = AISTPPDataset(
                 data_path=actual_data_path,
@@ -450,6 +530,7 @@ class EDGE:
                 feature_type=self.feature_type,
                 seq_len=opt.seq_len,
                 normalizer=train_dataset.normalizer,
+                return_traj=True,
             )
             self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer
