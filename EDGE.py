@@ -467,7 +467,15 @@ class EDGE:
         
         if is_dunhuang:
             print(f"\n🪷 检测到敦煌数据集路径 ({data_path})，启动中华古典舞纯视觉微调模式！")
-
+            if opt.audio_pairing_mode == "none":
+                train_audio_sample_mode = "zero"
+                val_audio_sample_mode = "zero"
+            elif opt.audio_pairing_mode == "paired":
+                train_audio_sample_mode = "best"
+                val_audio_sample_mode = "best"
+            else:
+                train_audio_sample_mode = "random"
+                val_audio_sample_mode = getattr(opt, "dunhuang_val_audio_mode", "best")
             train_dataset = DunhuangDataset(
                 data_path=data_path,
                 train=True,
@@ -477,7 +485,10 @@ class EDGE:
                 return_traj=True,
                 split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
                 split_seed=getattr(opt, "dunhuang_split_seed", 42),
-                audio_sample_mode="random",
+                audio_sample_mode=train_audio_sample_mode,
+                audio_pairing_mode=opt.audio_pairing_mode,
+                paired_audio_missing_policy=getattr(opt, "paired_audio_missing_policy", "error"),
+                weak_pairs_path=getattr(opt, "weak_pairs_path", "data/proxy_weak_pairs/weak_pairs.csv"),
                 traj_aug_prob=getattr(opt, "traj_aug_prob", 0.3),
                 traj_aug_scale_range=(
                     getattr(opt, "traj_aug_scale_min", 0.8),
@@ -497,7 +508,10 @@ class EDGE:
                 return_traj=True,
                 split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
                 split_seed=getattr(opt, "dunhuang_split_seed", 42),
-                audio_sample_mode=getattr(opt, "dunhuang_val_audio_mode", "best"),
+                audio_sample_mode=val_audio_sample_mode,
+                audio_pairing_mode=opt.audio_pairing_mode,
+                paired_audio_missing_policy=getattr(opt, "paired_audio_missing_policy", "error"),
+                weak_pairs_path=getattr(opt, "weak_pairs_path", "data/proxy_weak_pairs/weak_pairs.csv"),
                 traj_aug_prob=0.0,
             )
 

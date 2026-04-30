@@ -222,6 +222,26 @@ def build_keyframe_constraint(args, seq_len, normalizer, traj_norm=None):
             mask[0, target_frame, 0] = 1.0
     return {"mask": mask, "value": value}
 
+def align_audio_features(raw_feat, seq_len, expected_dim):
+    raw_feat = np.asarray(raw_feat, dtype=np.float32)
+
+    if raw_feat.ndim != 2:
+        raise ValueError(f"Expected audio feature shape [T,C], got {raw_feat.shape}")
+
+    if raw_feat.shape[-1] != expected_dim:
+        raise ValueError(
+            f"Audio dim mismatch: got {raw_feat.shape[-1]}, expected {expected_dim}. "
+            "Please check --feature_type and --audio_dim."
+        )
+
+    raw_tensor = torch.from_numpy(raw_feat).float().unsqueeze(0).transpose(1, 2)
+    aligned = F.interpolate(
+        raw_tensor,
+        size=seq_len,
+        mode="linear",
+        align_corners=False,
+    )
+    return aligned.transpose(1, 2).squeeze(0).numpy().astype(np.float32)
 
 def extract_audio_features(args, seq_len):
     feature_map = {
@@ -234,26 +254,7 @@ def extract_audio_features(args, seq_len):
         raise ValueError(f"Unknown feature_type: {args.feature_type}")
 
     raw_feat, _ = feature_map[args.feature_type](args.music)
-    raw_feat = np.asarray(raw_feat, dtype=np.float32)
-
-    if raw_feat.ndim != 2:
-        raise ValueError(f"Expected audio feature shape [T,C], got {raw_feat.shape}")
-
-    if raw_feat.shape[-1] != args.audio_dim:
-        raise ValueError(
-            f"Audio dim mismatch: got {raw_feat.shape[-1]}, expected {args.audio_dim}. "
-            "Please check --feature_type and --audio_dim."
-        )
-
-    raw_tensor = torch.from_numpy(raw_feat).float().unsqueeze(0).transpose(1, 2)
-    aligned = F.interpolate(
-        raw_tensor,
-        size=seq_len,
-        mode="linear",
-        align_corners=False,
-    )
-    audio = aligned.transpose(1, 2).squeeze(0).numpy().astype(np.float32)
-    return audio
+    return align_audio_features(raw_feat, seq_len=seq_len, expected_dim=args.audio_dim)
 
 
 def motion_to_joints(motion_physical, device):

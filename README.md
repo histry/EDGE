@@ -30,3 +30,5 @@
 - 24 个关节的 6D rotation，共 144 维
 
 总计 4 + 3 + 144 = 151 维。
+
+For data and music-supervision limitations, see `docs/data_limitations.md`.

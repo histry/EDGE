@@ -88,7 +88,23 @@ def parse_train_opt():
             "'paired' means real paired audio-motion supervision is available."
         ),
     )
+    parser.add_argument(
+        "--weak_pairs_path",
+        type=str,
+        default="data/proxy_weak_pairs/weak_pairs.csv",
+        help="CSV file for Dunhuang weak/proxy or paired audio-motion candidates.",
+    )
 
+    parser.add_argument(
+        "--paired_audio_missing_policy",
+        type=str,
+        default="error",
+        choices=["error", "zero"],
+        help=(
+            "What to do when --audio_pairing_mode paired but a motion window "
+            "has no paired audio candidate. 'error' is safest for strict paired training."
+        ),
+    )
     parser.add_argument(
         "--mmr_loss_weight",
         type=float,

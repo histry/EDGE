@@ -331,6 +331,8 @@ class DunhuangDataset(Dataset):
         split_ratio=0.9,
         split_seed=42,
         audio_sample_mode="random",
+        audio_pairing_mode="proxy",
+        paired_audio_missing_policy="error",
         traj_aug_prob=0.0,
         traj_aug_scale_range=(1.0, 1.0),
         traj_aug_rot_deg=0.0,
@@ -340,8 +342,25 @@ class DunhuangDataset(Dataset):
         self.seq_len = seq_len
         self.audio_dim = audio_dim
         self.return_traj = return_traj
-        self.audio_sample_mode = audio_sample_mode
+        self.audio_pairing_mode = str(audio_pairing_mode).lower()
+        self.paired_audio_missing_policy = paired_audio_missing_policy
 
+        valid_pairing_modes = {"none", "proxy", "paired"}
+        if self.audio_pairing_mode not in valid_pairing_modes:
+            raise ValueError(
+                f"audio_pairing_mode must be one of {sorted(valid_pairing_modes)}, "
+                f"got {audio_pairing_mode}"
+            )
+
+        if self.audio_pairing_mode == "none":
+            use_weak_pairs = False
+            audio_sample_mode = "zero"
+
+        if self.audio_pairing_mode == "paired":
+            # paired 模式下默认用 best，避免训练时随机抽错候选。
+            audio_sample_mode = "best"
+
+        self.audio_sample_mode = audio_sample_mode
         # Trajectory augmentation is enabled only for training.
         # Validation/test data should remain deterministic.
         self.traj_aug_prob = float(traj_aug_prob) if train else 0.0
@@ -609,22 +628,65 @@ class DunhuangDataset(Dataset):
             print(f"🎵 已加载 weak proxy music 候选: {len(pair_map)} 个动作窗口。")
         return pair_map
 
+    def _choose_weak_candidate(self, candidates):
+        if not candidates:
+            return None
+
+        if self.audio_sample_mode == "best":
+            return max(candidates, key=lambda candidate: candidate["score"])
+
+        weights = [max(float(candidate.get("score", 1.0)), 1e-6) for candidate in candidates]
+        return random.choices(candidates, weights=weights, k=1)[0]
+
+
     def _sample_audio_feature(self, idx):
-        if self.audio_sample_mode == "zero":
+        """
+        Return:
+            audio_feat or None
+
+        audio_pairing_mode:
+        - none:
+            Always returns None, and __getitem__ will convert it to zero audio.
+        - proxy:
+            Uses weak-pair candidates if available; otherwise falls back to proxy/RAG music.
+            This is weak rhythm guidance only, not paired supervision.
+        - paired:
+            Requires a weak_pair_map entry for the exact motion window id.
+            If missing, either raises error or returns None according to paired_audio_missing_policy.
+        """
+        if self.audio_pairing_mode == "none" or self.audio_sample_mode == "zero":
             return None
 
         window_id = self.motion_window_ids[idx] if idx < len(self.motion_window_ids) else ""
         weak_candidates = self.weak_pair_map.get(window_id, [])
-        if weak_candidates:
-            if self.audio_sample_mode == "best":
-                return max(weak_candidates, key=lambda candidate: candidate["score"])["audio_feat"]
-            weights = [candidate["score"] for candidate in weak_candidates]
-            return random.choices(weak_candidates, weights=weights, k=1)[0]["audio_feat"]
 
-        if hasattr(self, 'proxy_audios') and len(self.proxy_audios) > 0:
+        if self.audio_pairing_mode == "paired":
+            candidate = self._choose_weak_candidate(weak_candidates)
+            if candidate is not None:
+                return candidate["audio_feat"]
+
+            message = (
+                f"audio_pairing_mode='paired' requires a paired audio candidate "
+                f"for motion window '{window_id}', but none was found. "
+                f"Check --weak_pairs_path or use --audio_pairing_mode proxy/none."
+            )
+
+            if self.paired_audio_missing_policy == "zero":
+                print(f"⚠️ {message} Falling back to zero audio.")
+                return None
+
+            raise RuntimeError(message)
+
+        # proxy mode: weak candidates are preferred, but fallback is allowed.
+        candidate = self._choose_weak_candidate(weak_candidates)
+        if candidate is not None:
+            return candidate["audio_feat"]
+
+        if hasattr(self, "proxy_audios") and len(self.proxy_audios) > 0:
             if self.audio_sample_mode == "best":
                 return self.proxy_audios[0]
             return random.choice(self.proxy_audios)
+
         return None
 
     def __getitem__(self, idx):
