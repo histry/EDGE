@@ -321,9 +321,21 @@ class GaussianDiffusion(nn.Module):
                 onset = audio_feat[:, 1:, 768].clamp_min(0.0)
                 onset = onset / (onset.amax(dim=1, keepdim=True).clamp_min(1e-6))
 
-                motion_delta = physical_xstart[:, 1:, 7:] - physical_xstart[:, :-1, 7:]
-                motion_energy = safe_norm(motion_delta, dim=-1)
+                # Beat guidance should respond to both global body travel and local pose change.
+                # Root velocity captures spatial accents; pose velocity captures limb/body accents.
+                root_delta = physical_xstart[:, 1:, 4:7] - physical_xstart[:, :-1, 4:7]
+                pose_delta = physical_xstart[:, 1:, 7:] - physical_xstart[:, :-1, 7:]
+
+                root_energy = safe_norm(root_delta, dim=-1)
+                pose_energy = safe_norm(pose_delta, dim=-1)
+
+                root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+                pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
+                # Root energy is weighted lower to avoid forcing the dancer to travel on every beat.
+                motion_energy = 0.35 * root_energy + 0.65 * pose_energy
                 motion_energy = motion_energy / motion_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
                 loss = loss + float(self.beat_guidance_weight) * F.mse_loss(motion_energy, onset)
 
         if constraint is not None and constraint.get("mask", None) is not None and constraint.get("value", None) is not None:

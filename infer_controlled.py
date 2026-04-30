@@ -120,10 +120,17 @@ def load_keyframe(path, normalizer, keyframe_space):
     """
     返回 normalized 151D pose，因为 diffusion constraint value 应该和 x_start 同空间。
 
-    keyframe_space:
-    - normalized: 文件已经是 normalized 151D
-    - physical: 文件是物理空间 151D，需要用 checkpoint normalizer 归一化
+    当前版本只接受已经转换好的 151D .npy keyframe。
+    2D 骨架图/图片需要先经过 2D pose estimation + 3D lifting/SMPL fitting。
     """
+    image_suffixes = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+    if str(path).lower().endswith(image_suffixes):
+        raise ValueError(
+            f"Keyframe image input is not supported yet: {path}. "
+            "Please first convert the skeleton image to a 151-D SMPL keyframe .npy. "
+            "Current supported format: shape [151] or compatible .npy."
+        )
+
     pose = np.asarray(np.load(path), dtype=np.float32).reshape(-1)
 
     if pose.shape[0] != 151:
@@ -285,7 +292,38 @@ def apply_trajectory_postprocess(motion_physical, traj_physical, strength=1.0):
     out[:, ROOT_X_IDX] = (1.0 - strength) * out[:, ROOT_X_IDX] + strength * traj_physical[:, 0]
     out[:, ROOT_Z_IDX] = (1.0 - strength) * out[:, ROOT_Z_IDX] + strength * traj_physical[:, 1]
     return out.astype(np.float32)
+def compute_trajectory_metrics(motion_physical, traj_physical):
+    """
+    Compare generated root X/Z with target trajectory in physical space.
 
+    Returns:
+        dict with ADE/RMSE/max/final error in meters.
+    """
+    if traj_physical is None:
+        return None
+
+    root_xz = motion_physical[:, [ROOT_X_IDX, ROOT_Z_IDX]].astype(np.float32)
+    target = traj_physical[:, :2].astype(np.float32)
+
+    if len(target) != len(root_xz):
+        old_x = np.linspace(0.0, 1.0, len(target))
+        new_x = np.linspace(0.0, 1.0, len(root_xz))
+        target = np.stack(
+            [
+                np.interp(new_x, old_x, target[:, 0]),
+                np.interp(new_x, old_x, target[:, 1]),
+            ],
+            axis=1,
+        ).astype(np.float32)
+
+    error = np.linalg.norm(root_xz - target, axis=-1)
+
+    return {
+        "ade_m": float(error.mean()),
+        "rmse_m": float(np.sqrt(np.mean(error ** 2))),
+        "max_error_m": float(error.max()),
+        "final_error_m": float(error[-1]),
+    }
 def find_contact_segments(contact_mask, min_len=3):
     """
     contact_mask: [T] bool
@@ -594,6 +632,13 @@ def main():
             "value": constraint["value"].to(model.accelerator.device),
         }
 
+        if not args.hard_keyframe_project:
+            print(
+                "⚠️ Keyframe constraints are provided, but --hard_keyframe_project is not enabled. "
+                "The model will use soft keyframe conditioning only. "
+                "For strict start/end pose demos, add --hard_keyframe_project."
+            )
+
     print("Sampling controlled motion...")
     shape = (1, args.frames, 151)
 
@@ -617,6 +662,8 @@ def main():
 
     raw_motion_path = os.path.join(args.out_dir, f"{args.out_name}_raw_model.npy")
     np.save(raw_motion_path, sample_physical.astype(np.float32))
+
+    raw_trajectory_metrics = compute_trajectory_metrics(sample_physical, traj_physical)
 
     final_motion = sample_physical.copy()
     postprocess_steps = []
@@ -690,6 +737,7 @@ def main():
 
     final_motion_path = os.path.join(args.out_dir, f"{args.out_name}_final_system.npy")
     np.save(final_motion_path, final_motion.astype(np.float32))
+    final_trajectory_metrics = compute_trajectory_metrics(final_motion, traj_physical)
 
     metadata = {
         "checkpoint": args.checkpoint,
@@ -709,6 +757,14 @@ def main():
         "postprocess_trajectory": args.postprocess_trajectory,
         "raw_model_motion": raw_motion_path,
         "final_system_motion": final_motion_path,
+        "trajectory_metrics": {
+            "raw_model_motion": raw_trajectory_metrics,
+            "final_system_motion": final_trajectory_metrics,
+            "note": (
+                "raw_model_motion evaluates the model's own trajectory-following ability; "
+                "final_system_motion may include explicit trajectory postprocess and should be reported as system-level control."
+            ),
+        },
         "postprocess_steps": postprocess_steps,
         "interpretation": {
             "raw_model_motion": "Use this file to evaluate the model's own keyframe/trajectory following ability.",

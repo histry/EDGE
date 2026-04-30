@@ -185,7 +185,7 @@ class EDGE:
         )
 
         self._apply_stage_freezing(model, train_stage)
-        self._print_trainable_summary(model)
+        _print_trainable_summary(self, model)
 
         smpl = SMPLSkeleton(self.accelerator.device)
         
@@ -514,7 +514,14 @@ class EDGE:
                 x = x.to(self.accelerator.device)
                 cond = move_condition_to_device(cond, self.accelerator.device)
 
-                val_loss, val_losses = self.diffusion(x, cond, current_epoch=epoch)
+                # Make validation more reproducible across epochs/runs.
+                # This does not remove stochastic diffusion training, but fixes validation-time masks/timesteps.
+                with torch.random.fork_rng(devices=[self.accelerator.device] if self.accelerator.device.type == "cuda" else []):
+                    torch.manual_seed(12345 + int(epoch) * 1000 + int(batch_idx))
+                    if self.accelerator.device.type == "cuda":
+                        torch.cuda.manual_seed_all(12345 + int(epoch) * 1000 + int(batch_idx))
+
+                    val_loss, val_losses = self.diffusion(x, cond, current_epoch=epoch)
 
                 metric_tensors = [val_loss.detach()]
                 for item in val_losses:
@@ -554,6 +561,10 @@ class EDGE:
 
     def train_loop(self, opt):
         data_path = opt.data_path
+
+        # 统一定义 trajectory condition 开关，避免只在敦煌分支定义导致 AIST++ 分支报错。
+        use_traj_cond = not getattr(opt, "disable_traj_cond", False)
+
         is_dunhuang = "dunhuang" in data_path.lower()
         if is_dunhuang:
             print(f"\n🪷 检测到敦煌数据集路径 ({data_path})，启动中华古典舞纯视觉微调模式！")
@@ -566,7 +577,6 @@ class EDGE:
             else:
                 train_audio_sample_mode = "random"
                 val_audio_sample_mode = getattr(opt, "dunhuang_val_audio_mode", "best")
-            use_traj_cond = not getattr(opt, "disable_traj_cond", False)
             if self.accelerator.is_main_process:
                 print(f"🧭 trajectory condition enabled: {use_traj_cond}")
             train_dataset = DunhuangDataset(
@@ -641,7 +651,28 @@ class EDGE:
             )
             self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer
+        
+        if self.accelerator.is_main_process:
+            print("\n🔎 Training configuration sanity check:")
+            print(f"  data_path={data_path}")
+            print(f"  audio_pairing_mode={getattr(opt, 'audio_pairing_mode', 'unknown')}")
+            print(f"  mmr_loss_weight={getattr(opt, 'mmr_loss_weight', 0.0)}")
+            print(f"  beat_guidance_weight={getattr(opt, 'beat_guidance_weight', 0.0)}")
+            print(f"  trajectory_condition_enabled={use_traj_cond}")
+            print(f"  keyframe_condition_prob={getattr(opt, 'keyframe_condition_prob', 0.0)}")
+            print(f"  keyframe_loss_weight={getattr(opt, 'keyframe_loss_weight', 0.0)}")
 
+            if getattr(opt, "audio_pairing_mode", "proxy") != "paired" and getattr(opt, "mmr_loss_weight", 0.0) > 0:
+                print(
+                    "⚠️ MMR loss was requested without paired audio-motion data. "
+                    "EDGE.__init__ will disable it to avoid false cross-modal supervision."
+                )
+
+            if is_dunhuang and getattr(opt, "audio_pairing_mode", "proxy") != "paired":
+                print(
+                    "📌 Dunhuang music claim: no true paired audio-motion supervision. "
+                    "Report music as weak/proxy rhythm guidance, not strict paired learning."
+                )
         if len(train_dataset) == 0:
             raise RuntimeError(f"在 {data_path} 目录下没有找到足够长的训练切片！")
             
@@ -753,7 +784,28 @@ class EDGE:
                             "ema_state_dict": self.diffusion.master_model.state_dict(),
                             "normalizer": {
                                 "mean": self.normalizer.mean.tolist(),
-                                "std": self.normalizer.std.tolist()
+                                "std": self.normalizer.std.tolist(),
+                            },
+
+                            # 保存完整训练配置，方便复现实验和回答老师关于 loss / 数据设置的问题。
+                            "train_config": vars(opt),
+
+                            # 明确保存音乐监督边界，避免把 proxy music 误报为真实配对监督。
+                            "claim_notes": {
+                                "audio_pairing_mode": getattr(opt, "audio_pairing_mode", "unknown"),
+                                "mmr_loss_weight": float(getattr(opt, "mmr_loss_weight", 0.0)),
+                                "beat_guidance_weight": float(getattr(opt, "beat_guidance_weight", 0.0)),
+                                "music_supervision_claim": (
+                                    "paired_audio_motion_supervision"
+                                    if getattr(opt, "audio_pairing_mode", "proxy") == "paired"
+                                    else "weak_or_proxy_rhythm_guidance_only"
+                                ),
+                                "trajectory_condition_enabled": bool(use_traj_cond),
+                                "keyframe_condition_prob": float(getattr(opt, "keyframe_condition_prob", 0.0)),
+                                "keyframe_loss_weight": float(getattr(opt, "keyframe_loss_weight", 0.0)),
+                                "contact_loss_weight": float(getattr(opt, "contact_loss_weight", 0.0)),
+                                "foot_loss_weight": float(getattr(opt, "foot_loss_weight", 0.0)),
+                                "sync_loss_weight": float(getattr(opt, "sync_loss_weight", 0.0)),
                             },
                         },
                         save_path,
