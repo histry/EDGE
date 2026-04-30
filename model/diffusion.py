@@ -106,8 +106,10 @@ class GaussianDiffusion(nn.Module):
         trajectory_loss_weight=1.0,
         trajectory_velocity_loss_weight=0.25,
         force_audio_only_drop=False,
+        disable_unpaired_audio_condition=True,
     ):
         super().__init__()
+        self.disable_unpaired_audio_condition = bool(disable_unpaired_audio_condition)
 
         self.horizon = horizon
         self.transition_dim = repr_dim
@@ -465,38 +467,56 @@ class GaussianDiffusion(nn.Module):
         return {"mask": force_mask, "value": force_value}
 
     def _merge_constraints(self, generated_constraint, external_constraint):
+        """
+        Merge generated training keyframe constraints and external inference constraints.
+
+        Important:
+        - Preserve feature-wise masks.
+        - Do not collapse [B,T,151] mask to [B,T,1], otherwise root X/Z may be
+        accidentally constrained by keyframes.
+        """
+        if generated_constraint is None:
+            return external_constraint
         if external_constraint is None:
             return generated_constraint
 
-        if generated_constraint is None:
-            return external_constraint
-
-        mask_a = generated_constraint["mask"]
         value_a = generated_constraint["value"]
+        mask_a = generated_constraint["mask"].to(
+            device=value_a.device,
+            dtype=value_a.dtype,
+        )
 
-        mask_b = external_constraint["mask"].to(device=mask_a.device, dtype=mask_a.dtype)
-        value_b = external_constraint["value"].to(device=value_a.device, dtype=value_a.dtype)
+        value_b = external_constraint["value"].to(
+            device=value_a.device,
+            dtype=value_a.dtype,
+        )
+        mask_b = external_constraint["mask"].to(
+            device=value_a.device,
+            dtype=value_a.dtype,
+        )
 
-        if mask_b.shape[-1] != mask_a.shape[-1]:
-            if mask_b.shape[-1] == value_a.shape[-1]:
-                mask_b_reduced = mask_b.amax(dim=-1, keepdim=True)
-            else:
-                raise ValueError(
-                    f"external constraint mask last dim must be 1 or {value_a.shape[-1]}, "
-                    f"got {mask_b.shape[-1]}"
-                )
-        else:
-            mask_b_reduced = mask_b
+        def expand_mask(mask, value):
+            if mask.shape[-1] == 1:
+                return mask.expand_as(value)
+            if mask.shape[-1] == value.shape[-1]:
+                return mask
+            raise ValueError(
+                f"constraint mask last dim must be 1 or {value.shape[-1]}, "
+                f"got {mask.shape[-1]}"
+            )
 
-        merged_mask = torch.maximum(mask_a, mask_b_reduced)
+        mask_a_full = expand_mask(mask_a, value_a)
+        mask_b_full = expand_mask(mask_b, value_a)
 
-        if mask_b.shape[-1] == 1:
-            mask_b_full = mask_b.expand_as(value_a)
-        else:
-            mask_b_full = mask_b
+        merged_mask_full = torch.maximum(mask_a_full, mask_b_full)
 
-        value = value_a * (1.0 - mask_b_full) + value_b * mask_b_full
-        return {"mask": merged_mask, "value": value}
+        # external constraint has higher priority
+        merged_value = value_a * (1.0 - mask_b_full) + value_b * mask_b_full
+
+        return {
+            "mask": merged_mask_full,
+            "value": merged_value,
+        }
 
     # ---------------------------------------------------------------------
     # Training losses
@@ -608,14 +628,33 @@ class GaussianDiffusion(nn.Module):
         return traj_pos, traj_vel
 
     def _contact_loss(self, model_motion_x0, target_motion_x0):
+        """
+        Balanced contact regression in physical contact space.
+
+        Why:
+        - Raw normalized contact channels are not directly interpretable as 0/1.
+        - Contacts are sparse/imbalanced; plain MSE can be dominated by non-contact frames.
+        """
         if model_motion_x0.shape[-1] != 151:
             return model_motion_x0.new_tensor(0.0)
 
-        pred_contacts = model_motion_x0[:, :, self.contact_slice]
-        target_contacts = target_motion_x0[:, :, self.contact_slice]
+        if self.normalizer is not None:
+            pred_physical = maybe_unnormalize(self.normalizer, model_motion_x0)
+            target_physical = maybe_unnormalize(self.normalizer, target_motion_x0)
+        else:
+            pred_physical = model_motion_x0
+            target_physical = target_motion_x0
 
-        # target contacts may be normalized. BCE is unsafe here, use MSE-style regression.
-        return F.mse_loss(pred_contacts, target_contacts)
+        pred_contacts = pred_physical[:, :, self.contact_slice].clamp(0.0, 1.0)
+        target_contacts = target_physical[:, :, self.contact_slice].clamp(0.0, 1.0)
+
+        # 平衡 contact / non-contact，避免模型全部预测 non-contact 也能拿低 loss。
+        pos = target_contacts
+        neg = 1.0 - target_contacts
+        pos_weight = neg.sum() / pos.sum().clamp_min(1.0)
+        weight = neg + pos * pos_weight.clamp(max=10.0)
+
+        return ((pred_contacts - target_contacts) ** 2 * weight).mean()
 
     def _fk_positions(self, motion_x0):
         """
@@ -649,28 +688,50 @@ class GaussianDiffusion(nn.Module):
         except Exception:
             return model_motion_x0.new_tensor(0.0)
 
-    def _foot_sliding_loss(self, model_motion_x0):
+    def _foot_sliding_loss(self, model_motion_x0, target_motion_x0=None):
+        """
+        Foot sliding loss gated by target contacts during training.
+
+        Main fix:
+        - Do NOT rely only on predicted contacts.
+        - If predicted contacts are wrong, the old loss can disappear.
+        - During training, target contacts are available and should gate foot-lock frames.
+        """
         if model_motion_x0.shape[-1] != 151:
             return model_motion_x0.new_tensor(0.0)
 
         if self.normalizer is not None:
-            physical = maybe_unnormalize(self.normalizer, model_motion_x0)
+            pred_physical = maybe_unnormalize(self.normalizer, model_motion_x0)
+            target_physical = (
+                maybe_unnormalize(self.normalizer, target_motion_x0)
+                if target_motion_x0 is not None
+                else None
+            )
         else:
-            physical = model_motion_x0
+            pred_physical = model_motion_x0
+            target_physical = target_motion_x0
 
         try:
-            contacts = physical[:, :, self.contact_slice] > self.tto_contact_threshold
+            # 优先使用 GT contact 判断落地帧。
+            if target_physical is not None:
+                contacts = target_physical[:, :, self.contact_slice] > 0.5
+            else:
+                contacts = pred_physical[:, :, self.contact_slice] > self.tto_contact_threshold
+
             contact_pairs = contacts[:, 1:] & contacts[:, :-1]
 
             if not bool(contact_pairs.any().item()):
                 return model_motion_x0.new_tensor(0.0)
 
-            joints = self._fk_positions(physical)
+            joints = self._fk_positions(pred_physical)
             feet = joints[:, :, [7, 8, 10, 11], :]
             feet_delta = feet[:, 1:] - feet[:, :-1]
+
+            # 只惩罚接触期间的水平滑动，不惩罚正常抬脚。
             horizontal_speed_sq = feet_delta[..., [0, 2]].pow(2).sum(dim=-1)
 
             return horizontal_speed_sq[contact_pairs].mean()
+
         except Exception:
             return model_motion_x0.new_tensor(0.0)
 
@@ -791,6 +852,36 @@ class GaussianDiffusion(nn.Module):
         except Exception:
             return model_motion_x0.new_tensor(0.0)
 
+    @staticmethod
+    def _linear_warmup(current_epoch, start=1, end=50):
+        """
+        Linear warmup coefficient for auxiliary losses.
+
+        Returns:
+            0.0 before or at `start`
+            1.0 after or at `end`
+            linearly increases between start and end
+
+        Why:
+            Diffusion training should first learn denoising / motion distribution.
+            Keyframe, trajectory and physical constraints are auxiliary losses.
+            If they are too strong at the beginning, they may destabilize the
+            denoising objective and cause jitter, frozen motion, or bad contacts.
+        """
+        if current_epoch is None:
+            return 1.0
+
+        current_epoch = float(current_epoch)
+        start = float(start)
+        end = float(end)
+
+        if current_epoch <= start:
+            return 0.0
+        if current_epoch >= end:
+            return 1.0
+
+        return float(current_epoch - start) / float(max(1.0, end - start))
+
     def _make_loss_tuple(
         self,
         recon_loss,
@@ -828,6 +919,19 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, cond, t, noise=None, current_epoch=None, constraint=None):
+        """
+        Compute training loss with staged warmup.
+
+        Design:
+        - Main diffusion objective is always active.
+        - Control losses (keyframe / trajectory) warm up early.
+        - Physical losses (contact / FK / foot / sync / stability) warm up later.
+        - Biomechanical regularization starts last because it is the easiest to over-constrain.
+
+        This makes the training story easier to explain:
+        first learn denoising and the motion distribution, then gradually strengthen
+        controllability and physical plausibility.
+        """
         if noise is None:
             noise = torch.randn_like(x_start)
 
@@ -839,26 +943,73 @@ class GaussianDiffusion(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_noisy = self._project_known_keyframes(x_noisy, train_constraint, t)
 
-        force_mask = train_constraint.get("mask", None) if train_constraint is not None else None
-        force_value = train_constraint.get("value", None) if train_constraint is not None else None
+        force_mask = (
+            train_constraint.get("mask", None)
+            if train_constraint is not None
+            else None
+        )
+        force_value = (
+            train_constraint.get("value", None)
+            if train_constraint is not None
+            else None
+        )
 
         cond_drop_prob = float(self.cond_drop_prob)
+        batch_size = x_start.shape[0]
+        device = x_start.device
 
         keep_audio_mask = None
         keep_traj_mask = None
 
+        # If the dataset explicitly marks whether audio is genuinely paired,
+        # never let unpaired/proxy audio become a strong training condition.
+        # Paired audio still receives normal classifier-free dropout.
+        if (
+            self.disable_unpaired_audio_condition
+            and isinstance(cond, dict)
+            and cond.get("audio_paired", None) is not None
+        ):
+            paired_mask = cond["audio_paired"].to(
+                device=device,
+                dtype=torch.float32,
+            ).view(-1) > 0.5
+
+            if cond_drop_prob > 0:
+                random_keep = (
+                    torch.rand((batch_size,), device=device)
+                    >= cond_drop_prob
+                )
+                keep_audio_mask = paired_mask & random_keep
+            else:
+                keep_audio_mask = paired_mask
+
+            # We have already handled audio dropout explicitly above.
+            # Keep trajectory dropout controlled by cond_drop_prob unless a stage
+            # below overrides it.
+            cond_drop_prob_for_model = 0.0
+        else:
+            cond_drop_prob_for_model = cond_drop_prob
+
         if self.force_audio_only_drop and isinstance(cond, dict):
-            # Stage-wise training: keep trajectory/keyframe branch while allowing audio to be weak/zero.
-            b = x_start.shape[0]
-            device = x_start.device
-            keep_audio_mask = torch.ones((b,), dtype=torch.bool, device=device)
-            keep_traj_mask = torch.ones((b,), dtype=torch.bool, device=device)
+            # Stage-wise control adaptation:
+            # drop audio completely but keep trajectory/keyframe conditions.
+            keep_audio_mask = torch.zeros(
+                (batch_size,),
+                dtype=torch.bool,
+                device=device,
+            )
+            keep_traj_mask = torch.ones(
+                (batch_size,),
+                dtype=torch.bool,
+                device=device,
+            )
+            cond_drop_prob_for_model = 0.0
 
         model_out = self.model(
             x_noisy,
             cond,
             t,
-            cond_drop_prob=cond_drop_prob,
+            cond_drop_prob=cond_drop_prob_for_model,
             force_mask=force_mask,
             force_x_clean=force_value,
             keep_audio_mask=keep_audio_mask,
@@ -875,10 +1026,20 @@ class GaussianDiffusion(nn.Module):
         else:
             model_motion_x0 = model_out
             target_motion_x0 = x_start
-            recon_loss = self._reconstruction_loss(model_motion_x0, target_motion_x0, t)
+            recon_loss = self._reconstruction_loss(
+                model_motion_x0,
+                target_motion_x0,
+                t,
+            )
 
-        velocity_loss = self._velocity_loss(model_motion_x0, target_motion_x0, t)
+        # Main temporal smoothness loss.
+        velocity_loss = self._velocity_loss(
+            model_motion_x0,
+            target_motion_x0,
+            t,
+        )
 
+        # Raw auxiliary losses before warmup / weighting.
         keyframe_loss = self._keyframe_loss(model_motion_x0, train_constraint)
 
         traj_pos_loss, traj_vel_loss = self._trajectory_training_loss(
@@ -886,25 +1047,29 @@ class GaussianDiffusion(nn.Module):
             cond,
             t,
         )
-        trajectory_loss = (
-            float(self.trajectory_loss_weight) * traj_pos_loss
-            + float(self.trajectory_velocity_loss_weight) * traj_vel_loss
-        )
 
         if x_start.shape[-1] == 151:
-            contact_loss = self.contact_loss_weight * self._contact_loss(
+            contact_loss = self._contact_loss(
                 model_motion_x0,
                 target_motion_x0,
             )
-            fk_loss = 0.15 * self._fk_loss(model_motion_x0, target_motion_x0)
-            foot_loss = self.foot_loss_weight * self._foot_sliding_loss(model_motion_x0)
-            anti_freeze_loss = 0.05 * self._anti_freeze_loss(model_motion_x0)
-            sync_loss = self.sync_loss_weight * self._kinematic_sync_loss(model_motion_x0)
-            biomech_loss = 0.02 * self._biomech_loss(model_motion_x0)
-            root_turn_loss = 0.01 * self._root_turn_loss(model_motion_x0)
-            contact_turn_loss = 0.02 * self._contact_turn_loss(model_motion_x0)
-            body_stability_loss = 0.05 * self._body_stability_loss(model_motion_x0)
-            motion_energy_loss = 0.05 * self._motion_energy_loss(
+            fk_loss = self._fk_loss(model_motion_x0, target_motion_x0)
+
+            # Important fix:
+            # pass target_motion_x0 so training foot-lock uses target contacts
+            # instead of relying only on predicted contacts.
+            foot_loss = self._foot_sliding_loss(
+                model_motion_x0,
+                target_motion_x0,
+            )
+
+            anti_freeze_loss = self._anti_freeze_loss(model_motion_x0)
+            sync_loss = self._kinematic_sync_loss(model_motion_x0)
+            biomech_loss = self._biomech_loss(model_motion_x0)
+            root_turn_loss = self._root_turn_loss(model_motion_x0)
+            contact_turn_loss = self._contact_turn_loss(model_motion_x0)
+            body_stability_loss = self._body_stability_loss(model_motion_x0)
+            motion_energy_loss = self._motion_energy_loss(
                 model_motion_x0,
                 target_motion_x0,
             )
@@ -921,34 +1086,86 @@ class GaussianDiffusion(nn.Module):
             body_stability_loss = zero
             motion_energy_loss = zero
 
-        mmr_loss = self.mmr_loss_weight * self._mmr_loss(model_motion_x0, cond)
+        mmr_loss = self._mmr_loss(model_motion_x0, cond)
 
-        keyframe_loss = self.keyframe_loss_weight * keyframe_loss
+        # ------------------------------------------------------------
+        # Warmup schedules
+        # ------------------------------------------------------------
+        control_w = self._linear_warmup(current_epoch, start=1, end=30)
+        physical_w = self._linear_warmup(current_epoch, start=5, end=80)
+        biomech_w = physical_w * self._linear_warmup(
+            current_epoch,
+            start=100,
+            end=200,
+        )
 
-        # Keep velocity weight compatible with original EDGE-style training.
-        velocity_loss = 3.0 * velocity_loss
+        # ------------------------------------------------------------
+        # Weighted loss terms.
+        # Keep tuple order compatible with EDGE._loss_keys().
+        # ------------------------------------------------------------
+        recon_term = recon_loss
+        velocity_term = 3.0 * velocity_loss
+
+        trajectory_term = control_w * (
+            float(self.trajectory_loss_weight) * traj_pos_loss
+            + float(self.trajectory_velocity_loss_weight) * traj_vel_loss
+        )
+        keyframe_term = (
+            control_w
+            * float(self.keyframe_loss_weight)
+            * keyframe_loss
+        )
+
+        contact_term = (
+            physical_w
+            * float(self.contact_loss_weight)
+            * contact_loss
+        )
+        fk_term = physical_w * 0.15 * fk_loss
+        foot_term = (
+            physical_w
+            * float(self.foot_loss_weight)
+            * foot_loss
+        )
+        anti_freeze_term = physical_w * 0.05 * anti_freeze_loss
+        sync_term = physical_w * float(self.sync_loss_weight) * sync_loss
+
+        biomech_term = biomech_w * 0.02 * biomech_loss
+        root_turn_term = physical_w * 0.01 * root_turn_loss
+        contact_turn_term = physical_w * 0.02 * contact_turn_loss
+        body_stability_term = physical_w * 0.05 * body_stability_loss
+        motion_energy_term = physical_w * 0.05 * motion_energy_loss
+
+        # Audio-motion contrastive/MMR loss should only be non-zero when caller
+        # has enabled it; EDGE.__init__ already disables it for unpaired modes.
+        mmr_term = control_w * float(self.mmr_loss_weight) * mmr_loss
 
         losses = self._make_loss_tuple(
-            recon_loss=recon_loss,
-            velocity_loss=velocity_loss,
-            contact_loss=contact_loss,
-            fk_loss=fk_loss,
-            foot_loss=foot_loss,
-            anti_freeze_loss=anti_freeze_loss,
-            mmr_loss=mmr_loss,
-            trajectory_loss=trajectory_loss,
-            keyframe_loss=keyframe_loss,
-            sync_loss=sync_loss,
-            biomech_loss=biomech_loss,
-            root_turn_loss=root_turn_loss,
-            contact_turn_loss=contact_turn_loss,
-            body_stability_loss=body_stability_loss,
-            motion_energy_loss=motion_energy_loss,
+            recon_loss=recon_term,
+            velocity_loss=velocity_term,
+            contact_loss=contact_term,
+            fk_loss=fk_term,
+            foot_loss=foot_term,
+            anti_freeze_loss=anti_freeze_term,
+            mmr_loss=mmr_term,
+            trajectory_loss=trajectory_term,
+            keyframe_loss=keyframe_term,
+            sync_loss=sync_term,
+            biomech_loss=biomech_term,
+            root_turn_loss=root_turn_term,
+            contact_turn_loss=contact_turn_term,
+            body_stability_loss=body_stability_term,
+            motion_energy_loss=motion_energy_term,
         )
 
         total_loss = sum(losses)
 
-        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=1e4, neginf=0.0)
+        total_loss = torch.nan_to_num(
+            total_loss,
+            nan=0.0,
+            posinf=1e4,
+            neginf=0.0,
+        )
         losses = tuple(
             torch.nan_to_num(item, nan=0.0, posinf=1e4, neginf=0.0)
             if torch.is_tensor(item)
@@ -1105,6 +1322,8 @@ class GaussianDiffusion(nn.Module):
             loss = loss + 0.05 * root_acc.pow(2).mean()
 
         if pred_xstart.shape[-1] == 151:
+            # During TTO there is no ground-truth target motion, so use predicted
+            # contacts / fallback contact threshold only.
             foot_loss = self._foot_sliding_loss(pred_xstart)
             loss = loss + 0.25 * foot_loss
 

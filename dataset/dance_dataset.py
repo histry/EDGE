@@ -712,10 +712,26 @@ class DunhuangDataset(Dataset):
         else:
             audio_tensor = torch.zeros((self.seq_len, self.audio_dim), dtype=torch.float32)
 
+        audio_is_paired = (
+            self.audio_pairing_mode == "paired"
+            and audio_feat is not None
+        )
+
+        # onset 单独暴露出来，方便后面做节拍弱引导；不是强监督标签。
+        if audio_tensor.shape[-1] > 768:
+            onset = audio_tensor[:, 768:769].clamp_min(0.0)
+            onset = onset / onset.amax().clamp_min(1e-6)
+        else:
+            onset = torch.zeros((self.seq_len, 1), dtype=torch.float32)
+
+        cond = {
+            "audio": audio_tensor,
+            "audio_paired": torch.tensor(float(audio_is_paired), dtype=torch.float32),
+            "onset": onset,
+        }
+
         if self.return_traj:
             traj = torch.from_numpy(self.trajs[idx])
-            cond = {"audio": audio_tensor, "trajectory": traj}
-        else:
-            cond = {"audio": audio_tensor}
+            cond["trajectory"] = traj
 
-        return motion, cond, f"dunhuang_motion_{idx}", "proxy_audio"
+        return motion, cond, f"dunhuang_motion_{idx}", "paired_audio" if audio_is_paired else "unpaired_or_proxy_audio"

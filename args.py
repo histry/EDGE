@@ -79,13 +79,15 @@ def parse_train_opt():
     parser.add_argument(
         "--audio_pairing_mode",
         type=str,
-        default="proxy",
+        default="none",
         choices=["none", "proxy", "paired"],
         help=(
             "Audio-motion pairing mode. "
-            "'none' means no audio supervision; "
-            "'proxy' means weak rhythm proxy only; "
-            "'paired' means real paired audio-motion supervision is available."
+            "'none' is the safest default for Dunhuang because no real paired "
+            "music-motion dataset is available; "
+            "'proxy' means weak rhythm proxy only and must not be reported as "
+            "paired supervision; "
+            "'paired' means verified real paired audio-motion supervision."
         ),
     )
     parser.add_argument(

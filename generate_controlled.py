@@ -419,6 +419,7 @@ def save_eval_assets(
     motion_final_physical: np.ndarray,
     traj_physical: np.ndarray,
     args,
+    trajectory_control_mode: str = "unknown",
 ):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -495,6 +496,11 @@ def save_eval_assets(
         "tto_interval": int(getattr(args, "tto_interval", 50)),
         "tto_lr": float(getattr(args, "tto_lr", 0.03)),
         "eval_command": " ".join(eval_cmd),
+        "trajectory_control_mode": trajectory_control_mode,
+        "report_warning": (
+            "If trajectory_control_mode starts with postprocess, report raw and final "
+            "metrics separately. Final trajectory error may include post-processing."
+        ),
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -785,23 +791,34 @@ def main():
     motion_physical_raw = to_numpy(motion_physical_raw)[0].astype(np.float32)
     motion_physical_final = motion_physical_raw.copy()
 
+    trajectory_control_mode = "model_condition_tto_only"
+
     if args.post_anchor_trajectory:
-        print("📌 post_anchor_trajectory 已开启：root X/Z 严格替换为目标轨迹。")
+        trajectory_control_mode = "postprocess_hard_anchor"
+        print(
+            "⚠️ post_anchor_trajectory 已开启：root X/Z 将被严格替换为目标轨迹。"
+            "该结果可以展示系统级轨迹控制，但不能单独声称是纯模型输出。"
+        )
         motion_physical_final = apply_trajectory_anchor(
             motion_physical_final,
             traj_physical,
             strength=1.0,
         )
+
     elif float(args.trajectory_anchor_strength) > 0.0:
+        trajectory_control_mode = "postprocess_soft_anchor"
         print(
-            f"📌 soft trajectory anchor 已开启："
-            f"strength={args.trajectory_anchor_strength:.3f}"
+            f"⚠️ soft trajectory anchor 已开启：strength={args.trajectory_anchor_strength:.3f}。"
+            "请同时报告 raw motion 和 final motion 指标。"
         )
         motion_physical_final = apply_trajectory_anchor(
             motion_physical_final,
             traj_physical,
             strength=args.trajectory_anchor_strength,
         )
+
+    else:
+        print("✅ 未启用 post trajectory anchor：final motion 等于 raw model/TTO output。")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
@@ -812,6 +829,7 @@ def main():
             motion_final_physical=motion_physical_final,
             traj_physical=traj_physical,
             args=args,
+            trajectory_control_mode=trajectory_control_mode,
         )
     else:
         np.save(args.out, motion_physical_final.astype(np.float32))
@@ -858,6 +876,11 @@ def main():
             "keep_trajectory_absolute": args.keep_trajectory_absolute,
             "uniform_trajectory_timing": args.uniform_trajectory_timing,
             "linear_trajectory": args.linear_trajectory,
+            "trajectory_control_mode": trajectory_control_mode,
+            "report_warning": (
+                "If trajectory_control_mode starts with postprocess, report raw and final "
+                "metrics separately. Final trajectory error may include post-processing."
+            ),
         }
 
         with open(meta_path, "w", encoding="utf-8") as f:
