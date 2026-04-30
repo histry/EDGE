@@ -1,42 +1,28 @@
 import copy
-import os
-import pickle
-from pathlib import Path
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import reduce
-from p_tqdm import p_map
-
-from pytorch3d.transforms import (axis_angle_to_quaternion,
-                                  quaternion_to_axis_angle,
-                                  rotation_6d_to_matrix)
 from tqdm import tqdm
 
-from dataset.quaternion import ax_from_6v, quat_slerp
+from pytorch3d.transforms import rotation_6d_to_matrix
+
+from dataset.quaternion import ax_from_6v
 from vis import audio_output_stem, skeleton_render
 
-from .utils import extract, make_beta_schedule, prob_mask_like
-from model.mmr_model import CrossModalMMR
+from .utils import extract, make_beta_schedule
+
 
 def identity(t, *args, **kwargs):
     return t
 
-# ✨ 新增：全局安全的 L2 范数，防止预测为 0 时除以 0 引发 NaN 梯度崩溃
-def safe_norm(x, dim=-1, eps=1e-8):
-    return torch.sqrt(torch.sum(x**2, dim=dim) + eps)
 
-def rotation_angle_between(rot_mats):
-    rel = torch.matmul(rot_mats[:, :-1].transpose(-1, -2), rot_mats[:, 1:])
-    trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-    
-    # 修复：将精度从 1e-4 提升至 1e-7，彻底消除高达 24度/秒 的抖动死区
-    cos_angle = torch.clamp((trace - 1.0) * 0.5, -1.0 + 1e-7, 1.0 - 1e-7)
-    
-    return torch.acos(cos_angle)
+def safe_norm(x, dim=-1, eps=1e-8):
+    return torch.sqrt(torch.sum(x ** 2, dim=dim) + eps)
+
 
 def move_condition_to_device(cond, device):
     if isinstance(cond, dict):
@@ -46,6 +32,27 @@ def move_condition_to_device(cond, device):
         return moved
     return cond.to(device)
 
+
+def maybe_unnormalize(normalizer, x):
+    if normalizer is None:
+        return x
+    out = normalizer.unnormalize(x)
+    if isinstance(out, np.ndarray):
+        out = torch.from_numpy(out).to(device=x.device, dtype=x.dtype)
+    return out.to(device=x.device, dtype=x.dtype)
+
+
+def rotation_angle_between(rot_mats):
+    """
+    rot_mats: [B, T, J, 3, 3]
+    return: [B, T-1, J]
+    """
+    rel = torch.matmul(rot_mats[:, :-1].transpose(-1, -2), rot_mats[:, 1:])
+    trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    cos_angle = torch.clamp((trace - 1.0) * 0.5, -1.0 + 1e-7, 1.0 - 1e-7)
+    return torch.acos(cos_angle)
+
+
 class EMA:
     def __init__(self, beta):
         super().__init__()
@@ -53,15 +60,18 @@ class EMA:
 
     def update_model_average(self, ma_model, current_model):
         for current_params, ma_params in zip(
-            current_model.parameters(), ma_model.parameters()
+            current_model.parameters(),
+            ma_model.parameters(),
         ):
-            old_weight, up_weight = ma_params.data, current_params.data
+            old_weight = ma_params.data
+            up_weight = current_params.data
             ma_params.data = self.update_average(old_weight, up_weight)
 
     def update_average(self, old, new):
         if old is None:
             return new
-        return old * self.beta + (1 - self.beta) * new
+        return old * self.beta + (1.0 - self.beta) * new
+
 
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -87,7 +97,7 @@ class GaussianDiffusion(nn.Module):
         mid_keyframe_count=2,
         mid_keyframe_condition_width=1,
         mid_keyframe_selection="motion_peak",
-        data_fps=30, 
+        data_fps=30,
         contact_loss_weight=0.8,
         foot_loss_weight=2.5,
         sync_loss_weight=1.2,
@@ -95,46 +105,66 @@ class GaussianDiffusion(nn.Module):
         beat_guidance_weight=0.0,
         trajectory_loss_weight=1.0,
         trajectory_velocity_loss_weight=0.25,
-        force_audio_only_drop=False
+        force_audio_only_drop=False,
     ):
         super().__init__()
-        self.dt = 1.0 / data_fps 
+
+        self.horizon = horizon
+        self.transition_dim = repr_dim
+        self.model = model
+        self.smpl = smpl
+        self.dt = 1.0 / float(data_fps)
+
+        self.predict_epsilon = predict_epsilon
+        self.clip_denoised = clip_denoised
+        self.guidance_weight = guidance_weight
+        self.cond_drop_prob = cond_drop_prob
         self.force_audio_only_drop = force_audio_only_drop
-        self.mmr_loss_weight = mmr_loss_weight
-        self.keyframe_condition_prob = keyframe_condition_prob
-        self.keyframe_condition_width = keyframe_condition_width
-        self.keyframe_loss_weight = keyframe_loss_weight
-        self.mid_keyframe_condition_prob = mid_keyframe_condition_prob
-        self.mid_keyframe_count = mid_keyframe_count
-        self.mid_keyframe_condition_width = mid_keyframe_condition_width
-        self.mid_keyframe_selection = mid_keyframe_selection
-        self.contact_loss_weight = contact_loss_weight
-        self.foot_loss_weight = foot_loss_weight
-        self.sync_loss_weight = sync_loss_weight
-        self.hard_keyframe_project = hard_keyframe_project
-        self.beat_guidance_weight = beat_guidance_weight
-        self.trajectory_loss_weight = trajectory_loss_weight
-        self.trajectory_velocity_loss_weight = trajectory_velocity_loss_weight
-        self.tto_interval = 50
-        self.tto_steps = 1
-        self.tto_lr = 0.03
-        self.tto_contact_threshold = 0.65
-        
+
         self.mmr_model = mmr_model
+        self.mmr_loss_weight = float(mmr_loss_weight)
         if self.mmr_model is not None:
             self.mmr_model.eval()
             for param in self.mmr_model.parameters():
                 param.requires_grad = False
-        
-        self.horizon = horizon
-        self.transition_dim = repr_dim
-        self.model = model
+
+        self.keyframe_condition_prob = float(keyframe_condition_prob)
+        self.keyframe_condition_width = int(keyframe_condition_width)
+        self.keyframe_loss_weight = float(keyframe_loss_weight)
+
+        self.mid_keyframe_condition_prob = float(mid_keyframe_condition_prob)
+        self.mid_keyframe_count = int(mid_keyframe_count)
+        self.mid_keyframe_condition_width = int(mid_keyframe_condition_width)
+        self.mid_keyframe_selection = str(mid_keyframe_selection)
+
+        self.contact_loss_weight = float(contact_loss_weight)
+        self.foot_loss_weight = float(foot_loss_weight)
+        self.sync_loss_weight = float(sync_loss_weight)
+
+        self.hard_keyframe_project = bool(hard_keyframe_project)
+        self.beat_guidance_weight = float(beat_guidance_weight)
+
+        self.trajectory_loss_weight = float(trajectory_loss_weight)
+        self.trajectory_velocity_loss_weight = float(trajectory_velocity_loss_weight)
+
+        # TTO 参数可以在 generate_controlled.py 中覆盖。
+        self.tto_interval = 50
+        self.tto_steps = 1
+        self.tto_lr = 0.03
+        self.tto_contact_threshold = 0.65
+
+        # 151-D representation:
+        # [0:4] contacts, [4:7] root xyz, [7:151] 24 joints * 6D rotation
+        self.root_x_idx = 4
+        self.root_y_idx = 5
+        self.root_z_idx = 6
+        self.contact_slice = slice(0, 4)
+        self.root_slice = slice(4, 7)
+        self.rot_slice = slice(7, 151)
+
         self.ema = EMA(0.9999)
         self.master_model = copy.deepcopy(self.model)
         self.normalizer = None
-
-        self.cond_drop_prob = cond_drop_prob
-        self.smpl = smpl
 
         betas = torch.Tensor(
             make_beta_schedule(schedule=schedule, n_timestep=n_timestep)
@@ -144,43 +174,63 @@ class GaussianDiffusion(nn.Module):
         alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]])
 
         self.n_timestep = int(n_timestep)
-        self.clip_denoised = clip_denoised
-        self.predict_epsilon = predict_epsilon
 
         self.register_buffer("betas", betas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
 
-        self.guidance_weight = guidance_weight
-
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
-        self.register_buffer("log_one_minus_alphas_cumprod", torch.log(1.0 - alphas_cumprod))
-        self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod))
-        self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1))
+        self.register_buffer(
+            "sqrt_one_minus_alphas_cumprod",
+            torch.sqrt(1.0 - alphas_cumprod),
+        )
+        self.register_buffer(
+            "log_one_minus_alphas_cumprod",
+            torch.log(1.0 - alphas_cumprod),
+        )
+        self.register_buffer(
+            "sqrt_recip_alphas_cumprod",
+            torch.sqrt(1.0 / alphas_cumprod),
+        )
+        self.register_buffer(
+            "sqrt_recipm1_alphas_cumprod",
+            torch.sqrt(1.0 / alphas_cumprod - 1.0),
+        )
 
         posterior_variance = (
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
         self.register_buffer("posterior_variance", posterior_variance)
-
-        self.register_buffer("posterior_log_variance_clipped", torch.log(torch.clamp(posterior_variance, min=1e-20)))
-        self.register_buffer("posterior_mean_coef1", betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
-        self.register_buffer("posterior_mean_coef2", (1.0 - alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - alphas_cumprod))
+        self.register_buffer(
+            "posterior_log_variance_clipped",
+            torch.log(torch.clamp(posterior_variance, min=1e-20)),
+        )
+        self.register_buffer(
+            "posterior_mean_coef1",
+            betas * np.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod),
+        )
+        self.register_buffer(
+            "posterior_mean_coef2",
+            (1.0 - alphas_cumprod_prev) * np.sqrt(alphas)
+            / (1.0 - alphas_cumprod),
+        )
 
         self.p2_loss_weight_k = 1
         self.p2_loss_weight_gamma = 0.5 if use_p2 else 0
         self.register_buffer(
             "p2_loss_weight",
-            (self.p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod))
+            (
+                self.p2_loss_weight_k
+                + alphas_cumprod / torch.clamp(1.0 - alphas_cumprod, min=1e-8)
+            )
             ** -self.p2_loss_weight_gamma,
         )
 
         self.loss_fn = F.mse_loss if loss_type == "l2" else F.l1_loss
-        
-        # 统一定义物理空间中 Root X 和 Root Z 的特征维度索引，消除 Magic Numbers
-        self.root_x_idx = 4
-        self.root_z_idx = 6
+
+    # ---------------------------------------------------------------------
+    # Diffusion math
+    # ---------------------------------------------------------------------
 
     def predict_start_from_noise(self, x_t, t, noise):
         if self.predict_epsilon:
@@ -188,50 +238,24 @@ class GaussianDiffusion(nn.Module):
                 extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
                 - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
             )
-        else:
-            return noise
+        return noise
 
     def predict_noise_from_start(self, x_t, t, x0):
         return (
-            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0
+        ) / torch.clamp(
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape),
+            min=1e-8,
         )
 
-    def model_predictions(self, x, cond, t, weight=None, clip_x_start=False, constraint=None):
-        weight = weight if weight is not None else self.guidance_weight
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
 
-        force_mask, force_x_clean = None, None
-        if constraint is not None:
-            force_mask = constraint["mask"]
-            force_x_clean = constraint["value"]
-
-        cond_input = cond
-        if isinstance(cond, dict) and "trajectory" in cond:
-            cond_input = cond.copy() 
-
-        model_output = self.model.guided_forward(
-            x, cond_input, t, weight, force_mask=force_mask, force_x_clean=force_x_clean
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
-
-        # 统一预测空间的数学语义
-        if self.predict_epsilon:
-            pred_noise = model_output
-            x_start = self.predict_start_from_noise(x, t, pred_noise)
-        else:
-            x_start = model_output
-        
-        if clip_x_start:
-            if x_start.shape[-1] > 7:
-                x_start = torch.cat(
-                    [x_start[..., :7], x_start[..., 7:].clamp(-1.0, 1.0)],
-                    dim=-1,
-                )
-            else:
-                x_start = x_start.clamp(-1.0, 1.0)
-        
-        pred_noise = self.predict_noise_from_start(x, t, x_start)
-
-        return pred_noise, x_start
 
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
@@ -240,426 +264,90 @@ class GaussianDiffusion(nn.Module):
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(
-            self.posterior_log_variance_clipped, t, x_t.shape
+            self.posterior_log_variance_clipped,
+            t,
+            x_t.shape,
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    def model_predictions(
+        self,
+        x,
+        cond,
+        t,
+        weight=None,
+        clip_x_start=False,
+        constraint=None,
+    ):
+        weight = self.guidance_weight if weight is None else weight
+
+        force_mask = None
+        force_x_clean = None
+        if constraint is not None:
+            force_mask = constraint.get("mask", None)
+            force_x_clean = constraint.get("value", None)
+
+        if hasattr(self.model, "guided_forward"):
+            model_output = self.model.guided_forward(
+                x,
+                cond,
+                t,
+                weight,
+                force_mask=force_mask,
+                force_x_clean=force_x_clean,
+            )
+        else:
+            model_output = self.model(
+                x,
+                cond,
+                t,
+                cond_drop_prob=0.0,
+                force_mask=force_mask,
+                force_x_clean=force_x_clean,
+            )
+
+        if self.predict_epsilon:
+            pred_noise = model_output
+            x_start = self.predict_start_from_noise(x, t, pred_noise)
+        else:
+            x_start = model_output
+            pred_noise = self.predict_noise_from_start(x, t, x_start)
+
+        if clip_x_start:
+            if x_start.shape[-1] > 7:
+                x_start = torch.cat(
+                    [
+                        x_start[..., :7],
+                        x_start[..., 7:].clamp(-1.0, 1.0),
+                    ],
+                    dim=-1,
+                )
+            else:
+                x_start = x_start.clamp(-1.0, 1.0)
+
+            pred_noise = self.predict_noise_from_start(x, t, x_start)
+
+        return pred_noise, x_start
+
     def p_mean_variance(self, x, cond, t, clip_denoised=True, constraint=None):
         _, x_recon = self.model_predictions(
-            x, cond, t, clip_x_start=clip_denoised, constraint=constraint
+            x,
+            cond,
+            t,
+            clip_x_start=clip_denoised,
+            constraint=constraint,
         )
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
-            x_start=x_recon, x_t=x, t=t
+            x_start=x_recon,
+            x_t=x,
+            t=t,
         )
-        
         return model_mean, posterior_variance, posterior_log_variance, x_recon
 
-    def _should_run_tto(self, use_tto, cond, constraint, t):
-        if not use_tto:
-            return False
-
-        has_traj = isinstance(cond, dict) and cond.get("trajectory", None) is not None
-        has_keyframes = (
-            constraint is not None
-            and constraint.get("mask", None) is not None
-            and constraint.get("value", None) is not None
-        )
-        if not has_traj and not has_keyframes:
-            return False
-
-        time_value = int(t[0].item())
-        if time_value > int(self.n_timestep * 0.75) or time_value < int(self.n_timestep * 0.05):
-            return False
-        return time_value % max(1, int(self.tto_interval)) == 0
-
-    def _tto_loss(self, pred_xstart, cond, constraint=None):
-        loss = pred_xstart.new_tensor(0.0)
-        
-        if getattr(self, "normalizer", None) is not None:
-            physical_xstart = self.normalizer.unnormalize(pred_xstart)
-        else:
-            physical_xstart = pred_xstart
-            
-        root_xz = physical_xstart[:, :, [self.root_x_idx, self.root_z_idx]] if physical_xstart.shape[-1] == 151 else physical_xstart[:, :, [0, 2]]
-
-        if isinstance(cond, dict) and cond.get("trajectory", None) is not None:
-            target_traj_norm = cond["trajectory"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            if target_traj_norm.shape[1] != root_xz.shape[1]:
-                target_traj_norm = F.interpolate(
-                    target_traj_norm.transpose(1, 2),
-                    size=root_xz.shape[1],
-                    mode="linear",
-                    align_corners=False,
-                ).transpose(1, 2)
-            target_traj_norm = target_traj_norm[..., :2]
-            
-            normalizer = getattr(self, "normalizer", None)
-            if normalizer is not None and hasattr(normalizer, "mean"):
-                mean_x = target_traj_norm.new_tensor(normalizer.mean[self.root_x_idx])
-                mean_z = target_traj_norm.new_tensor(normalizer.mean[self.root_z_idx])
-                std_x = target_traj_norm.new_tensor(normalizer.std[self.root_x_idx])
-                std_z = target_traj_norm.new_tensor(normalizer.std[self.root_z_idx])
-                
-                target_traj = target_traj_norm.clone()
-                target_traj[..., 0] = target_traj_norm[..., 0] * std_x + mean_x
-                target_traj[..., 1] = target_traj_norm[..., 1] * std_z + mean_z
-            else:
-                target_traj = target_traj_norm
-
-            traj_loss = F.mse_loss(root_xz, target_traj)
-            traj_velocity_loss = F.mse_loss(root_xz[:, 1:] - root_xz[:, :-1], target_traj[:, 1:] - target_traj[:, :-1])
-            loss = loss + 4.0 * traj_loss + 0.5 * traj_velocity_loss
-
-        if self.beat_guidance_weight > 0 and isinstance(cond, dict):
-            onset_cond = cond.get("onset", None)
-
-            if onset_cond is not None:
-                onset_curve = onset_cond.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-                if onset_curve.shape[1] != pred_xstart.shape[1]:
-                    onset_curve = F.interpolate(
-                        onset_curve.transpose(1, 2),
-                        size=pred_xstart.shape[1],
-                        mode="linear",
-                        align_corners=False,
-                    ).transpose(1, 2)
-                onset = onset_curve[:, 1:, 0].clamp_min(0.0)
-
-            else:
-                # Backward-compatible fallback only.
-                audio_feat = cond.get("audio", None)
-                if audio_feat is None or audio_feat.shape[-1] <= 768 or pred_xstart.shape[1] <= 2:
-                    onset = None
-                else:
-                    audio_feat = audio_feat.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-                    if audio_feat.shape[1] != pred_xstart.shape[1]:
-                        audio_feat = F.interpolate(
-                            audio_feat.transpose(1, 2),
-                            size=pred_xstart.shape[1],
-                            mode="linear",
-                            align_corners=False,
-                        ).transpose(1, 2)
-                    onset = audio_feat[:, 1:, 768].clamp_min(0.0)
-
-            if onset is not None and pred_xstart.shape[1] > 2:
-                onset = onset / onset.amax(dim=1, keepdim=True).clamp_min(1e-6)
-
-                root_delta = physical_xstart[:, 1:, 4:7] - physical_xstart[:, :-1, 4:7]
-                pose_delta = physical_xstart[:, 1:, 7:] - physical_xstart[:, :-1, 7:]
-
-                root_energy = safe_norm(root_delta, dim=-1)
-                pose_energy = safe_norm(pose_delta, dim=-1)
-
-                root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
-                pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
-
-                motion_energy = 0.35 * root_energy + 0.65 * pose_energy
-                motion_energy = motion_energy / motion_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
-
-                loss = loss + float(self.beat_guidance_weight) * F.mse_loss(motion_energy, onset)
-
-        if constraint is not None and constraint.get("mask", None) is not None and constraint.get("value", None) is not None:
-            mask = constraint["mask"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            value = constraint["value"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-
-            if mask.shape[-1] == 1:
-                feature_mask = mask.expand_as(pred_xstart)
-                denom = mask.sum() * pred_xstart.shape[-1]
-            elif mask.shape[-1] == pred_xstart.shape[-1]:
-                feature_mask = mask
-                denom = mask.sum()
-            else:
-                raise ValueError(
-                    f"constraint mask last dim must be 1 or {pred_xstart.shape[-1]}, "
-                    f"got {mask.shape[-1]}"
-                )
-
-            squared_error = (pred_xstart - value) ** 2 * feature_mask
-            key_loss = squared_error.sum() / (denom.clamp_min(1e-6))
-
-            # 不再硬编码 2.0，使用 __init__ 里已经传入的 keyframe_loss_weight
-            loss = loss + float(self.keyframe_loss_weight) * key_loss
-
-        if root_xz.shape[1] > 2:
-            root_acc = root_xz[:, 2:] - 2.0 * root_xz[:, 1:-1] + root_xz[:, :-2]
-            loss = loss + 0.05 * root_acc.pow(2).mean()
-
-        if pred_xstart.shape[-1] == 151 and getattr(self, "normalizer", None) is not None:
-            contacts = physical_xstart[:, :, 0:4] > self.tto_contact_threshold
-            contact_pairs = contacts[:, 1:] & contacts[:, :-1]
-            if bool(contact_pairs.any().item()):
-                pos = physical_xstart[:, :, 4:7]
-                q = ax_from_6v(physical_xstart[:, :, 7:].reshape(physical_xstart.shape[0], physical_xstart.shape[1], 24, 6))
-                feet = self.smpl.forward(q, pos)[:, :, [7, 8, 10, 11], :]
-                feet_delta = feet[:, 1:] - feet[:, :-1]
-                foot_error = feet_delta[..., [0, 2]].pow(2).sum(dim=-1)
-                loss = loss + 0.25 * foot_error[contact_pairs].mean()
-
-        return loss
-
-    def _apply_tto(self, x, cond, t, constraint=None):
-        x_opt = x.detach()
-        for _ in range(max(1, int(self.tto_steps))):
-            with torch.enable_grad():
-                x_opt = x_opt.detach().requires_grad_(True)
-                _, pred_xstart = self.model_predictions(
-                    x_opt,
-                    cond,
-                    t,
-                    # ✨ 修复：强行关闭 TTO 阶段的截断，保证极限误差下的梯度全量回传
-                    clip_x_start=False, 
-                    constraint=constraint,
-                )
-                tto_loss = self._tto_loss(pred_xstart, cond, constraint)
-                grad = torch.autograd.grad(tto_loss, x_opt, allow_unused=True)[0]
-                if grad is None:
-                    break
-                grad = torch.nan_to_num(grad)
-                grad_norm = safe_norm(grad.flatten(1), dim=1).clamp_min(1e-6)
-                grad = grad / grad_norm.view(-1, *([1] * (grad.ndim - 1)))
-                x_opt = x_opt - self.tto_lr * grad
-        return x_opt.detach()
-
-    def _project_known_keyframes(self, x, constraint, t):
-        if (not self.hard_keyframe_project) or constraint is None:
-            return x
-        if constraint.get("mask", None) is None or constraint.get("value", None) is None:
-            return x
-
-        mask = constraint["mask"].to(device=x.device, dtype=x.dtype)
-        value = constraint["value"].to(device=x.device, dtype=x.dtype)
-
-        if mask.shape[-1] == 1:
-            feature_mask = mask.expand_as(x)
-        elif mask.shape[-1] == x.shape[-1]:
-            feature_mask = mask
-        else:
-            raise ValueError(
-                f"constraint mask last dim must be 1 or {x.shape[-1]}, got {mask.shape[-1]}"
-            )
-
-        known_t = self.q_sample(value, t)
-        clean_t = (t == 0).to(dtype=x.dtype).reshape(x.shape[0], *((1,) * (x.ndim - 1)))
-        known_t = known_t * (1.0 - clean_t) + value * clean_t
-        return x * (1.0 - feature_mask) + known_t * feature_mask
-
-    def p_sample(self, x, cond, t, constraint=None, use_tto=True):
-        b, *_, device = *x.shape, x.device
-
-        if self._should_run_tto(use_tto, cond, constraint, t):
-            x = self._apply_tto(x, cond, t, constraint=constraint)
-
-        with torch.no_grad():
-            model_mean, posterior_variance, model_log_variance, pred_xstart = self.p_mean_variance(
-                x, cond, t, constraint=constraint
-            )
-
-            noise = torch.randn_like(model_mean)
-            nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(noise.shape) - 1)))
-            x_out = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
-            x_out = self._project_known_keyframes(x_out, constraint, t)
-        return x_out, pred_xstart
-
-    @torch.no_grad()
-    def p_sample_loop(
-        self,
-        shape,
-        cond,
-        noise=None,
-        constraint=None,
-        return_diffusion=False,
-        start_point=None,
-        use_tto=True, 
-    ):
-        device = self.betas.device
-        start_point = self.n_timestep if start_point is None else start_point
-        batch_size = shape[0]
-        x = torch.randn(shape, device=device) if noise is None else noise.to(device)
-        cond = move_condition_to_device(cond, device)
-
-        if return_diffusion:
-            diffusion = [x]
-
-        for i in tqdm(reversed(range(0, start_point))):
-            timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
-
-            x, _ = self.p_sample(x, cond, timesteps, constraint=constraint, use_tto=use_tto)
-
-            if return_diffusion:
-                diffusion.append(x)
-
-        if return_diffusion:
-            return x, diffusion
-        else:
-            return x
-
-    @torch.no_grad()
-    def ddim_sample(self, shape, cond, constraint=None, **kwargs):
-        batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 0
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))
-
-        x = torch.randn(shape, device=device)
-        cond = move_condition_to_device(cond, device)
-
-        for time, time_next in tqdm(time_pairs, desc='ddim sampling'):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(
-                x, cond, time_cond, clip_x_start=self.clip_denoised, constraint=constraint
-            )
-
-            if time_next < 0:
-                x = x_start
-                final_time_cond = torch.zeros((batch,), device=device, dtype=torch.long)
-                x = self._project_known_keyframes(x, constraint, final_time_cond)
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-
-            noise = torch.randn_like(x)
-            x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
-            next_time_cond = torch.full((batch,), max(time_next, 0), device=device, dtype=torch.long)
-            x = self._project_known_keyframes(x, constraint, next_time_cond)
-        return x
-
-    @torch.no_grad()
-    def long_ddim_sample(self, shape, cond, constraint=None, **kwargs):
-        batch, device, total_timesteps, sampling_timesteps, eta = shape[0], self.betas.device, self.n_timestep, 50, 0
-
-        if batch == 1:
-            return self.ddim_sample(shape, cond, constraint=constraint)
-
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-        times = list(reversed(times.int().tolist()))
-        weights = np.clip(np.linspace(0, self.guidance_weight * 2, sampling_timesteps), None, self.guidance_weight)
-        time_pairs = list(zip(times[:-1], times[1:], weights))
-
-        x = torch.randn(shape, device=device)
-        cond = move_condition_to_device(cond, device)
-
-        assert batch > 1
-        assert x.shape[1] % 2 == 0
-        half = x.shape[1] // 2
-
-        x_start = None
-
-        for time, time_next, weight in tqdm(time_pairs, desc='sampling loop time step'):
-            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(
-                x, cond, time_cond, weight=weight, clip_x_start=self.clip_denoised, constraint=constraint
-            )
-
-            if time_next < 0:
-                x = x_start
-                final_time_cond = torch.zeros((batch,), device=device, dtype=torch.long)
-                x = self._project_known_keyframes(x, constraint, final_time_cond)
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-
-            noise = torch.randn_like(x)
-
-            x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
-            next_time_cond = torch.full((batch,), max(time_next, 0), device=device, dtype=torch.long)
-            x = self._project_known_keyframes(x, constraint, next_time_cond)
-
-            if time > 0:
-                x[1:, :half] = x[:-1, half:]
-        return x
-
-    @torch.no_grad()
-    def inpaint_loop(
-        self,
-        shape,
-        cond,
-        noise=None,
-        constraint=None,
-        return_diffusion=False,
-        start_point=None,
-        use_tto=True, 
-    ):
-        device = self.betas.device
-        batch_size = shape[0]
-        x = torch.randn(shape, device=device) if noise is None else noise.to(device)
-        cond = move_condition_to_device(cond, device)
-        if return_diffusion:
-            diffusion = [x]
-
-        start_point = self.n_timestep if start_point is None else start_point
-        for i in tqdm(reversed(range(0, start_point))):
-            timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
-
-            x, _ = self.p_sample(x, cond, timesteps, constraint=constraint, use_tto=use_tto)
-
-            if return_diffusion:
-                diffusion.append(x)
-
-        if return_diffusion:
-            return x, diffusion
-        else:
-            return x
-
-    @torch.no_grad()
-    def long_inpaint_loop(
-        self, shape, cond, noise=None, constraint=None, return_diffusion=False, start_point=None, use_tto=True, 
-    ):
-        device = self.betas.device
-        batch_size = shape[0]
-        x = torch.randn(shape, device=device) if noise is None else noise.to(device)
-        cond = move_condition_to_device(cond, device)
-        if return_diffusion:
-            diffusion = [x]
-
-        assert x.shape[1] % 2 == 0
-        if batch_size == 1:
-            return self.inpaint_loop(
-                shape, cond, noise=noise, constraint=constraint, return_diffusion=return_diffusion, start_point=start_point,
-                use_tto=use_tto,
-            )
-        assert batch_size > 1
-        half = x.shape[1] // 2
-
-        start_point = self.n_timestep if start_point is None else start_point
-
-        for i in tqdm(reversed(range(0, start_point))):
-            timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
-
-            x, _ = self.p_sample(x, cond, timesteps, constraint=constraint, use_tto=use_tto)
-
-            if i > 0:
-                x[1:, :half] = x[:-1, half:].clone()
-
-            if return_diffusion:
-                diffusion.append(x)
-
-        if return_diffusion:
-            return x, diffusion
-        else:
-            return x
-
-    @torch.no_grad()
-    def conditional_sample(self, shape, cond, constraint=None, *args, horizon=None, **kwargs):
-        device = self.betas.device
-        horizon = horizon or self.horizon
-        return self.p_sample_loop(shape, cond, constraint=constraint, *args, **kwargs)
-
-    # ------------------------------------------ training ------------------------------------------#
-
-    def q_sample(self, x_start, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        sample = (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
-        )
-        return sample
+    # ---------------------------------------------------------------------
+    # Keyframe conditioning
+    # ---------------------------------------------------------------------
 
     def _normalize_keyframe_scores(self, scores):
         scores = torch.nan_to_num(scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -671,11 +359,13 @@ class GaussianDiffusion(nn.Module):
         b, s, c = x_start.shape
         device = x_start.device
         mode = self.mid_keyframe_selection
+
         score_parts = []
 
         if mode in ["motion_peak", "mixed"]:
             motion_feat = x_start[..., 4:] if c == 151 else x_start
             motion_delta = torch.zeros((b, s), device=device, dtype=torch.float32)
+
             if s > 1:
                 motion_diff = motion_feat[:, 1:].float() - motion_feat[:, :-1].float()
                 motion_delta[:, 1:] = safe_norm(motion_diff, dim=-1)
@@ -684,6 +374,7 @@ class GaussianDiffusion(nn.Module):
             kernel = min(5, s)
             if kernel % 2 == 0:
                 kernel -= 1
+
             if kernel > 1:
                 motion_delta = F.avg_pool1d(
                     motion_delta.unsqueeze(1),
@@ -691,12 +382,14 @@ class GaussianDiffusion(nn.Module):
                     stride=1,
                     padding=kernel // 2,
                 ).squeeze(1)
+
             score_parts.append(self._normalize_keyframe_scores(motion_delta))
 
         if mode in ["audio_onset", "mixed"]:
             audio_feat = cond.get("audio", None) if isinstance(cond, dict) else None
             if audio_feat is not None:
                 audio_feat = audio_feat.to(device=device).float()
+
                 if audio_feat.shape[1] != s:
                     audio_feat = F.interpolate(
                         audio_feat.transpose(1, 2),
@@ -713,6 +406,7 @@ class GaussianDiffusion(nn.Module):
                         audio_diff = audio_feat[:, 1:] - audio_feat[:, :-1]
                         audio_score[:, 1:] = safe_norm(audio_diff, dim=-1)
                         audio_score[:, 0] = audio_score[:, 1]
+
                 score_parts.append(self._normalize_keyframe_scores(audio_score))
 
         if mode == "random" or not score_parts:
@@ -721,615 +415,1033 @@ class GaussianDiffusion(nn.Module):
         return torch.stack(score_parts, dim=0).mean(dim=0)
 
     def _build_keyframe_condition(self, x_start, cond=None):
-        b, s, _ = x_start.shape
+        """
+        Build known clean-frame mask/value for inpainting-style training.
+
+        - start/end keyframes: controlled by keyframe_condition_prob
+        - optional middle keyframes: controlled by mid_keyframe_condition_prob
+        """
+        b, s, c = x_start.shape
         device = x_start.device
         dtype = x_start.dtype
 
         force_mask = torch.zeros((b, s, 1), device=device, dtype=dtype)
+        force_value = torch.zeros_like(x_start)
 
         if self.keyframe_condition_prob > 0:
-            use_endpoint = torch.rand((b,), device=device) < self.keyframe_condition_prob
-            if bool(use_endpoint.any().item()):
-                width = max(1, int(self.keyframe_condition_width))
-                width = min(width, s)
-                force_mask[use_endpoint, :width, :] = 1.0
-                force_mask[use_endpoint, -width:, :] = 1.0
+            use_keyframe = torch.rand((b,), device=device) < self.keyframe_condition_prob
+            width = max(1, min(int(self.keyframe_condition_width), s))
 
-        if self.mid_keyframe_condition_prob > 0 and self.mid_keyframe_count > 0 and s > 2:
+            for batch_idx in range(b):
+                if bool(use_keyframe[batch_idx].item()):
+                    force_mask[batch_idx, :width, 0] = 1.0
+                    force_mask[batch_idx, s - width :, 0] = 1.0
+
+        if self.mid_keyframe_condition_prob > 0 and self.mid_keyframe_count > 0 and s > 4:
             use_middle = torch.rand((b,), device=device) < self.mid_keyframe_condition_prob
-            if bool(use_middle.any().item()):
-                scores = self._middle_keyframe_scores(x_start, cond)
-                middle_width = max(1, int(self.mid_keyframe_condition_width))
-                middle_width = min(middle_width, s)
-                max_middle = max(1, int(self.mid_keyframe_count))
-                margin = max(4, int(self.keyframe_condition_width) + middle_width)
-                if s <= 2 * margin:
-                    margin = max(1, s // 4)
-                min_distance = max(middle_width * 2 + 1, s // 10)
+            scores = self._middle_keyframe_scores(x_start, cond or {})
 
-                for batch_idx in range(b):
-                    if not bool(use_middle[batch_idx].item()):
-                        continue
+            # Do not select first/last frames as middle keyframes.
+            scores[:, 0] = -1.0
+            scores[:, -1] = -1.0
 
-                    num_middle = int(
-                        torch.randint(1, max_middle + 1, (1,), device=device).item()
-                    )
-                    candidate_scores = scores[batch_idx].clone()
-                    candidate_scores[:margin] = float("-inf")
-                    candidate_scores[s - margin :] = float("-inf")
-                    candidate_scores[force_mask[batch_idx, :, 0] > 0.5] = float("-inf")
+            max_mid = min(int(self.mid_keyframe_count), max(1, s - 2))
+            width = max(0, int(self.mid_keyframe_condition_width))
 
-                    for _ in range(num_middle):
-                        finite_mask = torch.isfinite(candidate_scores)
-                        if not bool(finite_mask.any().item()):
-                            break
+            for batch_idx in range(b):
+                if not bool(use_middle[batch_idx].item()):
+                    continue
 
-                        valid_count = int(finite_mask.sum().item())
-                        pool_size = min(max(4, max_middle * 4), valid_count)
-                        top_candidates = torch.topk(candidate_scores, k=pool_size).indices
-                        random_offset = int(
-                            torch.randint(pool_size, (1,), device=device).item()
-                        )
-                        center = int(top_candidates[random_offset].item())
+                k = max_mid
+                indices = torch.topk(scores[batch_idx], k=k, largest=True).indices
 
-                        start = max(0, center - middle_width // 2)
-                        end = min(s, start + middle_width)
-                        force_mask[batch_idx, start:end, 0] = 1.0
+                for frame_idx in indices:
+                    frame = int(frame_idx.item())
+                    start = max(0, frame - width)
+                    end = min(s, frame + width + 1)
+                    force_mask[batch_idx, start:end, 0] = 1.0
 
-                        suppress_start = max(0, center - min_distance)
-                        suppress_end = min(s, center + min_distance + 1)
-                        candidate_scores[suppress_start:suppress_end] = float("-inf")
+        force_value = x_start * force_mask
+        return {"mask": force_mask, "value": force_value}
 
-        if not bool((force_mask > 0).any().item()):
-            return None, None
+    def _merge_constraints(self, generated_constraint, external_constraint):
+        if external_constraint is None:
+            return generated_constraint
 
-        return force_mask, x_start.detach()
+        if generated_constraint is None:
+            return external_constraint
 
-    def _trajectory_supervision_loss(self, pred_x0, cond, t):
+        mask_a = generated_constraint["mask"]
+        value_a = generated_constraint["value"]
+
+        mask_b = external_constraint["mask"].to(device=mask_a.device, dtype=mask_a.dtype)
+        value_b = external_constraint["value"].to(device=value_a.device, dtype=value_a.dtype)
+
+        if mask_b.shape[-1] != mask_a.shape[-1]:
+            if mask_b.shape[-1] == value_a.shape[-1]:
+                mask_b_reduced = mask_b.amax(dim=-1, keepdim=True)
+            else:
+                raise ValueError(
+                    f"external constraint mask last dim must be 1 or {value_a.shape[-1]}, "
+                    f"got {mask_b.shape[-1]}"
+                )
+        else:
+            mask_b_reduced = mask_b
+
+        merged_mask = torch.maximum(mask_a, mask_b_reduced)
+
+        if mask_b.shape[-1] == 1:
+            mask_b_full = mask_b.expand_as(value_a)
+        else:
+            mask_b_full = mask_b
+
+        value = value_a * (1.0 - mask_b_full) + value_b * mask_b_full
+        return {"mask": merged_mask, "value": value}
+
+    # ---------------------------------------------------------------------
+    # Training losses
+    # ---------------------------------------------------------------------
+
+    def _loss_per_sample(self, pred, target):
+        return self.loss_fn(pred, target, reduction="none")
+
+    def _p2_apply(self, loss_per_sample, t):
         """
-        Supervise generated root X/Z with the trajectory condition in normalized space.
-
-        pred_x0: [B,T,151], normalized model prediction
-        cond["trajectory"]: [B,T,2], normalized target root X/Z
+        loss_per_sample: [B] or broadcastable to [B]
         """
-        zero = pred_x0.new_tensor(0.0)
+        return loss_per_sample * extract(self.p2_loss_weight, t, loss_per_sample.shape)
 
-        if not isinstance(cond, dict) or cond.get("trajectory", None) is None:
-            return zero
+    def _reconstruction_loss(self, model_motion_x0, target_motion_x0, t):
+        loss = self._loss_per_sample(model_motion_x0, target_motion_x0).mean(dim=(1, 2))
+        loss = self._p2_apply(loss, t)
+        return loss.mean()
 
-        target_traj = cond["trajectory"].to(device=pred_x0.device, dtype=pred_x0.dtype)
-        if target_traj.shape[1] != pred_x0.shape[1]:
+    def _velocity_loss(self, model_motion_x0, target_motion_x0, t):
+        if model_motion_x0.shape[1] < 2:
+            return model_motion_x0.new_tensor(0.0)
+
+        pred_vel = model_motion_x0[:, 1:] - model_motion_x0[:, :-1]
+        target_vel = target_motion_x0[:, 1:] - target_motion_x0[:, :-1]
+
+        loss = self._loss_per_sample(pred_vel, target_vel).mean(dim=(1, 2))
+        loss = self._p2_apply(loss, t)
+        return loss.mean()
+
+    def _keyframe_loss(self, model_motion_x0, constraint):
+        if constraint is None:
+            return model_motion_x0.new_tensor(0.0)
+
+        mask = constraint.get("mask", None)
+        value = constraint.get("value", None)
+        if mask is None or value is None:
+            return model_motion_x0.new_tensor(0.0)
+
+        mask = mask.to(device=model_motion_x0.device, dtype=model_motion_x0.dtype)
+        value = value.to(device=model_motion_x0.device, dtype=model_motion_x0.dtype)
+
+        if mask.shape[-1] == 1:
+            feature_mask = mask.expand_as(model_motion_x0)
+            denom = mask.sum() * model_motion_x0.shape[-1]
+        elif mask.shape[-1] == model_motion_x0.shape[-1]:
+            feature_mask = mask
+            denom = mask.sum()
+        else:
+            raise ValueError(
+                f"constraint mask last dim must be 1 or {model_motion_x0.shape[-1]}, "
+                f"got {mask.shape[-1]}"
+            )
+
+        if float(denom.item()) <= 1e-8:
+            return model_motion_x0.new_tensor(0.0)
+
+        sq = (model_motion_x0 - value) ** 2 * feature_mask
+        return sq.sum() / denom.clamp_min(1e-6)
+
+    def _trajectory_training_loss(self, model_motion_x0, cond, t):
+        """
+        Supervise generated root X/Z against trajectory condition in normalized space.
+
+        This fixes the previous weak point:
+        trajectory was used as condition, but the loss did not explicitly log/supervise
+        root X/Z trajectory error during training.
+        """
+        zero = model_motion_x0.new_tensor(0.0)
+
+        if (
+            not isinstance(cond, dict)
+            or cond.get("trajectory", None) is None
+            or float(self.trajectory_loss_weight) <= 0.0
+        ):
+            return zero, zero
+
+        target_traj = cond["trajectory"].to(
+            device=model_motion_x0.device,
+            dtype=model_motion_x0.dtype,
+        )
+
+        if target_traj.shape[1] != model_motion_x0.shape[1]:
             target_traj = F.interpolate(
                 target_traj.transpose(1, 2),
-                size=pred_x0.shape[1],
+                size=model_motion_x0.shape[1],
                 mode="linear",
                 align_corners=False,
             ).transpose(1, 2)
 
         target_traj = target_traj[..., :2]
-        pred_root_xz = pred_x0[:, :, [self.root_x_idx, self.root_z_idx]]
 
-        pos_loss = F.mse_loss(pred_root_xz, target_traj, reduction="none").mean(dim=(1, 2))
-
-        if pred_root_xz.shape[1] > 1:
-            pred_vel = pred_root_xz[:, 1:] - pred_root_xz[:, :-1]
-            target_vel = target_traj[:, 1:] - target_traj[:, :-1]
-            vel_loss = F.mse_loss(pred_vel, target_vel, reduction="none").mean(dim=(1, 2))
+        if model_motion_x0.shape[-1] == 151:
+            pred_traj = model_motion_x0[:, :, [self.root_x_idx, self.root_z_idx]]
         else:
-            vel_loss = pos_loss.new_zeros(pos_loss.shape)
+            pred_traj = model_motion_x0[:, :, [0, 2]]
 
-        loss = (
-            float(self.trajectory_loss_weight) * pos_loss
-            + float(self.trajectory_velocity_loss_weight) * vel_loss
+        traj_pos = self._loss_per_sample(pred_traj, target_traj).mean(dim=(1, 2))
+        traj_pos = self._p2_apply(traj_pos, t).mean()
+
+        if pred_traj.shape[1] > 1:
+            pred_vel = pred_traj[:, 1:] - pred_traj[:, :-1]
+            target_vel = target_traj[:, 1:] - target_traj[:, :-1]
+            traj_vel = self._loss_per_sample(pred_vel, target_vel).mean(dim=(1, 2))
+            traj_vel = self._p2_apply(traj_vel, t).mean()
+        else:
+            traj_vel = zero
+
+        return traj_pos, traj_vel
+
+    def _contact_loss(self, model_motion_x0, target_motion_x0):
+        if model_motion_x0.shape[-1] != 151:
+            return model_motion_x0.new_tensor(0.0)
+
+        pred_contacts = model_motion_x0[:, :, self.contact_slice]
+        target_contacts = target_motion_x0[:, :, self.contact_slice]
+
+        # target contacts may be normalized. BCE is unsafe here, use MSE-style regression.
+        return F.mse_loss(pred_contacts, target_contacts)
+
+    def _fk_positions(self, motion_x0):
+        """
+        motion_x0 should be physical-space 151-D motion.
+        return joints: [B, T, J, 3]
+        """
+        pos = motion_x0[:, :, self.root_slice]
+        q = ax_from_6v(motion_x0[:, :, self.rot_slice].reshape(
+            motion_x0.shape[0],
+            motion_x0.shape[1],
+            24,
+            6,
+        ))
+        return self.smpl.forward(q, pos)
+
+    def _fk_loss(self, model_motion_x0, target_motion_x0):
+        if model_motion_x0.shape[-1] != 151:
+            return model_motion_x0.new_tensor(0.0)
+
+        if self.normalizer is not None:
+            pred_physical = maybe_unnormalize(self.normalizer, model_motion_x0)
+            target_physical = maybe_unnormalize(self.normalizer, target_motion_x0)
+        else:
+            pred_physical = model_motion_x0
+            target_physical = target_motion_x0
+
+        try:
+            pred_joints = self._fk_positions(pred_physical)
+            target_joints = self._fk_positions(target_physical)
+            return F.mse_loss(pred_joints, target_joints)
+        except Exception:
+            return model_motion_x0.new_tensor(0.0)
+
+    def _foot_sliding_loss(self, model_motion_x0):
+        if model_motion_x0.shape[-1] != 151:
+            return model_motion_x0.new_tensor(0.0)
+
+        if self.normalizer is not None:
+            physical = maybe_unnormalize(self.normalizer, model_motion_x0)
+        else:
+            physical = model_motion_x0
+
+        try:
+            contacts = physical[:, :, self.contact_slice] > self.tto_contact_threshold
+            contact_pairs = contacts[:, 1:] & contacts[:, :-1]
+
+            if not bool(contact_pairs.any().item()):
+                return model_motion_x0.new_tensor(0.0)
+
+            joints = self._fk_positions(physical)
+            feet = joints[:, :, [7, 8, 10, 11], :]
+            feet_delta = feet[:, 1:] - feet[:, :-1]
+            horizontal_speed_sq = feet_delta[..., [0, 2]].pow(2).sum(dim=-1)
+
+            return horizontal_speed_sq[contact_pairs].mean()
+        except Exception:
+            return model_motion_x0.new_tensor(0.0)
+
+    def _anti_freeze_loss(self, model_motion_x0):
+        """
+        Penalize almost completely static outputs very weakly.
+        This is a safety term, not a main objective.
+        """
+        if model_motion_x0.shape[1] < 2:
+            return model_motion_x0.new_tensor(0.0)
+
+        delta = model_motion_x0[:, 1:] - model_motion_x0[:, :-1]
+        energy = safe_norm(delta, dim=-1).mean()
+        return F.relu(0.015 - energy)
+
+    def _motion_energy_loss(self, model_motion_x0, target_motion_x0):
+        if model_motion_x0.shape[1] < 2:
+            return model_motion_x0.new_tensor(0.0)
+
+        pred_energy = safe_norm(model_motion_x0[:, 1:] - model_motion_x0[:, :-1], dim=-1)
+        target_energy = safe_norm(target_motion_x0[:, 1:] - target_motion_x0[:, :-1], dim=-1)
+        return F.mse_loss(pred_energy, target_energy)
+
+    def _body_stability_loss(self, model_motion_x0):
+        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 3:
+            return model_motion_x0.new_tensor(0.0)
+
+        if self.normalizer is not None:
+            physical = maybe_unnormalize(self.normalizer, model_motion_x0)
+        else:
+            physical = model_motion_x0
+
+        root = physical[:, :, self.root_slice]
+        root_acc = root[:, 2:] - 2.0 * root[:, 1:-1] + root[:, :-2]
+        return root_acc.pow(2).mean()
+
+    def _root_turn_loss(self, model_motion_x0):
+        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
+            return model_motion_x0.new_tensor(0.0)
+
+        rot6d = model_motion_x0[:, :, self.rot_slice].reshape(
+            model_motion_x0.shape[0],
+            model_motion_x0.shape[1],
+            24,
+            6,
         )
-        loss = loss * extract(self.p2_loss_weight, t, loss.shape)
-        return loss.mean()
-        
-    def p_losses(self, x_start, cond, t, current_epoch=None):
-        noise = torch.randn_like(x_start)
+
+        try:
+            root_rot = rotation_6d_to_matrix(rot6d[:, :, 0])
+            angle = rotation_angle_between(root_rot.unsqueeze(2)).squeeze(2)
+            return angle.pow(2).mean()
+        except Exception:
+            return model_motion_x0.new_tensor(0.0)
+
+    def _kinematic_sync_loss(self, model_motion_x0):
+        """
+        Weakly align root movement with leg/pose movement.
+        Helps reduce cases where root moves but body does not respond.
+        """
+        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
+            return model_motion_x0.new_tensor(0.0)
+
+        root_delta = model_motion_x0[:, 1:, self.root_slice] - model_motion_x0[:, :-1, self.root_slice]
+        pose_delta = model_motion_x0[:, 1:, self.rot_slice] - model_motion_x0[:, :-1, self.rot_slice]
+
+        root_energy = safe_norm(root_delta, dim=-1)
+        pose_energy = safe_norm(pose_delta, dim=-1)
+
+        root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
+        return F.mse_loss(root_energy, pose_energy)
+
+    def _biomech_loss(self, model_motion_x0):
+        """
+        Conservative biomechanical smoothness term on rotations.
+        """
+        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 3:
+            return model_motion_x0.new_tensor(0.0)
+
+        rot = model_motion_x0[:, :, self.rot_slice]
+        rot_acc = rot[:, 2:] - 2.0 * rot[:, 1:-1] + rot[:, :-2]
+        return rot_acc.pow(2).mean()
+
+    def _contact_turn_loss(self, model_motion_x0):
+        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
+            return model_motion_x0.new_tensor(0.0)
+
+        contacts = model_motion_x0[:, :, self.contact_slice]
+        contact_delta = contacts[:, 1:] - contacts[:, :-1]
+        return contact_delta.pow(2).mean()
+
+    def _mmr_loss(self, model_motion_x0, cond):
+        if self.mmr_model is None or self.mmr_loss_weight <= 0:
+            return model_motion_x0.new_tensor(0.0)
+
+        if not isinstance(cond, dict) or cond.get("audio", None) is None:
+            return model_motion_x0.new_tensor(0.0)
+
+        audio = cond["audio"].to(device=model_motion_x0.device, dtype=model_motion_x0.dtype)
+
+        try:
+            with torch.no_grad():
+                self.mmr_model.eval()
+
+            # Try common CrossModalMMR signatures.
+            if hasattr(self.mmr_model, "compute_loss"):
+                return self.mmr_model.compute_loss(model_motion_x0, audio)
+
+            out = self.mmr_model(model_motion_x0, audio)
+            if isinstance(out, dict) and "loss" in out:
+                return out["loss"]
+
+            if torch.is_tensor(out):
+                return out.mean()
+
+            return model_motion_x0.new_tensor(0.0)
+        except Exception:
+            return model_motion_x0.new_tensor(0.0)
+
+    def _make_loss_tuple(
+        self,
+        recon_loss,
+        velocity_loss,
+        contact_loss,
+        fk_loss,
+        foot_loss,
+        anti_freeze_loss,
+        mmr_loss,
+        trajectory_loss,
+        keyframe_loss,
+        sync_loss,
+        biomech_loss,
+        root_turn_loss,
+        contact_turn_loss,
+        body_stability_loss,
+        motion_energy_loss,
+    ):
+        return (
+            recon_loss,
+            velocity_loss,
+            contact_loss,
+            fk_loss,
+            foot_loss,
+            anti_freeze_loss,
+            mmr_loss,
+            trajectory_loss,
+            keyframe_loss,
+            sync_loss,
+            biomech_loss,
+            root_turn_loss,
+            contact_turn_loss,
+            body_stability_loss,
+            motion_energy_loss,
+        )
+
+    def p_losses(self, x_start, cond, t, noise=None, current_epoch=None, constraint=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+
+        cond = move_condition_to_device(cond, x_start.device)
+
+        train_constraint = self._build_keyframe_condition(x_start, cond)
+        train_constraint = self._merge_constraints(train_constraint, constraint)
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        
-        cond_input = cond 
+        x_noisy = self._project_known_keyframes(x_noisy, train_constraint, t)
 
-        b, s, c = x_start.shape
-        
-        rand_probs = torch.rand((b,), device=x_start.device)
-        
-        keep_audio_mask = torch.ones((b,), dtype=torch.bool, device=x_start.device)
-        keep_traj_mask = torch.ones((b,), dtype=torch.bool, device=x_start.device)
-        
-        if self.cond_drop_prob > 0:
-            p_uncond = self.cond_drop_prob * 0.4
-            p_drop_audio = self.cond_drop_prob * 0.7
-            p_drop_traj = self.cond_drop_prob
-            
-            uncond_mask = rand_probs < p_uncond
-            drop_audio_mask = (rand_probs >= p_uncond) & (rand_probs < p_drop_audio)
-            drop_traj_mask = (rand_probs >= p_drop_audio) & (rand_probs < p_drop_traj)
-            
-            keep_audio_mask[uncond_mask | drop_audio_mask] = False
-            keep_traj_mask[uncond_mask | drop_traj_mask] = False
+        force_mask = train_constraint.get("mask", None) if train_constraint is not None else None
+        force_value = train_constraint.get("value", None) if train_constraint is not None else None
 
-        if getattr(self, "force_audio_only_drop", False):
-            keep_audio_mask[:] = False
-            keep_traj_mask[:] = True
+        cond_drop_prob = float(self.cond_drop_prob)
 
-        force_mask, force_x_clean = self._build_keyframe_condition(x_start, cond_input)
+        keep_audio_mask = None
+        keep_traj_mask = None
 
-        x_recon = self.model(
+        if self.force_audio_only_drop and isinstance(cond, dict):
+            # Stage-wise training: keep trajectory/keyframe branch while allowing audio to be weak/zero.
+            b = x_start.shape[0]
+            device = x_start.device
+            keep_audio_mask = torch.ones((b,), dtype=torch.bool, device=device)
+            keep_traj_mask = torch.ones((b,), dtype=torch.bool, device=device)
+
+        model_out = self.model(
             x_noisy,
-            cond_input,
+            cond,
             t,
-            cond_drop_prob=0.0, 
+            cond_drop_prob=cond_drop_prob,
             force_mask=force_mask,
-            force_x_clean=force_x_clean,
+            force_x_clean=force_value,
             keep_audio_mask=keep_audio_mask,
-            keep_traj_mask=keep_traj_mask  
+            keep_traj_mask=keep_traj_mask,
         )
 
-        assert noise.shape == x_recon.shape
-
-        model_out = x_recon
         if self.predict_epsilon:
             target = noise
+            pred = model_out
+            model_motion_x0 = self.predict_start_from_noise(x_noisy, t, model_out)
+            target_motion_x0 = x_start
+            recon_loss = self._loss_per_sample(pred, target).mean(dim=(1, 2))
+            recon_loss = self._p2_apply(recon_loss, t).mean()
         else:
-            target = x_start
+            model_motion_x0 = model_out
+            target_motion_x0 = x_start
+            recon_loss = self._reconstruction_loss(model_motion_x0, target_motion_x0, t)
 
-        loss = self.loss_fn(model_out, target, reduction="none")
-        loss = reduce(loss, "b ... -> b (...)", "mean")
-        loss = loss * extract(self.p2_loss_weight, t, loss.shape)
+        velocity_loss = self._velocity_loss(model_motion_x0, target_motion_x0, t)
 
-        keyframe_loss = torch.tensor(0.0, device=x_start.device)
-        if force_mask is not None:
-            pred_x0_for_key = self.predict_start_from_noise(x_noisy, t, model_out) if self.predict_epsilon else model_out
-            keyframe_error = self.loss_fn(pred_x0_for_key, x_start, reduction="none") * force_mask
-            keyframe_loss = keyframe_error.sum() / (
-                force_mask.sum() * model_out.shape[-1] + 1e-6
-            )
+        keyframe_loss = self._keyframe_loss(model_motion_x0, train_constraint)
 
-        model_motion_x0 = self.predict_start_from_noise(x_noisy, t, model_out) if self.predict_epsilon else model_out
-        trajectory_loss = self._trajectory_supervision_loss(model_motion_x0, cond_input, t)
-        target_motion_x0 = x_start
-        # Trajectory supervision loss.
-        # It supervises generated root X/Z with cond["trajectory"] in normalized space.
-        trajectory_loss = self._trajectory_supervision_loss(
+        traj_pos_loss, traj_vel_loss = self._trajectory_training_loss(
             model_motion_x0,
-            cond_input,
+            cond,
             t,
         )
-
-        if model_out.shape[2] == 381:
-            target_v = target_motion_x0[:, 1:] - target_motion_x0[:, :-1]
-            model_out_v = model_motion_x0[:, 1:] - model_motion_x0[:, :-1]
-            v_loss = self.loss_fn(model_out_v, target_v, reduction="none")
-            v_loss = reduce(v_loss, "b ... -> b (...)", "mean")
-            v_loss = v_loss * extract(self.p2_loss_weight, t, v_loss.shape)
-
-            zero = torch.tensor(0.0, device=x_start.device)
-            losses = (
-                1.0 * loss.mean(),                           # 1. Recon Loss
-                3.0 * v_loss.mean(),                         # 2. Velocity Loss
-                zero,                                        # 3. Contact Loss
-                zero,                                        # 4. FK Loss
-                zero,                                        # 5. Foot Loss
-                zero,                                        # 6. Anti-Freeze Loss
-                zero,                                        # 7. MMR Loss
-                trajectory_loss,                             # 8. Trajectory Loss
-                self.keyframe_loss_weight * keyframe_loss,   # 9. Keyframe Loss
-                zero,                                        # 10. Kinematic Sync Loss
-                zero,                                        # 11. Biomech Loss
-                zero,                                        # 12. Root Turn Loss
-                zero,                                        # 13. Contact Turn Loss
-                zero,                                        # 14. Body Stability Loss
-                zero,                                        # 15. Motion Energy Loss
-            )
-            return sum(losses), losses
-        else:
-            _, model_out_main_x0 = torch.split(model_motion_x0, (4, model_motion_x0.shape[2] - 4), dim=2)
-            _, target_main_x0 = torch.split(target_motion_x0, (4, target_motion_x0.shape[2] - 4), dim=2)
-
-            target_v = target_main_x0[:, 1:] - target_main_x0[:, :-1]
-            model_out_v = model_out_main_x0[:, 1:] - model_out_main_x0[:, :-1]
-            v_loss = self.loss_fn(model_out_v, target_v, reduction="none")
-            v_loss = reduce(v_loss, "b ... -> b (...)", "mean")
-            v_loss = v_loss * extract(self.p2_loss_weight, t, v_loss.shape)
-
-            normalizer = getattr(self, "normalizer", None)
-            if normalizer is not None and hasattr(normalizer, "mean"):
-                model_motion_phys = normalizer.unnormalize(model_motion_x0)
-                target_motion_phys = normalizer.unnormalize(target_motion_x0)
-            else:
-                model_motion_phys = model_motion_x0
-                target_motion_phys = target_motion_x0
-
-            model_contact, model_out_main = torch.split(model_motion_phys, (4, model_motion_phys.shape[2] - 4), dim=2)
-            target_contact, target_main = torch.split(target_motion_phys, (4, target_motion_phys.shape[2] - 4), dim=2)
-
-            model_x = model_out_main[:, :, :3]
-            model_q = ax_from_6v(model_out_main[:, :, 3:].reshape(b, s, -1, 6))
-            target_x = target_main[:, :, :3]
-            target_q = ax_from_6v(target_main[:, :, 3:].reshape(b, s, -1, 6))
-
-            model_contact_phys = model_contact
-            target_contact_phys = target_contact.clamp(0.0, 1.0)
-
-            contact_loss = self.loss_fn(model_contact_phys, target_contact_phys, reduction="none")
-            contact_loss = contact_loss.mean(dim=(1, 2))
-            contact_loss = contact_loss * extract(self.p2_loss_weight, t, contact_loss.shape)
-
-            model_root_rot = rotation_6d_to_matrix(model_out_main[:, :, 3:9])
-            target_root_rot = rotation_6d_to_matrix(target_main[:, :, 3:9])
-            model_ang_v = rotation_angle_between(model_root_rot) / self.dt
-            target_ang_v = rotation_angle_between(target_root_rot) / self.dt
-
-            turn_velocity_loss = self.loss_fn(model_ang_v, target_ang_v, reduction="none")
-            turn_velocity_loss = turn_velocity_loss.mean(dim=1)
-            turn_velocity_loss = turn_velocity_loss * extract(self.p2_loss_weight, t, turn_velocity_loss.shape)
-
-            if s > 2:
-                model_ang_acc = model_ang_v[:, 1:] - model_ang_v[:, :-1]
-                target_ang_acc = target_ang_v[:, 1:] - target_ang_v[:, :-1]
-                turn_acc_loss = self.loss_fn(model_ang_acc, target_ang_acc, reduction="none")
-                turn_acc_loss = turn_acc_loss.mean(dim=1)
-                turn_acc_loss = turn_acc_loss * extract(self.p2_loss_weight, t, turn_acc_loss.shape)
-            else:
-                turn_acc_loss = turn_velocity_loss.new_zeros(turn_velocity_loss.shape)
-            turn_smooth_loss = turn_velocity_loss + 0.35 * turn_acc_loss
-
-            chunk_len = min(30, s) 
-            start_idx = torch.randint(0, s - chunk_len + 1, (1,), device=x_start.device).item()
-            sub_s_idx = torch.arange(start_idx, start_idx + chunk_len, device=x_start.device)
-            
-            sparse_step = (s + 29) // 30 
-            global_s_idx = torch.arange(0, s, sparse_step, device=x_start.device)
-
-            model_q_sub = model_q[:, sub_s_idx]
-            model_x_sub = model_x[:, sub_s_idx]
-            target_q_sub = target_q[:, sub_s_idx]
-            target_x_sub = target_x[:, sub_s_idx]
-            t_sub = t
-
-            model_xp = self.smpl.forward(model_q_sub, model_x_sub)
-            target_xp = self.smpl.forward(target_q_sub, target_x_sub)
-            
-            model_xp_global = self.smpl.forward(model_q[:, global_s_idx], model_x[:, global_s_idx])
-            target_xp_global = self.smpl.forward(target_q[:, global_s_idx], target_x[:, global_s_idx])
-
-            model_feet = model_xp[:, :, [7, 8, 10, 11], :]
-            # Foot sliding supervision with target contact mask.
-            # Use target contact instead of predicted contact to avoid trivial "no-contact" escape.
-            if chunk_len > 1:
-                target_contact_sub = target_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
-                target_contact_pair = target_contact_sub[:, 1:] * target_contact_sub[:, :-1]
-
-                model_feet_delta = model_feet[:, 1:] - model_feet[:, :-1]
-                model_feet_xz_speed = model_feet_delta[..., [0, 2]].pow(2).sum(dim=-1)
-
-                foot_slide_loss = (
-                    model_feet_xz_speed * target_contact_pair
-                ).sum() / target_contact_pair.sum().clamp_min(1e-6)
-
-                # Optional: keep foot height near target during contact.
-                model_feet_y = model_feet[:, :, :, 1]
-                target_feet = target_xp[:, :, [7, 8, 10, 11], :]
-                target_feet_y = target_feet[:, :, :, 1]
-                foot_height_loss = (
-                    (model_feet_y - target_feet_y).pow(2) * target_contact_sub
-                ).sum() / target_contact_sub.sum().clamp_min(1e-6)
-
-                foot_loss = foot_slide_loss + 0.25 * foot_height_loss
-            else:
-                foot_loss = model_feet.new_tensor(0.0)
-            pelvis_global = model_xp_global[:, :, 0, :]
-            spine_global = model_xp_global[:, :, 6, :]
-            neck_global = model_xp_global[:, :, 12, :]
-            target_pelvis_global = target_xp_global[:, :, 0, :]
-            target_neck_global = target_xp_global[:, :, 12, :]
-                
-            vec_lower_global = spine_global - pelvis_global
-            vec_upper_global = neck_global - spine_global
-
-            model_torso = F.normalize(neck_global - pelvis_global, dim=-1, eps=1e-6)
-            target_torso = F.normalize(target_neck_global - target_pelvis_global, dim=-1, eps=1e-6)
-            torso_dir_loss_raw = 1.0 - F.cosine_similarity(model_torso, target_torso, dim=-1)
-
-            model_height = model_xp_global[..., 1].amax(dim=2) - model_xp_global[..., 1].amin(dim=2)
-            target_height = target_xp_global[..., 1].amax(dim=2) - target_xp_global[..., 1].amin(dim=2)
-            height_loss_raw = self.loss_fn(model_height, target_height, reduction="none")
-
-            model_span = safe_norm(model_xp_global.amax(dim=2) - model_xp_global.amin(dim=2), dim=-1)
-            target_span = safe_norm(target_xp_global.amax(dim=2) - target_xp_global.amin(dim=2), dim=-1)
-            span_loss_raw = self.loss_fn(model_span, target_span, reduction="none")
-
-            body_stability_raw = (
-                torso_dir_loss_raw
-                + 0.35 * height_loss_raw
-                + 0.25 * span_loss_raw
-            )
-            body_stability_loss = body_stability_raw.mean(dim=1)
-            
-            if chunk_len > 2:
-                model_root_y_acc = model_x_sub[:, 2:, 1] - 2.0 * model_x_sub[:, 1:-1, 1] + model_x_sub[:, :-2, 1]
-                target_root_y_acc = target_x_sub[:, 2:, 1] - 2.0 * target_x_sub[:, 1:-1, 1] + target_x_sub[:, :-2, 1]
-                root_y_acc_loss = self.loss_fn(model_root_y_acc, target_root_y_acc, reduction="none")
-                root_y_acc_loss = root_y_acc_loss.mean(dim=1)
-                body_stability_loss = body_stability_loss + 0.15 * root_y_acc_loss
-            body_stability_loss = body_stability_loss * extract(self.p2_loss_weight, t_sub, body_stability_loss.shape)
-
-            energy_joints = [4, 5, 7, 8, 10, 11, 18, 19, 20, 21]
-            model_energy_v = (model_xp[:, 1:, energy_joints] - model_xp[:, :-1, energy_joints]) / self.dt
-            target_energy_v = (target_xp[:, 1:, energy_joints] - target_xp[:, :-1, energy_joints]) / self.dt
-            model_energy = safe_norm(model_energy_v, dim=-1)
-            target_energy = safe_norm(target_energy_v, dim=-1)
-            motion_energy_loss = self.loss_fn(model_energy, target_energy, reduction="none")
-            motion_energy_loss = motion_energy_loss.mean(dim=(1, 2))
-            motion_energy_loss = motion_energy_loss * extract(self.p2_loss_weight, t_sub, motion_energy_loss.shape)
-
-            biomech_weight = 0.0
-            if current_epoch is not None:
-                biomech_start = 100.0
-                biomech_duration = 100.0
-                if current_epoch > biomech_start:
-                    biomech_weight = min(1.0, (current_epoch - biomech_start) / biomech_duration)
-            else:
-                biomech_weight = 1.0
-            
-            scurve_loss = torch.tensor(0.0, device=x_start.device)
-            hunchback_loss = torch.tensor(0.0, device=x_start.device)
-            asymmetry_loss = torch.tensor(0.0, device=x_start.device)
-
-            if biomech_weight > 0.0:
-                vec_lower_yz = vec_lower_global[..., [1, 2]]
-                vec_upper_yz = vec_upper_global[..., [1, 2]]
-                cos_sim_yz = torch.nn.functional.cosine_similarity(vec_lower_yz, vec_upper_yz, dim=-1)
-                
-                loss_too_straight = F.relu(cos_sim_yz - 0.985)
-                loss_too_bent = F.relu(0.866 - cos_sim_yz)
-                scurve_loss_raw = loss_too_straight + loss_too_bent
-                
-                hunchback_penalty = F.relu(-vec_lower_global[..., 2] - 0.05) + F.relu(-vec_upper_global[..., 2] - 0.05)
-                scoliosis_penalty = torch.abs(vec_lower_global[..., 0]) + torch.abs(vec_upper_global[..., 0])
-                hunchback_loss_raw = hunchback_penalty + scoliosis_penalty
-                
-                l_wrist = model_xp_global[:, :, 20, :]
-                r_wrist = model_xp_global[:, :, 21, :]
-                dist_wrists = safe_norm(l_wrist - r_wrist, dim=-1)
-                asymmetry_loss_raw = F.relu(0.02 - dist_wrists)
-                
-                if force_mask is not None:
-                    mask_inv = (1.0 - force_mask[:, global_s_idx, 0])
-                else:
-                    mask_inv = torch.ones_like(scurve_loss_raw)
-                    
-                scurve_loss_raw = scurve_loss_raw * mask_inv
-                hunchback_loss_raw = hunchback_loss_raw * mask_inv
-                asymmetry_loss_raw = asymmetry_loss_raw * mask_inv
-                    
-                scurve_loss = reduce(scurve_loss_raw, "b ... -> b (...)", "mean")
-                scurve_loss = scurve_loss * extract(self.p2_loss_weight, t_sub, scurve_loss.shape) * biomech_weight
-                
-                hunchback_loss = reduce(hunchback_loss_raw, "b ... -> b (...)", "mean")
-                hunchback_loss = hunchback_loss * extract(self.p2_loss_weight, t_sub, hunchback_loss.shape) * biomech_weight
-                
-                asymmetry_loss = reduce(asymmetry_loss_raw, "b ... -> b (...)", "mean")
-                asymmetry_loss = asymmetry_loss * extract(self.p2_loss_weight, t_sub, asymmetry_loss.shape) * biomech_weight
-
-            fk_loss = self.loss_fn(model_xp, target_xp, reduction="none")
-            fk_loss = reduce(fk_loss, "b ... -> b (...)", "mean")
-            fk_loss = fk_loss * extract(self.p2_loss_weight, t_sub, fk_loss.shape)
-
-            model_contact_sub = model_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
-            target_contact_sub = target_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
-
-            # Use target contact as the supervision mask.
-            # This avoids the trivial escape where the model predicts "no contact"
-            # to reduce foot sliding penalty.
-            target_static_idx = (target_contact_sub > 0.5).detach()
-            static_continuous = target_static_idx[:, :-1, :] & target_static_idx[:, 1:, :]
-
-            # Foot sliding should mainly penalize horizontal movement, not vertical lifting.
-            # model_feet: [B, T_sub, 4, 3]
-            foot_dist_vec_xz = model_feet[:, 1:, :, [0, 2]] - model_feet[:, :-1, :, [0, 2]]
-            foot_dist_norm = safe_norm(foot_dist_vec_xz, dim=-1)
-
-            # 0.01 is a small tolerance in physical space.
-            slide_penalty = F.relu(foot_dist_norm - 0.01)
-            static_weight = static_continuous.float()
-
-            foot_loss_raw = slide_penalty * static_weight
-            static_weight_sum = static_weight.sum(dim=(1, 2))
-            valid_mask = (static_weight_sum > 0).float()
-
-            foot_loss = foot_loss_raw.sum(dim=(1, 2)) / static_weight_sum.clamp_min(1.0)
-            foot_loss = foot_loss * valid_mask
-            foot_loss = foot_loss * extract(self.p2_loss_weight, t_sub, foot_loss.shape)
-
-            model_extremities = model_xp[:, :, [20, 21], :] 
-            model_extremities_v = (model_extremities[:, 1:] - model_extremities[:, :-1]) / self.dt
-            model_v_norm = safe_norm(model_extremities_v, dim=-1).mean(dim=(1, 2))
-            
-            base_threshold = 0.005
-            dynamic_threshold = torch.full_like(model_v_norm, base_threshold)
-            
-            audio_feat = cond.get("audio", None) if isinstance(cond, dict) else None
-            if audio_feat is not None:
-                audio_feat = audio_feat.to(device=x_start.device).float()
-                if audio_feat.shape[1] != s:
-                    audio_feat = F.interpolate(
-                        audio_feat.transpose(1, 2), size=s, mode="linear", align_corners=False
-                    ).transpose(1, 2)
-            
-            if audio_feat is not None and audio_feat.shape[-1] > 768:
-                onset = audio_feat[:, sub_s_idx[:-1], 768]
-                onset_mean = onset.mean(dim=-1, keepdim=True)
-                active_ratio = (onset > (0.5 * onset_mean)).float().mean(dim=-1)
-                
-                raw_dynamic_threshold = base_threshold * torch.clamp(active_ratio, min=0.25)
-                dynamic_threshold = torch.where(
-                    keep_audio_mask, 
-                    raw_dynamic_threshold, 
-                    torch.full_like(raw_dynamic_threshold, base_threshold)
-                )
-
-            anti_freeze_loss = F.relu(dynamic_threshold - model_v_norm)
-            anti_freeze_loss = anti_freeze_loss * extract(self.p2_loss_weight, t_sub, anti_freeze_loss.shape)
-            
-            root_xz = model_xp[:, :, 0, [0, 2]]
-            root_v = safe_norm(root_xz[:, 1:] - root_xz[:, :-1], dim=-1) / self.dt
-            
-            feet_xz = model_feet[:, :, :, [0, 2]]
-            feet_rel = feet_xz - root_xz.unsqueeze(2)
-            feet_rel_v = safe_norm(feet_rel[:, 1:] - feet_rel[:, :-1], dim=-1) / self.dt
-            max_leg_swing = torch.max(feet_rel_v, dim=2)[0]
-            
-            grounded_mask = (static_idx[:, :-1, :].sum(dim=-1) >= 2).float()
-            sync_loss_raw = F.relu(root_v - max_leg_swing - 0.5) * grounded_mask
-            
-            sync_loss = reduce(sync_loss_raw, "b ... -> b (...)", "mean")
-            sync_loss = sync_loss * extract(self.p2_loss_weight, t_sub, sync_loss.shape)
-
-            model_ang_v_sub = model_ang_v[:, sub_s_idx[:-1]]
-            target_ang_v_sub = target_ang_v[:, sub_s_idx[:-1]]
-            contact_turn_raw = self.loss_fn(model_ang_v_sub, target_ang_v_sub, reduction="none") * grounded_mask
-            contact_turn_loss = contact_turn_raw.sum(dim=-1) / (grounded_mask.sum(dim=-1) + 1e-6)
-            contact_turn_loss = contact_turn_loss * extract(self.p2_loss_weight, t_sub, contact_turn_loss.shape)
-
-            mmr_loss = torch.tensor(0.0, device=x_start.device)
-            if audio_feat is not None and self.mmr_model is not None and self.mmr_loss_weight > 0:
-                valid_audio_mask = keep_audio_mask.float()
-                if valid_audio_mask.bool().any():
-                    physical_out = model_motion_phys
-                    
-                    with torch.no_grad():
-                        audio_latent = self.mmr_model.encode_audio(audio_feat)
-                    motion_latent = self.mmr_model.encode_motion(physical_out)
-                    raw_mmr_loss = 1.0 - F.cosine_similarity(motion_latent, audio_latent, dim=-1) 
-                    
-                    progress = 1.0 - (t.float() / self.n_timestep)
-                    dynamic_mmr_weight = 4.0 * progress * (1.0 - progress)
-                    
-                    weighted_mmr_loss = (
-                        raw_mmr_loss 
-                        * extract(self.p2_loss_weight, t, raw_mmr_loss.shape).view(-1) 
-                        * dynamic_mmr_weight
-                    )
-                    mmr_loss = (weighted_mmr_loss * valid_audio_mask).sum() / (valid_audio_mask.sum() + 1e-6)
-
-            traj_loss = torch.tensor(0.0, device=x_start.device)
-            raw_target_traj = cond.get("trajectory", None) if isinstance(cond, dict) else None
-            
-            if raw_target_traj is not None:
-                target_traj_norm = raw_target_traj.to(device=model_out_main.device, dtype=model_out_main.dtype)
-                
-                if target_traj_norm.shape[1] != s:
-                    target_traj_norm = F.interpolate(
-                        target_traj_norm.transpose(1, 2), size=s, mode="linear", align_corners=False
-                    ).transpose(1, 2)
-                    
-                normalizer = getattr(self, "normalizer", None)
-                if normalizer is not None and hasattr(normalizer, "mean"):
-                    mean_x = target_traj_norm.new_tensor(normalizer.mean[self.root_x_idx])
-                    mean_z = target_traj_norm.new_tensor(normalizer.mean[self.root_z_idx])
-                    std_x = target_traj_norm.new_tensor(normalizer.std[self.root_x_idx])
-                    std_z = target_traj_norm.new_tensor(normalizer.std[self.root_z_idx])
-                    
-                    target_traj = target_traj_norm.clone()
-                    target_traj[..., 0] = target_traj_norm[..., 0] * std_x + mean_x
-                    target_traj[..., 1] = target_traj_norm[..., 1] * std_z + mean_z
-                else:
-                    target_traj = target_traj_norm
-                
-                pred_traj = model_out_main[:, :, [0, 2]]
-                
-                pos_traj_loss = self.loss_fn(pred_traj, target_traj, reduction="none").mean(dim=(1, 2))
-                vel_traj_loss = self.loss_fn(
-                    pred_traj[:, 1:] - pred_traj[:, :-1],
-                    target_traj[:, 1:] - target_traj[:, :-1],
-                    reduction="none",
-                ).mean(dim=(1, 2))
-
-                if s > 2:
-                    pred_acc = pred_traj[:, 2:] - 2.0 * pred_traj[:, 1:-1] + pred_traj[:, :-2]
-                    target_acc = target_traj[:, 2:] - 2.0 * target_traj[:, 1:-1] + target_traj[:, :-2]
-                    acc_traj_loss = self.loss_fn(pred_acc, target_acc, reduction="none").mean(dim=(1, 2))
-                else:
-                    acc_traj_loss = vel_traj_loss.new_zeros(vel_traj_loss.shape)
-                
-                anchor_indices = [0, s // 2, s - 1] 
-                pred_anchors = pred_traj[:, anchor_indices, :]
-                target_anchors = target_traj[:, anchor_indices, :]
-                anchor_loss = F.l1_loss(pred_anchors, target_anchors, reduction="none").mean(dim=(1, 2))
-                
-                raw_traj_loss = (
-                    pos_traj_loss
-                    + 0.5 * vel_traj_loss
-                    + 0.2 * acc_traj_loss
-                    + 0.5 * anchor_loss
-                )
-                p2_weight = extract(self.p2_loss_weight, t, raw_traj_loss.shape).view(-1)
-                weighted_traj_loss = raw_traj_loss * p2_weight
-                
-                valid_traj_mask = keep_traj_mask.float()
-                if valid_traj_mask.bool().any():
-                    traj_loss = (weighted_traj_loss * valid_traj_mask).sum() / (valid_traj_mask.sum() + 1e-6)
-
-        warmup_epochs = 10.0
-        if current_epoch is not None:
-            physics_weight = min(1.0, current_epoch / warmup_epochs)
-        else:
-            physics_weight = 1.0 
-
-        mmr_target_weight = self.mmr_loss_weight
-        mmr_warmup_epochs = 20.0
-        if current_epoch is not None:
-            mmr_weight = mmr_target_weight * min(1.0, current_epoch / mmr_warmup_epochs)
-        else:
-            mmr_weight = mmr_target_weight
-
-        turn_loss = turn_smooth_loss.mean()
-        contact_turn = contact_turn_loss.mean()
-        body_stability = body_stability_loss.mean()
-        motion_energy = motion_energy_loss.mean()
-
-        losses = (
-            5.0 * loss.mean(),        
-            0.5 * v_loss.mean(),      
-            self.contact_loss_weight * contact_loss.mean(),
-            1.0 * fk_loss.mean(),     
-            self.foot_loss_weight * physics_weight * foot_loss.mean(),  
-            0.01 * physics_weight * anti_freeze_loss.mean(),  
-            self.mmr_loss_weight * mmr_loss,
-            trajectory_loss,
-            self.keyframe_loss_weight * keyframe_loss,
-            self.sync_loss_weight * physics_weight * sync_loss.mean(),
-            0.1 * physics_weight * scurve_loss.mean() + 0.1 * physics_weight * hunchback_loss.mean() + 0.1 * physics_weight * asymmetry_loss.mean(),
-            0.08 * turn_loss,
-            0.04 * physics_weight * contact_turn,
-            0.05 * physics_weight * body_stability,
-            0.03 * motion_energy,
+        trajectory_loss = (
+            float(self.trajectory_loss_weight) * traj_pos_loss
+            + float(self.trajectory_velocity_loss_weight) * traj_vel_loss
         )
-        return sum(losses), losses
 
-    def loss(self, x, cond, t_override=None, current_epoch=None):
-        batch_size = len(x)
-        if t_override is None:
-            t = torch.randint(0, self.n_timestep, (batch_size,), device=x.device).long()
+        if x_start.shape[-1] == 151:
+            contact_loss = self.contact_loss_weight * self._contact_loss(
+                model_motion_x0,
+                target_motion_x0,
+            )
+            fk_loss = 0.15 * self._fk_loss(model_motion_x0, target_motion_x0)
+            foot_loss = self.foot_loss_weight * self._foot_sliding_loss(model_motion_x0)
+            anti_freeze_loss = 0.05 * self._anti_freeze_loss(model_motion_x0)
+            sync_loss = self.sync_loss_weight * self._kinematic_sync_loss(model_motion_x0)
+            biomech_loss = 0.02 * self._biomech_loss(model_motion_x0)
+            root_turn_loss = 0.01 * self._root_turn_loss(model_motion_x0)
+            contact_turn_loss = 0.02 * self._contact_turn_loss(model_motion_x0)
+            body_stability_loss = 0.05 * self._body_stability_loss(model_motion_x0)
+            motion_energy_loss = 0.05 * self._motion_energy_loss(
+                model_motion_x0,
+                target_motion_x0,
+            )
         else:
-            t = torch.full((batch_size,), t_override, device=x.device).long()
-        return self.p_losses(x, cond, t, current_epoch)
+            zero = x_start.new_tensor(0.0)
+            contact_loss = zero
+            fk_loss = zero
+            foot_loss = zero
+            anti_freeze_loss = zero
+            sync_loss = zero
+            biomech_loss = zero
+            root_turn_loss = zero
+            contact_turn_loss = zero
+            body_stability_loss = zero
+            motion_energy_loss = zero
 
-    def forward(self, x, cond, t_override=None, current_epoch=None):
-        return self.loss(x, cond, t_override, current_epoch)
+        mmr_loss = self.mmr_loss_weight * self._mmr_loss(model_motion_x0, cond)
 
-    def partial_denoise(self, x, cond, t):
-        x_noisy = self.noise_to_t(x, t)
-        return self.p_sample_loop(x.shape, cond, noise=x_noisy, start_point=t)
+        keyframe_loss = self.keyframe_loss_weight * keyframe_loss
 
-    def noise_to_t(self, x, timestep):
-        batch_size = len(x)
-        t = torch.full((batch_size,), timestep, device=x.device).long()
-        return self.q_sample(x, t) if timestep > 0 else x
+        # Keep velocity weight compatible with original EDGE-style training.
+        velocity_loss = 3.0 * velocity_loss
 
+        losses = self._make_loss_tuple(
+            recon_loss=recon_loss,
+            velocity_loss=velocity_loss,
+            contact_loss=contact_loss,
+            fk_loss=fk_loss,
+            foot_loss=foot_loss,
+            anti_freeze_loss=anti_freeze_loss,
+            mmr_loss=mmr_loss,
+            trajectory_loss=trajectory_loss,
+            keyframe_loss=keyframe_loss,
+            sync_loss=sync_loss,
+            biomech_loss=biomech_loss,
+            root_turn_loss=root_turn_loss,
+            contact_turn_loss=contact_turn_loss,
+            body_stability_loss=body_stability_loss,
+            motion_energy_loss=motion_energy_loss,
+        )
+
+        total_loss = sum(losses)
+
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=1e4, neginf=0.0)
+        losses = tuple(
+            torch.nan_to_num(item, nan=0.0, posinf=1e4, neginf=0.0)
+            if torch.is_tensor(item)
+            else item
+            for item in losses
+        )
+
+        return total_loss, losses
+
+    def forward(self, x, cond, current_epoch=None, constraint=None):
+        b = x.shape[0]
+        device = x.device
+        t = torch.randint(0, self.n_timestep, (b,), device=device).long()
+        return self.p_losses(x, cond, t, current_epoch=current_epoch, constraint=constraint)
+
+    # ---------------------------------------------------------------------
+    # TTO / inference guidance
+    # ---------------------------------------------------------------------
+
+    def _should_run_tto(self, use_tto, cond, constraint, t):
+        if not use_tto:
+            return False
+
+        has_traj = isinstance(cond, dict) and cond.get("trajectory", None) is not None
+        has_keyframes = (
+            constraint is not None
+            and constraint.get("mask", None) is not None
+            and constraint.get("value", None) is not None
+        )
+
+        if not has_traj and not has_keyframes:
+            return False
+
+        time_value = int(t[0].item())
+        if time_value > int(self.n_timestep * 0.75):
+            return False
+        if time_value < int(self.n_timestep * 0.05):
+            return False
+
+        return time_value % max(1, int(self.tto_interval)) == 0
+
+    def _trajectory_target_to_physical(self, target_traj_norm, dtype, device):
+        target_traj_norm = target_traj_norm.to(device=device, dtype=dtype)[..., :2]
+
+        if self.normalizer is None or not hasattr(self.normalizer, "mean"):
+            return target_traj_norm
+
+        mean_x = target_traj_norm.new_tensor(self.normalizer.mean[self.root_x_idx])
+        mean_z = target_traj_norm.new_tensor(self.normalizer.mean[self.root_z_idx])
+        std_x = target_traj_norm.new_tensor(self.normalizer.std[self.root_x_idx])
+        std_z = target_traj_norm.new_tensor(self.normalizer.std[self.root_z_idx])
+
+        target_traj = target_traj_norm.clone()
+        target_traj[..., 0] = target_traj_norm[..., 0] * std_x + mean_x
+        target_traj[..., 1] = target_traj_norm[..., 1] * std_z + mean_z
+        return target_traj
+
+    def _tto_loss(self, pred_xstart, cond, constraint=None):
+        loss = pred_xstart.new_tensor(0.0)
+
+        physical_xstart = maybe_unnormalize(self.normalizer, pred_xstart)
+
+        if physical_xstart.shape[-1] == 151:
+            root_xz = physical_xstart[:, :, [self.root_x_idx, self.root_z_idx]]
+        else:
+            root_xz = physical_xstart[:, :, [0, 2]]
+
+        if isinstance(cond, dict) and cond.get("trajectory", None) is not None:
+            target_traj_norm = cond["trajectory"].to(
+                device=pred_xstart.device,
+                dtype=pred_xstart.dtype,
+            )
+
+            if target_traj_norm.shape[1] != root_xz.shape[1]:
+                target_traj_norm = F.interpolate(
+                    target_traj_norm.transpose(1, 2),
+                    size=root_xz.shape[1],
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+
+            target_traj = self._trajectory_target_to_physical(
+                target_traj_norm,
+                dtype=pred_xstart.dtype,
+                device=pred_xstart.device,
+            )
+
+            traj_loss = F.mse_loss(root_xz, target_traj)
+            traj_velocity_loss = F.mse_loss(
+                root_xz[:, 1:] - root_xz[:, :-1],
+                target_traj[:, 1:] - target_traj[:, :-1],
+            )
+
+            loss = (
+                loss
+                + float(self.trajectory_loss_weight) * traj_loss
+                + float(self.trajectory_velocity_loss_weight) * traj_velocity_loss
+            )
+
+        if self.beat_guidance_weight > 0 and isinstance(cond, dict):
+            onset_cond = cond.get("onset", None)
+
+            if onset_cond is not None:
+                onset_curve = onset_cond.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+                if onset_curve.shape[1] != pred_xstart.shape[1]:
+                    onset_curve = F.interpolate(
+                        onset_curve.transpose(1, 2),
+                        size=pred_xstart.shape[1],
+                        mode="linear",
+                        align_corners=False,
+                    ).transpose(1, 2)
+                onset = onset_curve[:, 1:, 0].clamp_min(0.0)
+            else:
+                audio_feat = cond.get("audio", None)
+                onset = None
+                if audio_feat is not None and audio_feat.shape[-1] > 768 and pred_xstart.shape[1] > 2:
+                    audio_feat = audio_feat.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+                    if audio_feat.shape[1] != pred_xstart.shape[1]:
+                        audio_feat = F.interpolate(
+                            audio_feat.transpose(1, 2),
+                            size=pred_xstart.shape[1],
+                            mode="linear",
+                            align_corners=False,
+                        ).transpose(1, 2)
+                    onset = audio_feat[:, 1:, 768].clamp_min(0.0)
+
+            if onset is not None and pred_xstart.shape[1] > 2:
+                onset = onset / onset.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
+                root_delta = physical_xstart[:, 1:, self.root_slice] - physical_xstart[:, :-1, self.root_slice]
+
+                if physical_xstart.shape[-1] == 151:
+                    pose_delta = physical_xstart[:, 1:, self.rot_slice] - physical_xstart[:, :-1, self.rot_slice]
+                else:
+                    pose_delta = physical_xstart[:, 1:] - physical_xstart[:, :-1]
+
+                root_energy = safe_norm(root_delta, dim=-1)
+                pose_energy = safe_norm(pose_delta, dim=-1)
+
+                root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+                pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
+                motion_energy = 0.35 * root_energy + 0.65 * pose_energy
+                motion_energy = motion_energy / motion_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
+                loss = loss + float(self.beat_guidance_weight) * F.mse_loss(motion_energy, onset)
+
+        if constraint is not None and constraint.get("mask", None) is not None and constraint.get("value", None) is not None:
+            key_loss = self._keyframe_loss(pred_xstart, constraint)
+            loss = loss + float(self.keyframe_loss_weight) * key_loss
+
+        if root_xz.shape[1] > 2:
+            root_acc = root_xz[:, 2:] - 2.0 * root_xz[:, 1:-1] + root_xz[:, :-2]
+            loss = loss + 0.05 * root_acc.pow(2).mean()
+
+        if pred_xstart.shape[-1] == 151:
+            foot_loss = self._foot_sliding_loss(pred_xstart)
+            loss = loss + 0.25 * foot_loss
+
+        return loss
+
+    def _apply_tto(self, x, cond, t, constraint=None):
+        x_opt = x.detach()
+
+        for _ in range(max(1, int(self.tto_steps))):
+            with torch.enable_grad():
+                x_opt = x_opt.detach().requires_grad_(True)
+
+                _, pred_xstart = self.model_predictions(
+                    x_opt,
+                    cond,
+                    t,
+                    clip_x_start=False,
+                    constraint=constraint,
+                )
+
+                tto_loss = self._tto_loss(pred_xstart, cond, constraint)
+                grad = torch.autograd.grad(tto_loss, x_opt, allow_unused=True)[0]
+
+                if grad is None:
+                    break
+
+                grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                grad_norm = safe_norm(grad.flatten(1), dim=1).clamp_min(1e-6)
+                grad = grad / grad_norm.view(-1, *([1] * (grad.ndim - 1)))
+
+                x_opt = x_opt - float(self.tto_lr) * grad
+
+        return x_opt.detach()
+
+    def _project_known_keyframes(self, x, constraint, t):
+        if (not self.hard_keyframe_project) or constraint is None:
+            return x
+
+        if constraint.get("mask", None) is None or constraint.get("value", None) is None:
+            return x
+
+        mask = constraint["mask"].to(device=x.device, dtype=x.dtype)
+        value = constraint["value"].to(device=x.device, dtype=x.dtype)
+
+        if mask.shape[-1] == 1:
+            feature_mask = mask.expand_as(x)
+        elif mask.shape[-1] == x.shape[-1]:
+            feature_mask = mask
+        else:
+            raise ValueError(
+                f"constraint mask last dim must be 1 or {x.shape[-1]}, got {mask.shape[-1]}"
+            )
+
+        known_t = self.q_sample(value, t)
+        clean_t = (t == 0).to(dtype=x.dtype).reshape(
+            x.shape[0],
+            *((1,) * (x.ndim - 1)),
+        )
+        known_t = known_t * (1.0 - clean_t) + value * clean_t
+
+        return x * (1.0 - feature_mask) + known_t * feature_mask
+
+    # ---------------------------------------------------------------------
+    # Sampling
+    # ---------------------------------------------------------------------
+
+    def p_sample(self, x, cond, t, constraint=None, use_tto=True):
+        b = x.shape[0]
+
+        if self._should_run_tto(use_tto, cond, constraint, t):
+            x = self._apply_tto(x, cond, t, constraint=constraint)
+
+        with torch.no_grad():
+            model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
+                x,
+                cond,
+                t,
+                constraint=constraint,
+            )
+
+            noise = torch.randn_like(model_mean)
+            nonzero_mask = (1.0 - (t == 0).float()).reshape(
+                b,
+                *((1,) * (len(noise.shape) - 1)),
+            )
+
+            x_out = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+            x_out = self._project_known_keyframes(x_out, constraint, t)
+
+        return x_out, pred_xstart
+
+    @torch.no_grad()
+    def p_sample_loop(
+        self,
+        shape,
+        cond,
+        noise=None,
+        constraint=None,
+        return_diffusion=False,
+        start_point=None,
+        use_tto=True,
+    ):
+        device = self.betas.device
+        batch_size = shape[0]
+        start_point = self.n_timestep if start_point is None else int(start_point)
+
+        x = torch.randn(shape, device=device) if noise is None else noise.to(device)
+        cond = move_condition_to_device(cond, device)
+
+        diffusion = [x] if return_diffusion else None
+
+        for i in tqdm(reversed(range(0, start_point)), total=start_point, desc="ddpm sampling"):
+            timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
+            x, _ = self.p_sample(
+                x,
+                cond,
+                timesteps,
+                constraint=constraint,
+                use_tto=use_tto,
+            )
+
+            if return_diffusion:
+                diffusion.append(x)
+
+        if return_diffusion:
+            return x, diffusion
+
+        return x
+
+    @torch.no_grad()
+    def ddim_sample(self, shape, cond, constraint=None, sampling_timesteps=50, eta=0.0, **kwargs):
+        batch = shape[0]
+        device = self.betas.device
+        total_timesteps = self.n_timestep
+
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        x = torch.randn(shape, device=device)
+        cond = move_condition_to_device(cond, device)
+
+        for time, time_next in tqdm(time_pairs, desc="ddim sampling"):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+
+            pred_noise, x_start = self.model_predictions(
+                x,
+                cond,
+                time_cond,
+                clip_x_start=self.clip_denoised,
+                constraint=constraint,
+            )
+
+            if time_next < 0:
+                x = x_start
+                final_time_cond = torch.zeros((batch,), device=device, dtype=torch.long)
+                x = self._project_known_keyframes(x, constraint, final_time_cond)
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1.0 - alpha / alpha_next) * (1.0 - alpha_next) / (1.0 - alpha)).sqrt()
+            c = (1.0 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(x)
+            x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+
+            next_time_cond = torch.full(
+                (batch,),
+                max(time_next, 0),
+                device=device,
+                dtype=torch.long,
+            )
+            x = self._project_known_keyframes(x, constraint, next_time_cond)
+
+        return x
+
+    @torch.no_grad()
+    def long_ddim_sample(self, shape, cond, constraint=None, **kwargs):
+        batch = shape[0]
+
+        if batch == 1:
+            return self.ddim_sample(shape, cond, constraint=constraint, **kwargs)
+
+        device = self.betas.device
+        total_timesteps = self.n_timestep
+        sampling_timesteps = int(kwargs.get("sampling_timesteps", 50))
+        eta = float(kwargs.get("eta", 0.0))
+
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        weights = np.clip(
+            np.linspace(0.0, self.guidance_weight * 2.0, sampling_timesteps),
+            None,
+            self.guidance_weight,
+        )
+        time_pairs = list(zip(times[:-1], times[1:], weights))
+
+        x = torch.randn(shape, device=device)
+        cond = move_condition_to_device(cond, device)
+
+        assert batch > 1
+        assert x.shape[1] % 2 == 0
+        half = x.shape[1] // 2
+
+        for time, time_next, weight in tqdm(time_pairs, desc="long ddim sampling"):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+
+            pred_noise, x_start = self.model_predictions(
+                x,
+                cond,
+                time_cond,
+                weight=weight,
+                clip_x_start=self.clip_denoised,
+                constraint=constraint,
+            )
+
+            if time_next < 0:
+                x = x_start
+                final_time_cond = torch.zeros((batch,), device=device, dtype=torch.long)
+                x = self._project_known_keyframes(x, constraint, final_time_cond)
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+            sigma = eta * ((1.0 - alpha / alpha_next) * (1.0 - alpha_next) / (1.0 - alpha)).sqrt()
+            c = (1.0 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(x)
+            x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+
+            next_time_cond = torch.full(
+                (batch,),
+                max(time_next, 0),
+                device=device,
+                dtype=torch.long,
+            )
+            x = self._project_known_keyframes(x, constraint, next_time_cond)
+
+            if time > 0:
+                x[1:, :half] = x[:-1, half:].clone()
+
+        return x
+
+    @torch.no_grad()
+    def inpaint_loop(
+        self,
+        shape,
+        cond,
+        noise=None,
+        constraint=None,
+        return_diffusion=False,
+        start_point=None,
+        use_tto=True,
+    ):
+        return self.p_sample_loop(
+            shape,
+            cond,
+            noise=noise,
+            constraint=constraint,
+            return_diffusion=return_diffusion,
+            start_point=start_point,
+            use_tto=use_tto,
+        )
+
+    @torch.no_grad()
+    def long_inpaint_loop(
+        self,
+        shape,
+        cond,
+        noise=None,
+        constraint=None,
+        return_diffusion=False,
+        start_point=None,
+        use_tto=True,
+    ):
+        batch_size = shape[0]
+
+        if batch_size == 1:
+            return self.inpaint_loop(
+                shape,
+                cond,
+                noise=noise,
+                constraint=constraint,
+                return_diffusion=return_diffusion,
+                start_point=start_point,
+                use_tto=use_tto,
+            )
+
+        device = self.betas.device
+        x = torch.randn(shape, device=device) if noise is None else noise.to(device)
+        cond = move_condition_to_device(cond, device)
+
+        assert x.shape[1] % 2 == 0
+        half = x.shape[1] // 2
+
+        start_point = self.n_timestep if start_point is None else int(start_point)
+        diffusion = [x] if return_diffusion else None
+
+        for i in tqdm(reversed(range(0, start_point)), total=start_point, desc="long inpaint sampling"):
+            timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
+
+            x, _ = self.p_sample(
+                x,
+                cond,
+                timesteps,
+                constraint=constraint,
+                use_tto=use_tto,
+            )
+
+            if i > 0:
+                x[1:, :half] = x[:-1, half:].clone()
+
+            if return_diffusion:
+                diffusion.append(x)
+
+        if return_diffusion:
+            return x, diffusion
+
+        return x
+
+    @torch.no_grad()
+    def conditional_sample(self, shape, cond, constraint=None, *args, horizon=None, **kwargs):
+        return self.p_sample_loop(
+            shape,
+            cond,
+            constraint=constraint,
+            *args,
+            **kwargs,
+        )
+
+    # ---------------------------------------------------------------------
+    # Rendering compatibility helper
+    # ---------------------------------------------------------------------
+
+    @torch.no_grad()
     def render_sample(
         self,
         shape,
@@ -1341,213 +1453,51 @@ class GaussianDiffusion(nn.Module):
         name=None,
         sound=True,
         mode="normal",
-        noise=None,
         constraint=None,
-        sound_folder="ood_sliced",
-        start_point=None,
         render=True,
-        target_frames=None,
-        use_tto=True, 
+        **kwargs,
     ):
-        if isinstance(shape, tuple):
-            if mode == "inpaint":
-                func_class = self.inpaint_loop
-            elif mode == "normal":
-                func_class = self.ddim_sample
-            elif mode == "long":
-                func_class = self.long_ddim_sample
-            elif mode == "long_inpaint":
-                func_class = self.long_inpaint_loop
-            else:
-                assert False, "Unrecognized inference mode"
-            samples = (
-                func_class(
-                    shape,
-                    cond,
-                    noise=noise,
-                    constraint=constraint,
-                    start_point=start_point,
-                    use_tto=use_tto  
-                )
-                .detach()
-                .cpu()
-            )
+        """
+        Compatibility helper for older EDGE scripts.
+
+        It samples motion, unnormalizes it if a normalizer is provided, saves .npy,
+        and optionally renders skeleton video.
+        """
+        if mode in ["inpaint", "inpainting"]:
+            samples = self.inpaint_loop(shape, cond, constraint=constraint, **kwargs)
+        elif mode in ["long", "long_ddim"]:
+            samples = self.long_ddim_sample(shape, cond, constraint=constraint, **kwargs)
+        elif mode == "ddim":
+            samples = self.ddim_sample(shape, cond, constraint=constraint, **kwargs)
         else:
-            samples = shape
+            samples = self.p_sample_loop(shape, cond, constraint=constraint, **kwargs)
 
-        samples = normalizer.unnormalize(samples)
+        motion = samples
 
-        if samples.shape[2] == 151:
-            sample_contact, samples = torch.split(
-                samples, (4, samples.shape[2] - 4), dim=2
-            )
-        else:
-            sample_contact = None
+        if normalizer is not None:
+            motion = normalizer.unnormalize(motion)
+            if isinstance(motion, np.ndarray):
+                motion = torch.from_numpy(motion).to(samples.device)
 
-        target_device = self.betas.device
-        if isinstance(cond, dict):
-            for value in cond.values():
-                if torch.is_tensor(value):
-                    target_device = value.device
-                    break
-        elif torch.is_tensor(cond):
-            target_device = cond.device
+        motion_np = motion.detach().cpu().numpy()
 
-        b, s, c = samples.shape
-        pos = samples[:, :, :3].to(target_device)
-        q = samples[:, :, 3:].reshape(b, s, 24, 6)
-        q = ax_from_6v(q).to(target_device)
+        render_out = Path(render_out)
+        render_out.mkdir(parents=True, exist_ok=True)
 
-        if mode in ["long", "long_inpaint"]:
-            b, s, c1, c2 = q.shape
-            assert s % 2 == 0
-            half = s // 2
-            if b > 1:
-                for i in range(1, b):
-                    delta_x = pos[i-1, half, 0] - pos[i, 0, 0]
-                    delta_z = pos[i-1, half, 2] - pos[i, 0, 2]
-                    pos[i, :, 0] += delta_x
-                    pos[i, :, 2] += delta_z
+        stem = name if name is not None else f"sample_{epoch}"
+        npy_path = render_out / f"{stem}.npy"
+        np.save(npy_path, motion_np)
 
-                fade_out = torch.ones((1, s, 1)).to(pos.device)
-                fade_in = torch.ones((1, s, 1)).to(pos.device)
-                fade_out[:, half:, :] = torch.linspace(1, 0, half)[None, :, None].to(
-                    pos.device
-                )
-                fade_in[:, :half, :] = torch.linspace(0, 1, half)[None, :, None].to(
-                    pos.device
-                )
-
-                pos[:-1] *= fade_out
-                pos[1:] *= fade_in
-
-                full_pos = torch.zeros((s + half * (b - 1), 3)).to(pos.device)
-                idx = 0
-                for pos_slice in pos:
-                    full_pos[idx : idx + s] += pos_slice
-                    idx += half
-
-                slerp_weight = torch.linspace(0, 1, half)[None, :, None].to(pos.device)
-
-                left, right = q[:-1, half:], q[1:, :half]
-                left, right = (
-                    axis_angle_to_quaternion(left),
-                    axis_angle_to_quaternion(right),
-                )
-                merged = quat_slerp(left, right, slerp_weight)
-                merged = quaternion_to_axis_angle(merged)
-
-                full_q = torch.zeros((s + half * (b - 1), c1, c2)).to(pos.device)
-                full_q[:half] += q[0, :half]
-                idx = half
-                for q_slice in merged:
-                    full_q[idx : idx + half] += q_slice
-                    idx += half
-                full_q[idx : idx + half] += q[-1, half:]
-
-                full_pos = full_pos.unsqueeze(0)
-                full_q = full_q.unsqueeze(0)
-            else:
-                full_pos = pos
-                full_q = q
-                
-            if target_frames is not None:
-                full_pos = full_pos[:, :target_frames, :]
-                full_q = full_q[:, :target_frames, :, :]
-
-            full_pose = (
-                self.smpl.forward(full_q, full_pos).detach().cpu().numpy()
-            )
-
+        if render:
             try:
-                pelvis = full_pose[0][:, 0, :]
-                spine = full_pose[0][:, 6, :]
-                neck = full_pose[0][:, 12, :]
-                
-                vec_lower = spine - pelvis
-                vec_upper = neck - spine
-                cos_sim = np.sum(vec_lower * vec_upper, axis=-1) / (np.linalg.norm(vec_lower, axis=-1) * np.linalg.norm(vec_upper, axis=-1) + 1e-6)
-                curve_score = np.mean(1.0 - cos_sim) * 1000 
-                
-                l_wrist = full_pose[0][:, 20, :]
-                r_wrist = full_pose[0][:, 21, :]
-                asymmetry_score = np.mean(np.linalg.norm(l_wrist - r_wrist, axis=-1)) * 50
-                
-                dss_score = np.clip((curve_score * 0.6) + (asymmetry_score * 0.4), 0, 100)
-                
-                print(f"\n✨ [评估报告] {name[0] if name else '当前生成'} 视频渲染完成！")
-                print(f"   ▶ 脊柱柔韧度 (S-Curve): {curve_score:.2f}")
-                print(f"   ▶ 肢体不对称律 (Asymmetry): {asymmetry_score:.2f}")
-                print(f"   🏆 综合敦煌舞姿得分 (DSS): {dss_score:.2f} / 100.00\n")
-            except Exception as e:
-                print(f"打分系统跳过: {e}")
-            
-            skeleton_render(
-                full_pose[0],
-                epoch=f"{epoch}",
-                out=render_out,
-                name=name,
-                sound=sound,
-                stitch=True,
-                sound_folder=sound_folder,
-                render=render
-            )
-            if fk_out is not None:
-                outname = f"{epoch}_{audio_output_stem(name)}.pkl"
-                Path(fk_out).mkdir(parents=True, exist_ok=True)
-                
-                target_traj_np = None
-                if isinstance(cond, dict) and "trajectory" in cond:
-                    target_traj_np = cond["trajectory"][0].detach().cpu().numpy()
-                
-                pickle.dump(
-                    {
-                        "smpl_poses": full_q.squeeze(0).reshape((-1, 72)).cpu().numpy(),
-                        "smpl_trans": full_pos.squeeze(0).cpu().numpy(),
-                        "full_pose": full_pose[0],
-                        "target_trajectory": target_traj_np, 
-                    },
-                    open(os.path.join(fk_out, outname), "wb"),
-                )
-            return
+                for batch_idx in range(motion_np.shape[0]):
+                    video_path = render_out / f"{stem}_{batch_idx}.mp4"
+                    skeleton_render(
+                        motion_np[batch_idx],
+                        str(video_path),
+                        sound=sound,
+                    )
+            except Exception as exc:
+                print(f"⚠️ skeleton_render failed: {exc}")
 
-        poses = self.smpl.forward(q, pos).detach().cpu().numpy()
-
-        sample_contact = (
-            sample_contact.detach().cpu().numpy()
-            if sample_contact is not None
-            else None
-        )
-
-        def inner(xx):
-            num, pose = xx
-            filename = name[num] if name is not None else None
-            contact = sample_contact[num] if sample_contact is not None else None
-            skeleton_render(
-                pose,
-                epoch=f"e{epoch}_b{num}",
-                out=render_out,
-                name=filename,
-                sound=sound,
-                contact=contact,
-            )
-
-        p_map(inner, enumerate(poses))
-
-        if fk_out is not None and mode != "long":
-            Path(fk_out).mkdir(parents=True, exist_ok=True)
-            for num, (qq, pos_, filename, pose) in enumerate(zip(q, pos, name, poses)):
-                path = os.path.normpath(filename)
-                pathparts = path.split(os.sep)
-                pathparts[-1] = pathparts[-1].replace("npy", "wav")
-                pathparts[2] = "wav_sliced"
-                audioname = os.path.join(*pathparts)
-                outname = f"{epoch}_{num}_{pathparts[-1][:-4]}.pkl"
-                pickle.dump(
-                    {
-                        "smpl_poses": qq.reshape((-1, 72)).cpu().numpy(),
-                        "smpl_trans": pos_.cpu().numpy(),
-                        "full_pose": pose,
-                    },
-                    open(f"{fk_out}/{outname}", "wb"),
-                )
+        return motion_np

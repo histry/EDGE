@@ -1,11 +1,12 @@
 import argparse
 import json
-import os
 from pathlib import Path
+
 import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
+
 try:
     import scipy.interpolate as spi
 except Exception:
@@ -24,6 +25,12 @@ ROT_SLICE = slice(7, 151)
 
 def ensure_parent(path: str):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def to_numpy(x) -> np.ndarray:
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 
 def load_151_pose(path: str) -> np.ndarray:
@@ -51,194 +58,6 @@ def load_151_pose(path: str) -> np.ndarray:
         raise ValueError(f"{path} 必须是 151 维 pose，当前是 {arr.shape}")
 
     return arr.astype(np.float32)
-def remove_duplicate_points(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    if len(points) <= 1:
-        return points
-
-    kept = [points[0]]
-    for p in points[1:]:
-        if np.linalg.norm(p - kept[-1]) > eps:
-            kept.append(p)
-
-    return np.asarray(kept, dtype=np.float32)
-
-
-def interpolate_trajectory_smooth(
-    points: np.ndarray,
-    progress: np.ndarray,
-    smooth: bool = True,
-) -> np.ndarray:
-    points = remove_duplicate_points(points)
-
-    if len(points) == 1:
-        return np.repeat(points[None, 0, :], len(progress), axis=0).astype(np.float32)
-
-    # 按控制点之间的距离分配参数，避免控制点距离不均导致局部速度异常
-    seg_len = np.linalg.norm(points[1:] - points[:-1], axis=1)
-    u = np.concatenate([[0.0], np.cumsum(seg_len)]).astype(np.float32)
-
-    if float(u[-1]) <= 1e-8:
-        return np.repeat(points[None, 0, :], len(progress), axis=0).astype(np.float32)
-
-    u = u / u[-1]
-
-    if smooth and spi is not None and len(points) >= 3:
-        # k 最多为 3；控制点少时自动降低阶数
-        k = min(3, len(points) - 1)
-
-        try:
-            tck, _ = spi.splprep(
-                [points[:, 0], points[:, 1]],
-                u=u,
-                s=0.0,
-                k=k,
-            )
-            x_new, z_new = spi.splev(progress, tck)
-            traj = np.stack([x_new, z_new], axis=-1).astype(np.float32)
-            return traj
-        except Exception as exc:
-            print(f"⚠️ Spline 轨迹插值失败，回退到线性插值: {exc}")
-
-    # fallback: 线性插值
-    x_new = np.interp(progress, u, points[:, 0])
-    z_new = np.interp(progress, u, points[:, 1])
-    return np.stack([x_new, z_new], axis=-1).astype(np.float32)
-def normalize_trajectory_for_model(
-    traj_physical: np.ndarray,
-    normalizer,
-    root_x_idx: int = 4,
-    root_z_idx: int = 6,
-) -> np.ndarray:
-    if normalizer is None or not hasattr(normalizer, "mean") or not hasattr(normalizer, "std"):
-        raise ValueError("checkpoint 中没有有效 normalizer，无法归一化 trajectory")
-
-    traj_physical = np.asarray(traj_physical, dtype=np.float32)
-
-    mean_x = float(normalizer.mean[root_x_idx])
-    mean_z = float(normalizer.mean[root_z_idx])
-    std_x = float(normalizer.std[root_x_idx])
-    std_z = float(normalizer.std[root_z_idx])
-
-    traj_norm = traj_physical.copy()
-    traj_norm[:, 0] = (traj_physical[:, 0] - mean_x) / (std_x + 1e-8)
-    traj_norm[:, 1] = (traj_physical[:, 1] - mean_z) / (std_z + 1e-8)
-
-    return traj_norm.astype(np.float32)
-
-def build_control_trajectory(
-    trajectory_text: str,
-    audio_feature: np.ndarray,
-    normalizer,
-    target_traj_path: str = "",
-    keep_absolute: bool = False,
-    uniform_timing: bool = False,
-    smooth: bool = True,
-):
-    num_frames = audio_feature.shape[0]
-
-    if target_traj_path:
-        traj_physical = np.load(target_traj_path).astype(np.float32)
-
-        if traj_physical.ndim == 3:
-            traj_physical = traj_physical[0]
-
-        traj_physical = traj_physical[:, :2]
-
-        if len(traj_physical) != num_frames:
-            traj_t = torch.from_numpy(traj_physical).float().unsqueeze(0).transpose(1, 2)
-            traj_t = F.interpolate(
-                traj_t,
-                size=num_frames,
-                mode="linear",
-                align_corners=False,
-            )
-            traj_physical = traj_t.transpose(1, 2).squeeze(0).numpy().astype(np.float32)
-
-    else:
-        points = parse_trajectory_points(trajectory_text)
-
-        progress = build_trajectory_progress(
-            audio_feature=audio_feature,
-            use_audio_timing=not uniform_timing,
-        )
-
-        traj_physical = interpolate_trajectory_smooth(
-            points=points,
-            progress=progress,
-            smooth=smooth,
-        )
-
-    if not keep_absolute:
-        traj_physical = traj_physical - traj_physical[0:1]
-
-    traj_norm = normalize_trajectory_for_model(
-        traj_physical=traj_physical,
-        normalizer=normalizer,
-    )
-
-    return traj_physical.astype(np.float32), traj_norm.astype(np.float32)
-
-def build_trajectory_progress(
-    audio_feature: np.ndarray,
-    use_audio_timing: bool = True,
-    onset_index: int = 768,
-    min_speed_bias: float = 0.20,
-) -> np.ndarray:
-    num_frames = audio_feature.shape[0]
-
-    if (not use_audio_timing) or audio_feature.shape[1] <= onset_index:
-        return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
-
-    onset = audio_feature[:, onset_index].astype(np.float32)
-    onset = np.maximum(onset, 0.0)
-
-    if float(onset.max()) <= 1e-8:
-        return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
-
-    onset = onset / (float(onset.max()) + 1e-8)
-
-    # 给一个基础速度，避免无 onset 的区间完全停住
-    speed = onset + float(min_speed_bias)
-
-    progress = np.cumsum(speed)
-    progress = progress - progress[0]
-    progress = progress / max(float(progress[-1]), 1e-8)
-
-    return progress.astype(np.float32)
-
-def parse_trajectory_points(text: str) -> np.ndarray:
-    points = []
-
-    for item in text.split(";"):
-        item = item.strip()
-        if not item:
-            continue
-
-        parts = item.split(",")
-        if len(parts) != 2:
-            raise ValueError(
-                f"轨迹控制点格式错误: {item}，应为 'x,z'，例如 '0,0;1,1;0,2'"
-            )
-
-        x = float(parts[0].strip())
-        z = float(parts[1].strip())
-        points.append([x, z])
-
-    if len(points) == 0:
-        raise ValueError("--trajectory 至少需要一个控制点")
-
-    return np.asarray(points, dtype=np.float32)
-
-def normalize_pose_if_needed(pose: np.ndarray, normalizer, pose_space: str) -> np.ndarray:
-    if pose_space == "normalized":
-        return pose.astype(np.float32)
-
-    if pose_space == "physical":
-        if normalizer is None:
-            raise ValueError("--pose_space physical 需要 checkpoint 里有 normalizer")
-        return normalizer.normalize(torch.from_numpy(pose[None, None, :])).numpy()[0, 0].astype(np.float32)
-
-    raise ValueError(f"Unknown pose_space: {pose_space}")
 
 
 def parse_list(text: str):
@@ -273,14 +92,54 @@ def parse_mid_frames(text: str, num_mid: int, num_frames: int):
     return frames
 
 
+def parse_trajectory_points(text: str) -> np.ndarray:
+    points = []
+
+    for item in text.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+
+        parts = item.split(",")
+        if len(parts) != 2:
+            raise ValueError(
+                f"轨迹控制点格式错误: {item}，应为 'x,z'，例如 '0,0;1,1;0,2'"
+            )
+
+        try:
+            x = float(parts[0].strip())
+            z = float(parts[1].strip())
+        except ValueError as exc:
+            raise ValueError(f"轨迹控制点不是数字: {item}") from exc
+
+        points.append([x, z])
+
+    if len(points) == 0:
+        raise ValueError("--trajectory 至少需要一个控制点，例如 '0,0;1,1;0,2'")
+
+    return np.asarray(points, dtype=np.float32)
+
+
+def remove_duplicate_points(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    if len(points) <= 1:
+        return points.astype(np.float32)
+
+    kept = [points[0]]
+    for point in points[1:]:
+        if np.linalg.norm(point - kept[-1]) > eps:
+            kept.append(point)
+
+    return np.asarray(kept, dtype=np.float32)
+
+
 def resample_feature(feature: np.ndarray, target_frames: int) -> np.ndarray:
     feature = np.asarray(feature, dtype=np.float32)
 
     if feature.ndim != 2:
-        raise ValueError(f"audio feature 应该是 [T,C]，当前是 {feature.shape}")
+        raise ValueError(f"feature 应该是 [T,C]，当前是 {feature.shape}")
 
     if feature.shape[0] == target_frames:
-        return feature
+        return feature.astype(np.float32)
 
     tensor = torch.from_numpy(feature).float().unsqueeze(0).transpose(1, 2)
     tensor = F.interpolate(
@@ -292,112 +151,170 @@ def resample_feature(feature: np.ndarray, target_frames: int) -> np.ndarray:
     return tensor.transpose(1, 2).squeeze(0).numpy().astype(np.float32)
 
 
-def parse_trajectory_points(text: str) -> np.ndarray:
-    points = []
-    for item in text.split(";"):
-        item = item.strip()
-        if not item:
-            continue
-        x_text, z_text = item.split(",")
-        points.append([float(x_text.strip()), float(z_text.strip())])
-
-    if not points:
-        raise ValueError("--trajectory 至少需要一个控制点，例如 '0,0;1,1;0,2'")
-
-    return np.asarray(points, dtype=np.float32)
-
-
-def build_progress_from_audio(audio_feature: np.ndarray, use_audio_timing: bool) -> np.ndarray:
+def build_trajectory_progress(
+    audio_feature: np.ndarray,
+    use_audio_timing: bool = True,
+    onset_index: int = 768,
+    min_speed_bias: float = 0.20,
+) -> np.ndarray:
     num_frames = audio_feature.shape[0]
 
-    if not use_audio_timing or audio_feature.shape[1] <= 768:
+    if (not use_audio_timing) or audio_feature.shape[1] <= onset_index:
         return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
 
-    onset = audio_feature[:, 768].astype(np.float32)
+    onset = audio_feature[:, onset_index].astype(np.float32)
     onset = np.maximum(onset, 0.0)
 
     if float(onset.max()) <= 1e-8:
         return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
 
     onset = onset / (float(onset.max()) + 1e-8)
-    speed = onset + 0.20
+
+    speed = onset + float(min_speed_bias)
     progress = np.cumsum(speed)
-    progress = (progress - progress[0]) / max(float(progress[-1] - progress[0]), 1e-8)
+    progress = progress - progress[0]
+    progress = progress / max(float(progress[-1]), 1e-8)
 
     return progress.astype(np.float32)
 
 
-def interpolate_trajectory(points: np.ndarray, progress: np.ndarray) -> np.ndarray:
+def interpolate_trajectory_smooth(
+    points: np.ndarray,
+    progress: np.ndarray,
+    smooth: bool = True,
+) -> np.ndarray:
+    points = remove_duplicate_points(points)
+
     if len(points) == 1:
         return np.repeat(points[None, 0, :], len(progress), axis=0).astype(np.float32)
 
     seg_len = np.linalg.norm(points[1:] - points[:-1], axis=1)
-    u = np.concatenate([[0.0], np.cumsum(seg_len)])
+    u = np.concatenate([[0.0], np.cumsum(seg_len)]).astype(np.float32)
 
     if float(u[-1]) <= 1e-8:
         return np.repeat(points[None, 0, :], len(progress), axis=0).astype(np.float32)
 
     u = u / u[-1]
 
-    # 去掉重复控制点，避免插值异常
-    keep = np.concatenate([[True], np.diff(u) > 1e-8])
-    u = u[keep]
-    points = points[keep]
+    if smooth and spi is not None and len(points) >= 3:
+        k = min(3, len(points) - 1)
 
-    if len(points) == 1:
-        return np.repeat(points[None, 0, :], len(progress), axis=0).astype(np.float32)
+        try:
+            tck, _ = spi.splprep(
+                [points[:, 0], points[:, 1]],
+                u=u,
+                s=0.0,
+                k=k,
+            )
+            x_new, z_new = spi.splev(progress, tck)
+            return np.stack([x_new, z_new], axis=-1).astype(np.float32)
+        except Exception as exc:
+            print(f"⚠️ Spline 轨迹插值失败，回退到线性插值: {exc}")
 
-    x = np.interp(progress, u, points[:, 0])
-    z = np.interp(progress, u, points[:, 1])
+    x_new = np.interp(progress, u, points[:, 0])
+    z_new = np.interp(progress, u, points[:, 1])
 
-    return np.stack([x, z], axis=-1).astype(np.float32)
-
-
-def load_or_build_trajectory(args, audio_feature: np.ndarray, num_frames: int) -> np.ndarray:
-    if args.target_traj:
-        traj = np.load(args.target_traj).astype(np.float32)
-        if traj.ndim == 3:
-            traj = traj[0]
-        traj = traj[:, :2]
-        traj = resample_feature(traj, num_frames)
-    else:
-        points = parse_trajectory_points(args.trajectory)
-        progress = build_progress_from_audio(
-            audio_feature,
-            use_audio_timing=not args.uniform_trajectory_timing,
-        )
-        traj = interpolate_trajectory(points, progress)
-
-    if not args.keep_trajectory_absolute:
-        traj = traj - traj[0:1]
-
-    return traj.astype(np.float32)
+    return np.stack([x_new, z_new], axis=-1).astype(np.float32)
 
 
-def normalize_trajectory(traj_physical: np.ndarray, normalizer) -> np.ndarray:
-    if normalizer is None:
-        raise ValueError("trajectory normalization 需要 checkpoint normalizer")
+def normalize_trajectory_for_model(
+    traj_physical: np.ndarray,
+    normalizer,
+    root_x_idx: int = ROOT_X_IDX,
+    root_z_idx: int = ROOT_Z_IDX,
+) -> np.ndarray:
+    if normalizer is None or not hasattr(normalizer, "mean") or not hasattr(normalizer, "std"):
+        raise ValueError("checkpoint 中没有有效 normalizer，无法归一化 trajectory")
 
-    mean_x = float(normalizer.mean[ROOT_X_IDX])
-    mean_z = float(normalizer.mean[ROOT_Z_IDX])
-    std_x = float(normalizer.std[ROOT_X_IDX])
-    std_z = float(normalizer.std[ROOT_Z_IDX])
+    traj_physical = np.asarray(traj_physical, dtype=np.float32)
+
+    mean_x = float(normalizer.mean[root_x_idx])
+    mean_z = float(normalizer.mean[root_z_idx])
+    std_x = float(normalizer.std[root_x_idx])
+    std_z = float(normalizer.std[root_z_idx])
 
     traj_norm = traj_physical.copy()
-    traj_norm[:, 0] = (traj_norm[:, 0] - mean_x) / (std_x + 1e-8)
-    traj_norm[:, 1] = (traj_norm[:, 1] - mean_z) / (std_z + 1e-8)
+    traj_norm[:, 0] = (traj_physical[:, 0] - mean_x) / (std_x + 1e-8)
+    traj_norm[:, 1] = (traj_physical[:, 1] - mean_z) / (std_z + 1e-8)
 
     return traj_norm.astype(np.float32)
 
 
-def make_keyframe_feature_mask(num_frames: int, constrain_contacts: bool) -> np.ndarray:
+def build_control_trajectory(
+    trajectory_text: str,
+    audio_feature: np.ndarray,
+    normalizer,
+    target_traj_path: str = "",
+    keep_absolute: bool = False,
+    uniform_timing: bool = False,
+    smooth: bool = True,
+):
+    num_frames = audio_feature.shape[0]
+
+    if target_traj_path:
+        traj_physical = np.load(target_traj_path).astype(np.float32)
+
+        if traj_physical.ndim == 3:
+            traj_physical = traj_physical[0]
+
+        if traj_physical.ndim != 2 or traj_physical.shape[1] < 2:
+            raise ValueError(
+                f"--target_traj 应该是 [T,2] 或 [1,T,2]，当前是 {traj_physical.shape}"
+            )
+
+        traj_physical = traj_physical[:, :2]
+
+        if len(traj_physical) != num_frames:
+            traj_physical = resample_feature(traj_physical, num_frames)
+
+    else:
+        points = parse_trajectory_points(trajectory_text)
+
+        progress = build_trajectory_progress(
+            audio_feature=audio_feature,
+            use_audio_timing=not uniform_timing,
+        )
+
+        traj_physical = interpolate_trajectory_smooth(
+            points=points,
+            progress=progress,
+            smooth=smooth,
+        )
+
+    if not keep_absolute:
+        traj_physical = traj_physical - traj_physical[0:1]
+
+    traj_norm = normalize_trajectory_for_model(
+        traj_physical=traj_physical,
+        normalizer=normalizer,
+    )
+
+    return traj_physical.astype(np.float32), traj_norm.astype(np.float32)
+
+
+def normalize_pose_if_needed(pose: np.ndarray, normalizer, pose_space: str) -> np.ndarray:
+    if pose_space == "normalized":
+        return pose.astype(np.float32)
+
+    if pose_space == "physical":
+        if normalizer is None:
+            raise ValueError("--pose_space physical 需要 checkpoint 里有 normalizer")
+
+        pose_t = torch.from_numpy(pose[None, None, :]).float()
+        pose_norm = normalizer.normalize(pose_t)
+        pose_norm = to_numpy(pose_norm)[0, 0]
+        return pose_norm.astype(np.float32)
+
+    raise ValueError(f"Unknown pose_space: {pose_space}")
+
+
+def make_keyframe_feature_mask(constrain_contacts: bool) -> np.ndarray:
     mask_one_frame = np.zeros((151,), dtype=np.float32)
 
-    # 2D/3D 骨架图通常没有可靠脚接触标签，默认不锁 contacts。
     if constrain_contacts:
         mask_one_frame[CONTACT_SLICE] = 1.0
 
-    # root X/Z 交给 trajectory 控制，不在 keyframe 里锁死。
+    # root X/Z 由 trajectory 控制，不在关键帧里锁死。
     mask_one_frame[ROOT_Y_IDX] = 1.0
     mask_one_frame[ROT_SLICE] = 1.0
 
@@ -409,7 +326,6 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
     mask = np.zeros((num_frames, 151), dtype=np.float32)
 
     frame_mask = make_keyframe_feature_mask(
-        num_frames=num_frames,
         constrain_contacts=args.constrain_contacts,
     )
 
@@ -429,11 +345,10 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
     for i, (path, frame) in enumerate(zip(mid_paths, mid_frames), start=1):
         add_pose(path, frame, f"mid{i}")
 
-    constraint = {
+    return {
         "value": torch.from_numpy(value[None]).to(device=device, dtype=torch.float32),
         "mask": torch.from_numpy(mask[None]).to(device=device, dtype=torch.float32),
     }
-    return constraint
 
 
 def sample_motion(model: EDGE, cond: dict, constraint: dict, args, num_frames: int):
@@ -454,6 +369,50 @@ def sample_motion(model: EDGE, cond: dict, constraint: dict, args, num_frames: i
         constraint=constraint,
         use_tto=not args.no_tto,
     )
+
+
+def apply_trajectory_anchor(
+    motion_physical: np.ndarray,
+    traj_physical: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    """
+    Softly anchor generated root X/Z to the target trajectory.
+
+    strength:
+      0.0 = keep generated trajectory
+      1.0 = strictly replace root X/Z with target trajectory
+      0~1 = soft blend, useful for display videos
+    """
+    motion = motion_physical.copy()
+    traj = np.asarray(traj_physical, dtype=np.float32)
+
+    if traj.ndim == 3:
+        traj = traj[0]
+
+    if traj.ndim != 2 or traj.shape[1] < 2:
+        raise ValueError(f"traj_physical 应该是 [T,2] 或 [1,T,2]，当前是 {traj.shape}")
+
+    traj = traj[:, :2]
+
+    if len(traj) != len(motion):
+        traj = resample_feature(traj, len(motion))
+
+    strength = float(np.clip(strength, 0.0, 1.0))
+
+    if strength <= 0.0:
+        return motion.astype(np.float32)
+
+    motion[:, ROOT_X_IDX] = (
+        (1.0 - strength) * motion[:, ROOT_X_IDX] + strength * traj[:, 0]
+    )
+    motion[:, ROOT_Z_IDX] = (
+        (1.0 - strength) * motion[:, ROOT_Z_IDX] + strength * traj[:, 1]
+    )
+
+    return motion.astype(np.float32)
+
+
 def save_eval_assets(
     out_path: str,
     motion_raw_physical: np.ndarray,
@@ -481,16 +440,26 @@ def save_eval_assets(
     eval_cmd = [
         "python",
         "eval_quantitative.py",
-        "--motion", str(final_motion_path),
-        "--raw_motion", str(raw_motion_path),
-        "--post_motion", str(final_motion_path),
-        "--checkpoint", args.checkpoint,
-        "--audio", args.music,
-        "--target_traj", str(target_traj_path),
-        "--start_pose", args.start_pose,
-        "--end_pose", args.end_pose,
-        "--out_json", str(eval_json_path),
-        "--out_csv", str(eval_csv_path),
+        "--motion",
+        str(final_motion_path),
+        "--raw_motion",
+        str(raw_motion_path),
+        "--post_motion",
+        str(final_motion_path),
+        "--checkpoint",
+        args.checkpoint,
+        "--audio",
+        args.music,
+        "--target_traj",
+        str(target_traj_path),
+        "--start_pose",
+        args.start_pose,
+        "--end_pose",
+        args.end_pose,
+        "--out_json",
+        str(eval_json_path),
+        "--out_csv",
+        str(eval_csv_path),
     ]
 
     if getattr(args, "mid_poses", ""):
@@ -518,6 +487,13 @@ def save_eval_assets(
         "target_traj_saved": str(target_traj_path),
         "eval_json": str(eval_json_path),
         "eval_csv": str(eval_csv_path),
+        "post_anchor_trajectory": bool(getattr(args, "post_anchor_trajectory", False)),
+        "trajectory_anchor_strength": float(getattr(args, "trajectory_anchor_strength", 0.0)),
+        "sampler": getattr(args, "sampler", "ddpm"),
+        "use_tto": not getattr(args, "no_tto", False),
+        "tto_steps": int(getattr(args, "tto_steps", 1)),
+        "tto_interval": int(getattr(args, "tto_interval", 50)),
+        "tto_lr": float(getattr(args, "tto_lr", 0.03)),
         "eval_command": " ".join(eval_cmd),
     }
 
@@ -541,7 +517,8 @@ def save_eval_assets(
         "eval_cmd": eval_cmd,
     }
 
-def main():
+
+def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Controlled EDGE generation: music + start/end keyframes + 2D trajectory."
     )
@@ -550,6 +527,7 @@ def main():
     parser.add_argument("--music", required=True)
     parser.add_argument("--start_pose", required=True)
     parser.add_argument("--end_pose", required=True)
+    parser.add_argument("--out", required=True)
 
     parser.add_argument(
         "--mid_poses",
@@ -573,7 +551,6 @@ def main():
         help="可选，直接读取 [T,2] 或 [1,T,2] 的 .npy 轨迹，优先级高于 --trajectory。",
     )
 
-    parser.add_argument("--out", required=True)
     parser.add_argument("--feature_type", default="hybrid", choices=["hybrid"])
     parser.add_argument("--audio_dim", type=int, default=803)
     parser.add_argument("--seq_len", type=int, default=150)
@@ -595,7 +572,7 @@ def main():
         "--pose_space",
         default="normalized",
         choices=["normalized", "physical"],
-        help="当前数据管线里的关键帧 .npy 多数是 normalized；如果来自图像转 3D 的物理空间结果，用 physical。",
+        help="关键帧 .npy 的空间。图像转3D结果一般用 physical；训练切片中导出的可用 normalized。",
     )
     parser.add_argument(
         "--constrain_contacts",
@@ -611,6 +588,11 @@ def main():
         "--uniform_trajectory_timing",
         action="store_true",
         help="默认使用音乐 onset 调整轨迹速度；开启后匀速走轨迹。",
+    )
+    parser.add_argument(
+        "--linear_trajectory",
+        action="store_true",
+        help="关闭 spline 平滑插值，改用线性折线轨迹。",
     )
 
     parser.add_argument(
@@ -640,50 +622,64 @@ def main():
         action="store_true",
         help="默认使用 active 权重；开启后尝试使用 EMA 权重。",
     )
-    parser.add_argument(
-        "--post_anchor_trajectory",
-        action="store_true",
-        help="生成后直接把 root X/Z 替换成目标轨迹。轨迹最严格，但可能增加脚滑。",
-    )
-    parser.add_argument(
-        "--save_controls",
-        action="store_true",
-        help="额外保存 target trajectory 和 meta json，方便评估。",
-    )
-    parser.add_argument(
-        "--target_traj",
-        default="",
-        help="可选，直接读取 [T,2] 或 [1,T,2] 的目标轨迹 .npy，优先级高于 --trajectory",
-    )
-
-    parser.add_argument(
-        "--keep_trajectory_absolute",
-        action="store_true",
-        help="默认把轨迹平移到从 0 开始；开启后保留绝对 X/Z 坐标",
-    )
-
-    parser.add_argument(
-        "--uniform_trajectory_timing",
-        action="store_true",
-        help="默认用音乐 onset 调整轨迹速度；开启后匀速走完整条轨迹",
-    )
-
-    parser.add_argument(
-        "--linear_trajectory",
-        action="store_true",
-        help="关闭 spline 平滑插值，改用线性折线轨迹",
-    )
-    parser.add_argument(
-        "--save_eval_assets",
-        action="store_true",
-        help="保存 raw motion、target trajectory、meta，并打印 eval_quantitative.py 命令",
-    )
 
     parser.add_argument(
         "--post_anchor_trajectory",
         action="store_true",
         help="生成后强制把 root X/Z 替换成目标轨迹。轨迹误差最低，但可能增加脚滑。",
     )
+    parser.add_argument(
+        "--trajectory_anchor_strength",
+        type=float,
+        default=0.0,
+        help=(
+            "生成后 root X/Z 贴合目标轨迹的软锚定强度。"
+            "0 表示不后处理，1 表示严格替换为目标轨迹。"
+            "建议展示视频用 0.6~0.9。"
+        ),
+    )
+
+    parser.add_argument(
+        "--tto_steps",
+        type=int,
+        default=1,
+        help="每次 TTO 的梯度优化步数；增大可增强关键帧/轨迹约束，但会变慢。",
+    )
+    parser.add_argument(
+        "--tto_interval",
+        type=int,
+        default=50,
+        help="每隔多少 diffusion step 执行一次 TTO；越小约束越强但越慢。",
+    )
+    parser.add_argument(
+        "--tto_lr",
+        type=float,
+        default=0.03,
+        help="TTO 梯度步长。",
+    )
+    parser.add_argument(
+        "--tto_contact_threshold",
+        type=float,
+        default=0.65,
+        help="TTO 中判断脚接触通道为接触的阈值。",
+    )
+
+    parser.add_argument(
+        "--save_controls",
+        action="store_true",
+        help="额外保存 target trajectory、raw motion 和 meta json，方便评估。",
+    )
+    parser.add_argument(
+        "--save_eval_assets",
+        action="store_true",
+        help="保存 raw motion、target trajectory、meta，并打印 eval_quantitative.py 命令。",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     print("🚀 初始化 EDGE controlled generator")
@@ -698,6 +694,19 @@ def main():
     )
     model.eval()
 
+    model.diffusion.tto_steps = int(args.tto_steps)
+    model.diffusion.tto_interval = int(args.tto_interval)
+    model.diffusion.tto_lr = float(args.tto_lr)
+    model.diffusion.tto_contact_threshold = float(args.tto_contact_threshold)
+
+    print(
+        "🧪 TTO config: "
+        f"steps={model.diffusion.tto_steps}, "
+        f"interval={model.diffusion.tto_interval}, "
+        f"lr={model.diffusion.tto_lr}, "
+        f"contact_threshold={model.diffusion.tto_contact_threshold}"
+    )
+
     device = model.accelerator.device
     normalizer = model.normalizer
 
@@ -705,8 +714,24 @@ def main():
         raise ValueError("checkpoint 中没有 normalizer，无法保证轨迹/姿态空间一致。")
 
     print("🎵 提取 hybrid audio feature")
-    audio_feature, audio_feature_path = hybrid_extract(args.music)
+    extracted = hybrid_extract(args.music)
+
+    if isinstance(extracted, tuple):
+        audio_feature, audio_feature_path = extracted
+    else:
+        audio_feature = extracted
+        audio_feature_path = ""
+
     audio_feature = np.asarray(audio_feature, dtype=np.float32)
+
+    if audio_feature.ndim != 2:
+        raise ValueError(f"audio_feature 应该是 [T,C]，当前是 {audio_feature.shape}")
+
+    if audio_feature.shape[1] != args.audio_dim:
+        raise ValueError(
+            f"audio feature dim 与模型不一致: feature={audio_feature.shape[1]}, "
+            f"model/audio_dim={args.audio_dim}"
+        )
 
     if args.use_full_music:
         duration = librosa.get_duration(path=args.music)
@@ -725,22 +750,30 @@ def main():
         trajectory_text=args.trajectory,
         audio_feature=audio_feature,
         normalizer=model.normalizer,
-        target_traj_path=getattr(args, "target_traj", ""),
-        keep_absolute=getattr(args, "keep_trajectory_absolute", False),
-        uniform_timing=getattr(args, "uniform_trajectory_timing", False),
-        smooth=not getattr(args, "linear_trajectory", False),
+        target_traj_path=args.target_traj,
+        keep_absolute=args.keep_trajectory_absolute,
+        uniform_timing=args.uniform_trajectory_timing,
+        smooth=not args.linear_trajectory,
     )
 
     cond = {
         "audio": torch.from_numpy(audio_feature[None]).to(
-            device=model.accelerator.device,
+            device=device,
             dtype=torch.float32,
         ),
         "trajectory": torch.from_numpy(traj_norm[None]).to(
-            device=model.accelerator.device,
+            device=device,
             dtype=torch.float32,
         ),
     }
+
+    # 显式提供 onset，避免 diffusion.py 里只能从 audio[...,768] fallback。
+    if audio_feature.shape[1] > 768:
+        onset = audio_feature[:, 768:769].astype(np.float32)
+        cond["onset"] = torch.from_numpy(onset[None]).to(
+            device=device,
+            dtype=torch.float32,
+        )
 
     constraint = build_constraint(args, normalizer, num_frames, device)
 
@@ -748,15 +781,31 @@ def main():
         sample_norm = sample_motion(model, cond, constraint, args, num_frames)
 
     motion_norm = sample_norm.detach().cpu()
-    motion_physical_raw = model.normalizer.unnormalize(motion_norm).numpy()[0].astype(np.float32)
+    motion_physical_raw = model.normalizer.unnormalize(motion_norm)
+    motion_physical_raw = to_numpy(motion_physical_raw)[0].astype(np.float32)
     motion_physical_final = motion_physical_raw.copy()
 
-    if getattr(args, "post_anchor_trajectory", False):
-        print("📌 post_anchor_trajectory 已开启：将 root X/Z 替换为目标轨迹。")
-        motion_physical_final[:, 4] = traj_physical[:, 0]
-        motion_physical_final[:, 6] = traj_physical[:, 1]
+    if args.post_anchor_trajectory:
+        print("📌 post_anchor_trajectory 已开启：root X/Z 严格替换为目标轨迹。")
+        motion_physical_final = apply_trajectory_anchor(
+            motion_physical_final,
+            traj_physical,
+            strength=1.0,
+        )
+    elif float(args.trajectory_anchor_strength) > 0.0:
+        print(
+            f"📌 soft trajectory anchor 已开启："
+            f"strength={args.trajectory_anchor_strength:.3f}"
+        )
+        motion_physical_final = apply_trajectory_anchor(
+            motion_physical_final,
+            traj_physical,
+            strength=args.trajectory_anchor_strength,
+        )
 
-    if getattr(args, "save_eval_assets", False):
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+
+    if args.save_eval_assets:
         save_eval_assets(
             out_path=args.out,
             motion_raw_physical=motion_physical_raw,
@@ -765,7 +814,6 @@ def main():
             args=args,
         )
     else:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         np.save(args.out, motion_physical_final.astype(np.float32))
         print(f"✅ saved motion: {args.out}, shape={motion_physical_final.shape}")
 
@@ -776,7 +824,7 @@ def main():
         meta_path = out_path.with_name(out_path.stem + "_meta.json")
 
         np.save(traj_path, traj_physical.astype(np.float32))
-        np.save(raw_path, raw_motion_physical.astype(np.float32))
+        np.save(raw_path, motion_physical_raw.astype(np.float32))
 
         meta = {
             "checkpoint": args.checkpoint,
@@ -785,25 +833,39 @@ def main():
             "start_pose": args.start_pose,
             "end_pose": args.end_pose,
             "mid_poses": parse_list(args.mid_poses),
-            "mid_pose_frames": parse_mid_frames(args.mid_pose_frames, len(parse_list(args.mid_poses)), num_frames),
+            "mid_pose_frames": parse_mid_frames(
+                args.mid_pose_frames,
+                len(parse_list(args.mid_poses)),
+                num_frames,
+            ),
             "trajectory": args.trajectory,
             "target_traj": args.target_traj,
+            "target_traj_saved": str(traj_path),
+            "raw_motion_saved": str(raw_path),
             "out": args.out,
             "num_frames": num_frames,
             "fps": args.fps,
             "pose_space": args.pose_space,
             "sampler": args.sampler,
             "use_tto": not args.no_tto,
+            "tto_steps": args.tto_steps,
+            "tto_interval": args.tto_interval,
+            "tto_lr": args.tto_lr,
             "hard_keyframe_project": not args.no_hard_keyframe_project,
             "post_anchor_trajectory": args.post_anchor_trajectory,
+            "trajectory_anchor_strength": args.trajectory_anchor_strength,
+            "beat_guidance_weight": args.beat_guidance_weight,
+            "keep_trajectory_absolute": args.keep_trajectory_absolute,
+            "uniform_trajectory_timing": args.uniform_trajectory_timing,
+            "linear_trajectory": args.linear_trajectory,
         }
 
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        print(f"✅ 已保存 target trajectory: {traj_path}")
-        print(f"✅ 已保存 raw motion: {raw_path}")
-        print(f"✅ 已保存 meta: {meta_path}")
+        print(f"✅ target trajectory: {traj_path}")
+        print(f"✅ raw motion: {raw_path}")
+        print(f"✅ meta: {meta_path}")
 
 
 if __name__ == "__main__":
