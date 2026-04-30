@@ -291,6 +291,7 @@ class DanceDecoder(nn.Module):
         self.null_cond_hidden = nn.Parameter(torch.randn(1, latent_dim))
         
         self.null_trajectory_embed = nn.Parameter(torch.randn(1, 1, latent_dim))
+        self.traj_type_embed = nn.Parameter(torch.randn(1, 1, latent_dim) * 0.02)
 
         self.norm_cond = nn.LayerNorm(latent_dim)
 
@@ -530,21 +531,37 @@ class DanceDecoder(nn.Module):
         null_cond_hidden = self.null_cond_hidden.to(t.dtype)
 
         if trajectory_tokens is not None:
-            null_traj_embed = self.null_trajectory_embed.to(trajectory_tokens.dtype)
+            null_traj_embed = self.null_trajectory_embed.to(
+                device=trajectory_tokens.device,
+                dtype=trajectory_tokens.dtype,
+            ).expand_as(trajectory_tokens)
+
             trajectory_tokens = torch.where(
                 keep_traj_mask_embed,
                 trajectory_tokens,
-                null_traj_embed
+                null_traj_embed,
             )
 
             cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
 
+            # Keep the old modulation path: trajectory can still shape audio memory.
             scale_shift = self.traj_modulate(trajectory_tokens)
             scale, shift = scale_shift.chunk(2, dim=-1)
-            fused_tokens = cond_tokens * (1.0 + scale) + shift
+            fused_audio_tokens = cond_tokens * (1.0 + scale) + shift
+
+            # New independent trajectory memory tokens.
+            traj_memory_tokens = trajectory_tokens + self.traj_type_embed.to(
+                device=trajectory_tokens.device,
+                dtype=trajectory_tokens.dtype,
+            )
 
             t += cond_hidden
-            c = torch.cat((fused_tokens, t_tokens), dim=-2)
+
+            # Memory now contains:
+            # 1) audio tokens modulated by trajectory,
+            # 2) independent trajectory tokens,
+            # 3) diffusion time tokens.
+            c = torch.cat((fused_audio_tokens, traj_memory_tokens, t_tokens), dim=-2)
         else:
             cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
             t += cond_hidden

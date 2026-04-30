@@ -116,6 +116,8 @@ class EDGE:
         mid_keyframe_condition_width=1,
         mid_keyframe_selection="motion_peak",
         beat_guidance_weight=0.0,
+        trajectory_loss_weight=1.0,
+        trajectory_velocity_loss_weight=0.25,
         hard_keyframe_project=False,
         train_stage="full",
         strict_audio_checkpoint=False,
@@ -250,6 +252,8 @@ class EDGE:
             mid_keyframe_selection=mid_keyframe_selection,
             data_fps=30,
             beat_guidance_weight=beat_guidance_weight,
+            trajectory_loss_weight=trajectory_loss_weight,
+            trajectory_velocity_loss_weight=trajectory_velocity_loss_weight,
             hard_keyframe_project=hard_keyframe_project,
         )
         

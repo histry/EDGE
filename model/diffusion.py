@@ -93,6 +93,8 @@ class GaussianDiffusion(nn.Module):
         sync_loss_weight=1.2,
         hard_keyframe_project=False,
         beat_guidance_weight=0.0,
+        trajectory_loss_weight=1.0,
+        trajectory_velocity_loss_weight=0.25,
         force_audio_only_drop=False
     ):
         super().__init__()
@@ -111,6 +113,8 @@ class GaussianDiffusion(nn.Module):
         self.sync_loss_weight = sync_loss_weight
         self.hard_keyframe_project = hard_keyframe_project
         self.beat_guidance_weight = beat_guidance_weight
+        self.trajectory_loss_weight = trajectory_loss_weight
+        self.trajectory_velocity_loss_weight = trajectory_velocity_loss_weight
         self.tto_interval = 50
         self.tto_steps = 1
         self.tto_lr = 0.03
@@ -307,22 +311,39 @@ class GaussianDiffusion(nn.Module):
             traj_velocity_loss = F.mse_loss(root_xz[:, 1:] - root_xz[:, :-1], target_traj[:, 1:] - target_traj[:, :-1])
             loss = loss + 4.0 * traj_loss + 0.5 * traj_velocity_loss
 
-        if self.beat_guidance_weight > 0 and isinstance(cond, dict) and cond.get("audio", None) is not None:
-            audio_feat = cond["audio"].to(device=pred_xstart.device, dtype=pred_xstart.dtype)
-            if audio_feat.shape[1] != pred_xstart.shape[1]:
-                audio_feat = F.interpolate(
-                    audio_feat.transpose(1, 2),
-                    size=pred_xstart.shape[1],
-                    mode="linear",
-                    align_corners=False,
-                ).transpose(1, 2)
+        if self.beat_guidance_weight > 0 and isinstance(cond, dict):
+            onset_cond = cond.get("onset", None)
 
-            if audio_feat.shape[-1] > 768 and pred_xstart.shape[1] > 2:
-                onset = audio_feat[:, 1:, 768].clamp_min(0.0)
-                onset = onset / (onset.amax(dim=1, keepdim=True).clamp_min(1e-6))
+            if onset_cond is not None:
+                onset_curve = onset_cond.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+                if onset_curve.shape[1] != pred_xstart.shape[1]:
+                    onset_curve = F.interpolate(
+                        onset_curve.transpose(1, 2),
+                        size=pred_xstart.shape[1],
+                        mode="linear",
+                        align_corners=False,
+                    ).transpose(1, 2)
+                onset = onset_curve[:, 1:, 0].clamp_min(0.0)
 
-                # Beat guidance should respond to both global body travel and local pose change.
-                # Root velocity captures spatial accents; pose velocity captures limb/body accents.
+            else:
+                # Backward-compatible fallback only.
+                audio_feat = cond.get("audio", None)
+                if audio_feat is None or audio_feat.shape[-1] <= 768 or pred_xstart.shape[1] <= 2:
+                    onset = None
+                else:
+                    audio_feat = audio_feat.to(device=pred_xstart.device, dtype=pred_xstart.dtype)
+                    if audio_feat.shape[1] != pred_xstart.shape[1]:
+                        audio_feat = F.interpolate(
+                            audio_feat.transpose(1, 2),
+                            size=pred_xstart.shape[1],
+                            mode="linear",
+                            align_corners=False,
+                        ).transpose(1, 2)
+                    onset = audio_feat[:, 1:, 768].clamp_min(0.0)
+
+            if onset is not None and pred_xstart.shape[1] > 2:
+                onset = onset / onset.amax(dim=1, keepdim=True).clamp_min(1e-6)
+
                 root_delta = physical_xstart[:, 1:, 4:7] - physical_xstart[:, :-1, 4:7]
                 pose_delta = physical_xstart[:, 1:, 7:] - physical_xstart[:, :-1, 7:]
 
@@ -332,7 +353,6 @@ class GaussianDiffusion(nn.Module):
                 root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
                 pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
 
-                # Root energy is weighted lower to avoid forcing the dancer to travel on every beat.
                 motion_energy = 0.35 * root_energy + 0.65 * pose_energy
                 motion_energy = motion_energy / motion_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
 
@@ -765,6 +785,46 @@ class GaussianDiffusion(nn.Module):
 
         return force_mask, x_start.detach()
 
+    def _trajectory_supervision_loss(self, pred_x0, cond, t):
+        """
+        Supervise generated root X/Z with the trajectory condition in normalized space.
+
+        pred_x0: [B,T,151], normalized model prediction
+        cond["trajectory"]: [B,T,2], normalized target root X/Z
+        """
+        zero = pred_x0.new_tensor(0.0)
+
+        if not isinstance(cond, dict) or cond.get("trajectory", None) is None:
+            return zero
+
+        target_traj = cond["trajectory"].to(device=pred_x0.device, dtype=pred_x0.dtype)
+        if target_traj.shape[1] != pred_x0.shape[1]:
+            target_traj = F.interpolate(
+                target_traj.transpose(1, 2),
+                size=pred_x0.shape[1],
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+
+        target_traj = target_traj[..., :2]
+        pred_root_xz = pred_x0[:, :, [self.root_x_idx, self.root_z_idx]]
+
+        pos_loss = F.mse_loss(pred_root_xz, target_traj, reduction="none").mean(dim=(1, 2))
+
+        if pred_root_xz.shape[1] > 1:
+            pred_vel = pred_root_xz[:, 1:] - pred_root_xz[:, :-1]
+            target_vel = target_traj[:, 1:] - target_traj[:, :-1]
+            vel_loss = F.mse_loss(pred_vel, target_vel, reduction="none").mean(dim=(1, 2))
+        else:
+            vel_loss = pos_loss.new_zeros(pos_loss.shape)
+
+        loss = (
+            float(self.trajectory_loss_weight) * pos_loss
+            + float(self.trajectory_velocity_loss_weight) * vel_loss
+        )
+        loss = loss * extract(self.p2_loss_weight, t, loss.shape)
+        return loss.mean()
+        
     def p_losses(self, x_start, cond, t, current_epoch=None):
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -828,7 +888,15 @@ class GaussianDiffusion(nn.Module):
             )
 
         model_motion_x0 = self.predict_start_from_noise(x_noisy, t, model_out) if self.predict_epsilon else model_out
+        trajectory_loss = self._trajectory_supervision_loss(model_motion_x0, cond_input, t)
         target_motion_x0 = x_start
+        # Trajectory supervision loss.
+        # It supervises generated root X/Z with cond["trajectory"] in normalized space.
+        trajectory_loss = self._trajectory_supervision_loss(
+            model_motion_x0,
+            cond_input,
+            t,
+        )
 
         if model_out.shape[2] == 381:
             target_v = target_motion_x0[:, 1:] - target_motion_x0[:, :-1]
@@ -839,21 +907,21 @@ class GaussianDiffusion(nn.Module):
 
             zero = torch.tensor(0.0, device=x_start.device)
             losses = (
-                1.0 * loss.mean(),
-                3.0 * v_loss.mean(),
-                zero,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                self.keyframe_loss_weight * keyframe_loss,
-                zero,
-                zero,
-                zero,
-                zero,
-                zero,
-                zero,
+                1.0 * loss.mean(),                           # 1. Recon Loss
+                3.0 * v_loss.mean(),                         # 2. Velocity Loss
+                zero,                                        # 3. Contact Loss
+                zero,                                        # 4. FK Loss
+                zero,                                        # 5. Foot Loss
+                zero,                                        # 6. Anti-Freeze Loss
+                zero,                                        # 7. MMR Loss
+                trajectory_loss,                             # 8. Trajectory Loss
+                self.keyframe_loss_weight * keyframe_loss,   # 9. Keyframe Loss
+                zero,                                        # 10. Kinematic Sync Loss
+                zero,                                        # 11. Biomech Loss
+                zero,                                        # 12. Root Turn Loss
+                zero,                                        # 13. Contact Turn Loss
+                zero,                                        # 14. Body Stability Loss
+                zero,                                        # 15. Motion Energy Loss
             )
             return sum(losses), losses
         else:
@@ -928,7 +996,30 @@ class GaussianDiffusion(nn.Module):
             target_xp_global = self.smpl.forward(target_q[:, global_s_idx], target_x[:, global_s_idx])
 
             model_feet = model_xp[:, :, [7, 8, 10, 11], :]
-            
+            # Foot sliding supervision with target contact mask.
+            # Use target contact instead of predicted contact to avoid trivial "no-contact" escape.
+            if chunk_len > 1:
+                target_contact_sub = target_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
+                target_contact_pair = target_contact_sub[:, 1:] * target_contact_sub[:, :-1]
+
+                model_feet_delta = model_feet[:, 1:] - model_feet[:, :-1]
+                model_feet_xz_speed = model_feet_delta[..., [0, 2]].pow(2).sum(dim=-1)
+
+                foot_slide_loss = (
+                    model_feet_xz_speed * target_contact_pair
+                ).sum() / target_contact_pair.sum().clamp_min(1e-6)
+
+                # Optional: keep foot height near target during contact.
+                model_feet_y = model_feet[:, :, :, 1]
+                target_feet = target_xp[:, :, [7, 8, 10, 11], :]
+                target_feet_y = target_feet[:, :, :, 1]
+                foot_height_loss = (
+                    (model_feet_y - target_feet_y).pow(2) * target_contact_sub
+                ).sum() / target_contact_sub.sum().clamp_min(1e-6)
+
+                foot_loss = foot_slide_loss + 0.25 * foot_height_loss
+            else:
+                foot_loss = model_feet.new_tensor(0.0)
             pelvis_global = model_xp_global[:, :, 0, :]
             spine_global = model_xp_global[:, :, 6, :]
             neck_global = model_xp_global[:, :, 12, :]
@@ -1029,23 +1120,28 @@ class GaussianDiffusion(nn.Module):
 
             model_contact_sub = model_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
             target_contact_sub = target_contact_phys[:, sub_s_idx].clamp(0.0, 1.0)
-            static_idx = ((model_contact_sub > 0.5) | (target_contact_sub > 0.5)).detach()
-            
-            static_continuous = static_idx[:, :-1, :] & static_idx[:, 1:, :]
-            
-            foot_dist_vec = model_feet[:, 1:] - model_feet[:, :-1]
-            foot_dist_norm = safe_norm(foot_dist_vec, dim=-1)
+
+            # Use target contact as the supervision mask.
+            # This avoids the trivial escape where the model predicts "no contact"
+            # to reduce foot sliding penalty.
+            target_static_idx = (target_contact_sub > 0.5).detach()
+            static_continuous = target_static_idx[:, :-1, :] & target_static_idx[:, 1:, :]
+
+            # Foot sliding should mainly penalize horizontal movement, not vertical lifting.
+            # model_feet: [B, T_sub, 4, 3]
+            foot_dist_vec_xz = model_feet[:, 1:, :, [0, 2]] - model_feet[:, :-1, :, [0, 2]]
+            foot_dist_norm = safe_norm(foot_dist_vec_xz, dim=-1)
+
+            # 0.01 is a small tolerance in physical space.
             slide_penalty = F.relu(foot_dist_norm - 0.01)
-            
             static_weight = static_continuous.float()
+
             foot_loss_raw = slide_penalty * static_weight
-            
             static_weight_sum = static_weight.sum(dim=(1, 2))
-            valid_mask = (static_weight_sum > 0).float() 
-            
+            valid_mask = (static_weight_sum > 0).float()
+
             foot_loss = foot_loss_raw.sum(dim=(1, 2)) / static_weight_sum.clamp_min(1.0)
-            foot_loss = foot_loss * valid_mask           
-            
+            foot_loss = foot_loss * valid_mask
             foot_loss = foot_loss * extract(self.p2_loss_weight, t_sub, foot_loss.shape)
 
             model_extremities = model_xp[:, :, [20, 21], :] 
@@ -1202,8 +1298,8 @@ class GaussianDiffusion(nn.Module):
             1.0 * fk_loss.mean(),     
             self.foot_loss_weight * physics_weight * foot_loss.mean(),  
             0.01 * physics_weight * anti_freeze_loss.mean(),  
-            mmr_weight * mmr_loss,   
-            1.0 * traj_loss,
+            self.mmr_loss_weight * mmr_loss,
+            trajectory_loss,
             self.keyframe_loss_weight * keyframe_loss,
             self.sync_loss_weight * physics_weight * sync_loss.mean(),
             0.1 * physics_weight * scurve_loss.mean() + 0.1 * physics_weight * hunchback_loss.mean() + 0.1 * physics_weight * asymmetry_loss.mean(),

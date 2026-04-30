@@ -13,12 +13,137 @@ from EDGE import EDGE
 from data.audio_extraction.baseline_features import extract as baseline_extract
 from data.audio_extraction.jukebox_features import extract as juke_extract
 from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
-from dataset.quaternion import ax_from_6v
+from dataset.quaternion import ax_from_6v, ax_to_6v
+from dataset.preprocess import vectorize_many
 from vis import SMPLSkeleton, skeleton_render
 
 
 ROOT_X_IDX = 4
 ROOT_Z_IDX = 6
+
+
+def pose151_from_pos_q(pos, q, frame=0, contact=None):
+    """
+    Convert one SMPL frame to the repository's 151-D motion representation:
+        contacts[4] + root_pos[3] + local_rot_6d[24*6] = 151
+
+    pos: [T,3] or [3]
+    q:   [T,72] / [T,24,3] or [72] / [24,3]
+    contact: optional [T,4] or [4]. If missing, set to zeros.
+    """
+    pos = np.asarray(pos, dtype=np.float32)
+    q = np.asarray(q, dtype=np.float32)
+
+    if pos.ndim == 1:
+        pos_f = pos.reshape(1, 1, 3)
+    else:
+        frame = int(np.clip(frame, 0, len(pos) - 1))
+        pos_f = pos[frame].reshape(1, 1, 3)
+
+    if q.ndim == 1:
+        q_f = q.reshape(1, 1, 24, 3)
+    elif q.ndim == 2 and q.shape[-1] == 3:
+        q_f = q.reshape(1, 1, 24, 3)
+    elif q.ndim == 2 and q.shape[-1] == 72:
+        frame = int(np.clip(frame, 0, len(q) - 1))
+        q_f = q[frame].reshape(1, 1, 24, 3)
+    elif q.ndim == 3:
+        frame = int(np.clip(frame, 0, q.shape[0] - 1))
+        q_f = q[frame].reshape(1, 1, 24, 3)
+    else:
+        raise ValueError(f"Unsupported q shape: {q.shape}")
+
+    if contact is None:
+        contact_f = np.zeros((1, 1, 4), dtype=np.float32)
+    else:
+        contact = np.asarray(contact, dtype=np.float32)
+        if contact.ndim == 1:
+            contact_f = contact.reshape(1, 1, 4)
+        else:
+            frame = int(np.clip(frame, 0, len(contact) - 1))
+            contact_f = contact[frame].reshape(1, 1, 4)
+
+    pos_t = torch.from_numpy(pos_f).float()
+    q_t = torch.from_numpy(q_f).float()
+    contact_t = torch.from_numpy(contact_f).float()
+
+    q_6v = ax_to_6v(q_t)
+    pose_151 = vectorize_many([contact_t, pos_t, q_6v]).view(151).numpy()
+    return pose_151.astype(np.float32)
+
+
+def load_keyframe_any(path, normalizer, keyframe_space, frame=0):
+    """
+    Supported:
+    - .npy with shape [151]
+    - .npz containing pose_151 / smpl_151
+    - .npz containing pos and q
+    - .pkl containing pos and q
+
+    Image files are intentionally rejected until a 2D-to-3D lifting module is added.
+    """
+    path = str(path)
+    image_suffixes = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+    if path.lower().endswith(image_suffixes):
+        raise ValueError(
+            f"Keyframe image input is not supported yet: {path}. "
+            "Please convert the skeleton image to a 151-D SMPL keyframe first. "
+            "Recommended pipeline: 2D pose estimation -> 3D lifting/SMPL fitting -> pose_151.npy."
+        )
+
+    suffix = Path(path).suffix.lower()
+
+    if suffix == ".npy":
+        pose = np.asarray(np.load(path), dtype=np.float32).reshape(-1)
+
+    elif suffix == ".npz":
+        data = np.load(path, allow_pickle=True)
+        if "pose_151" in data:
+            pose = np.asarray(data["pose_151"], dtype=np.float32).reshape(-1)
+        elif "smpl_151" in data:
+            pose = np.asarray(data["smpl_151"], dtype=np.float32).reshape(-1)
+        elif "pos" in data and "q" in data:
+            contact = data["contact"] if "contact" in data else None
+            pose = pose151_from_pos_q(data["pos"], data["q"], frame=frame, contact=contact)
+        else:
+            raise ValueError(
+                f"{path} must contain pose_151/smpl_151 or pos+q. "
+                f"Found keys: {list(data.keys())}"
+            )
+
+    elif suffix == ".pkl":
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        if "pose_151" in data:
+            pose = np.asarray(data["pose_151"], dtype=np.float32).reshape(-1)
+        elif "pos" in data and "q" in data:
+            pose = pose151_from_pos_q(
+                data["pos"],
+                data["q"],
+                frame=frame,
+                contact=data.get("contact", None),
+            )
+        else:
+            raise ValueError(f"{path} must contain pose_151 or pos+q.")
+
+    else:
+        raise ValueError(f"Unsupported keyframe file type: {suffix}")
+
+    if pose.shape[0] != 151:
+        raise ValueError(f"Expected 151-D keyframe from {path}, got shape {pose.shape}")
+
+    if keyframe_space == "normalized":
+        return pose.astype(np.float32)
+
+    if keyframe_space == "physical":
+        if normalizer is None:
+            raise ValueError("--keyframe_space physical requires checkpoint normalizer")
+        pose_t = torch.from_numpy(pose).float().view(1, 1, 151)
+        pose_norm = normalizer.normalize(pose_t).view(151).cpu().numpy()
+        return pose_norm.astype(np.float32)
+
+    raise ValueError(f"Unknown keyframe_space: {keyframe_space}")
 
 
 def parse_control_points(text):
@@ -116,37 +241,13 @@ def normalize_trajectory(traj_physical, normalizer):
     return traj.astype(np.float32)
 
 
-def load_keyframe(path, normalizer, keyframe_space):
-    """
-    返回 normalized 151D pose，因为 diffusion constraint value 应该和 x_start 同空间。
-
-    当前版本只接受已经转换好的 151D .npy keyframe。
-    2D 骨架图/图片需要先经过 2D pose estimation + 3D lifting/SMPL fitting。
-    """
-    image_suffixes = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-    if str(path).lower().endswith(image_suffixes):
-        raise ValueError(
-            f"Keyframe image input is not supported yet: {path}. "
-            "Please first convert the skeleton image to a 151-D SMPL keyframe .npy. "
-            "Current supported format: shape [151] or compatible .npy."
-        )
-
-    pose = np.asarray(np.load(path), dtype=np.float32).reshape(-1)
-
-    if pose.shape[0] != 151:
-        raise ValueError(f"Expected 151-D keyframe from {path}, got shape {pose.shape}")
-
-    if keyframe_space == "normalized":
-        return pose.astype(np.float32)
-
-    if keyframe_space == "physical":
-        if normalizer is None:
-            raise ValueError("--keyframe_space physical requires checkpoint normalizer")
-        pose_t = torch.from_numpy(pose).float().view(1, 1, 151)
-        pose_norm = normalizer.normalize(pose_t).view(151).cpu().numpy()
-        return pose_norm.astype(np.float32)
-
-    raise ValueError(f"Unknown keyframe_space: {keyframe_space}")
+def load_keyframe(path, normalizer, keyframe_space, frame=0):
+    return load_keyframe_any(
+        path=path,
+        normalizer=normalizer,
+        keyframe_space=keyframe_space,
+        frame=frame,
+    )
 
 def keyframe_window(frame, seq_len, width):
     """
@@ -214,8 +315,19 @@ def build_keyframe_constraint(args, seq_len, normalizer, traj_norm=None):
         return None
 
     for frame, path in keyframes:
-        pose = load_keyframe(path, normalizer, args.keyframe_space)
+        if frame == 0:
+            source_frame = args.start_frame
+        elif frame == seq_len - 1:
+            source_frame = args.end_frame if args.end_frame >= 0 else frame
+        else:
+            source_frame = frame
 
+        pose = load_keyframe(
+            path,
+            normalizer,
+            args.keyframe_space,
+            frame=source_frame,
+        )
         for target_frame in keyframe_window(frame, seq_len, args.keyframe_width):
             pose_for_frame = pose.copy()
 
@@ -263,6 +375,30 @@ def extract_audio_features(args, seq_len):
     raw_feat, _ = feature_map[args.feature_type](args.music)
     return align_audio_features(raw_feat, seq_len=seq_len, expected_dim=args.audio_dim)
 
+def extract_onset_condition(music_path, seq_len, fps=30):
+    """
+    Extract a normalized onset-strength curve as explicit beat/rhythm condition.
+    Return shape: [seq_len, 1]
+    """
+    y, sr = librosa.load(music_path, sr=None, mono=True)
+    hop_length = max(1, int(sr / fps))
+
+    onset_env = librosa.onset.onset_strength(
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+    ).astype(np.float32)
+
+    if len(onset_env) < 2:
+        onset_env = np.zeros((seq_len,), dtype=np.float32)
+    else:
+        old_x = np.linspace(0.0, 1.0, len(onset_env))
+        new_x = np.linspace(0.0, 1.0, seq_len)
+        onset_env = np.interp(new_x, old_x, onset_env).astype(np.float32)
+
+    onset_env = onset_env - onset_env.min()
+    onset_env = onset_env / (onset_env.max() + 1e-6)
+    return onset_env.reshape(seq_len, 1).astype(np.float32)
 
 def motion_to_joints(motion_physical, device):
     """
@@ -499,7 +635,11 @@ def apply_foot_lock_postprocess(
 
 def main():
     parser = argparse.ArgumentParser("Controlled EDGE inference")
-
+    
+    parser.add_argument("--start_frame", type=int, default=0)
+    parser.add_argument("--end_frame", type=int, default=-1)
+    parser.add_argument("--mid_pose_source_frames", default="")
+    
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--music", required=True)
     parser.add_argument(
@@ -573,8 +713,17 @@ def main():
         default=0.25,
         help="Soft trajectory restoration strength after foot lock. Use small value to avoid reintroducing sliding.",
     )
-    parser.add_argument("--postprocess_trajectory", action="store_true")
-    parser.add_argument("--postprocess_strength", type=float, default=1.0)
+    parser.add_argument(
+        "--postprocess_trajectory",
+        action="store_true",
+        help="System-level trajectory anchoring. Do not use this for raw model evaluation.",
+    )
+    parser.add_argument(
+        "--postprocess_strength",
+        type=float,
+        default=0.0,
+        help="0 disables trajectory anchoring. Use 1.0 only for strict system-control demo.",
+    )
 
     parser.add_argument("--out_dir", default="output/controlled")
     parser.add_argument("--out_name", default="controlled")
@@ -610,7 +759,13 @@ def main():
     traj_physical = load_target_trajectory(args, args.frames)
     traj_norm = None
 
-    cond = {"audio": audio}
+    onset_np = extract_onset_condition(args.music, args.frames, fps=30)
+    onset = torch.from_numpy(onset_np).float().unsqueeze(0).to(model.accelerator.device)
+
+    cond = {
+        "audio": audio,
+        "onset": onset,
+    }
 
     if traj_physical is not None:
         traj_norm = normalize_trajectory(traj_physical, normalizer)
@@ -667,6 +822,12 @@ def main():
 
     final_motion = sample_physical.copy()
     postprocess_steps = []
+
+    if args.postprocess_trajectory and args.postprocess_strength >= 0.999:
+        print(
+            "⚠️ postprocess_strength=1.0 will directly anchor root X/Z to the target trajectory. "
+            "Report this as final_system_motion, not raw model trajectory-following ability."
+        )
 
     if args.postprocess_trajectory and traj_physical is not None:
         final_motion = apply_trajectory_postprocess(

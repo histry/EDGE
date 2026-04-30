@@ -127,6 +127,18 @@ def parse_train_opt():
         help="number of start/end frames exposed as known keyframes during inpainting training",
     )
     parser.add_argument(
+        "--trajectory_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for supervised root X/Z trajectory position loss.",
+    )
+    parser.add_argument(
+        "--trajectory_velocity_loss_weight",
+        type=float,
+        default=0.25,
+        help="Weight for supervised root X/Z trajectory velocity loss.",
+    )
+    parser.add_argument(
         "--keyframe_loss_weight",
         type=float,
         default=2.0,

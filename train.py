@@ -31,6 +31,8 @@ def train(opt):
         hard_keyframe_project=opt.hard_keyframe_project,
         train_stage=opt.train_stage,
         strict_audio_checkpoint=opt.strict_audio_checkpoint,
+        trajectory_loss_weight=opt.trajectory_loss_weight,
+        trajectory_velocity_loss_weight=opt.trajectory_velocity_loss_weight,
     )
     model.train_loop(opt)
 
