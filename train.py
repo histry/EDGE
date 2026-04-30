@@ -30,6 +30,7 @@ def train(opt):
         beat_guidance_weight=opt.beat_guidance_weight,
         hard_keyframe_project=opt.hard_keyframe_project,
         train_stage=opt.train_stage,
+        strict_audio_checkpoint=opt.strict_audio_checkpoint,
     )
     model.train_loop(opt)
 

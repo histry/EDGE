@@ -305,7 +305,19 @@ def prefixed(metrics, prefix):
     return {f"{prefix}{key}": value for key, value in metrics.items()}
 
 
-def eval_raw_post_trajectory(args, primary_motion):
+def eval_raw_post_system_metrics(args, primary_motion):
+    """
+    Compare raw model output and final system output.
+
+    raw_*:
+        metrics on the model output before system-level postprocessing.
+
+    post_*:
+        metrics on the final displayed motion after trajectory anchoring,
+        foot lock, smoothing, or other postprocess steps.
+
+    This prevents postprocessing gains from being mistaken as pure model ability.
+    """
     raw_path = getattr(args, "raw_motion", "")
     post_path = getattr(args, "post_motion", "")
     if not raw_path and not post_path:
@@ -314,14 +326,23 @@ def eval_raw_post_trajectory(args, primary_motion):
     raw_motion = load_motion(raw_path) if raw_path else primary_motion
     post_motion = load_motion(post_path) if post_path else primary_motion
 
-    raw_metrics = eval_trajectory(raw_motion, args)
-    post_metrics = eval_trajectory(post_motion, args)
+    def evaluate_one(motion):
+        joints = motion_to_joints(motion, device=args.device)
+        metrics = {}
+        metrics.update(eval_trajectory(motion, args))
+        metrics.update(eval_foot_sliding(motion, joints, args))
+        metrics.update(eval_beatalign(joints, args))
+        return metrics
+
+    raw_metrics = evaluate_one(raw_motion)
+    post_metrics = evaluate_one(post_motion)
 
     out = {
-        "trajectory_eval_note": (
+        "raw_post_eval_note": (
             "raw_* metrics evaluate the model output before system postprocessing; "
             "post_* metrics evaluate the final displayed system output after postprocessing. "
-            "If post trajectory error is near zero but raw error is not, trajectory accuracy mainly comes from postprocessing."
+            "If post trajectory error improves while raw does not, the gain comes from system postprocessing. "
+            "If post foot_slide_rate worsens, the postprocess improves path following at the cost of physical plausibility."
         ),
         "raw_motion_path": os.path.abspath(raw_path) if raw_path else os.path.abspath(args.motion),
         "post_motion_path": os.path.abspath(post_path) if post_path else os.path.abspath(args.motion),
@@ -330,12 +351,12 @@ def eval_raw_post_trajectory(args, primary_motion):
     out.update(prefixed(raw_metrics, "raw_"))
     out.update(prefixed(post_metrics, "post_"))
 
-    if raw_metrics and post_metrics:
-        for key in sorted(set(raw_metrics) & set(post_metrics)):
-            raw_value = raw_metrics[key]
-            post_value = post_metrics[key]
-            if isinstance(raw_value, float) and isinstance(post_value, float):
-                out[f"post_minus_raw_{key}"] = post_value - raw_value
+    for key in sorted(set(raw_metrics) & set(post_metrics)):
+        raw_value = raw_metrics[key]
+        post_value = post_metrics[key]
+        if isinstance(raw_value, (float, int)) and isinstance(post_value, (float, int)):
+            if math.isfinite(float(raw_value)) and math.isfinite(float(post_value)):
+                out[f"post_minus_raw_{key}"] = float(post_value) - float(raw_value)
 
     return out
 
@@ -547,7 +568,7 @@ def main():
     keyframe_summary, keyframe_rows = eval_keyframes(motion, args, normalizer=normalizer)
     metrics.update(keyframe_summary)
     metrics.update(eval_trajectory(motion, args))
-    metrics.update(eval_raw_post_trajectory(args, motion))
+    metrics.update(eval_raw_post_system_metrics(args, motion))
     metrics.update(eval_foot_sliding(motion, joints, args))
     metrics.update(eval_beatalign(joints, args))
 

@@ -118,6 +118,7 @@ class EDGE:
         beat_guidance_weight=0.0,
         hard_keyframe_project=False,
         train_stage="full",
+        strict_audio_checkpoint=False,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
@@ -295,7 +296,11 @@ class EDGE:
                 log_prefix=f"checkpoint:{os.path.basename(checkpoint_path)}",
             )
             self.model.load_state_dict(adapted_state_dict, strict=True)
-
+            self._check_audio_checkpoint_compatibility(
+                adapt_report=adapt_report,
+                strict_audio_checkpoint=strict_audio_checkpoint,
+                train_stage=train_stage,
+            )
             # 同步 EMA master_model，避免续训时 EMA 从随机初始化开始
             unwrapped_loaded_model = self.accelerator.unwrap_model(self.model)
             if EMA and isinstance(checkpoint, dict) and "ema_state_dict" in checkpoint:
@@ -308,6 +313,13 @@ class EDGE:
                     ema_adapted_state_dict,
                     strict=True,
                 )
+
+                self._check_audio_checkpoint_compatibility(
+                    adapt_report=ema_adapt_report,
+                    strict_audio_checkpoint=False,
+                    train_stage=train_stage,
+                )
+
                 if self.accelerator.is_main_process:
                     for line in summarize_adapt_report(ema_adapt_report):
                         print(f"⚠️ EMA {line}")
@@ -325,7 +337,86 @@ class EDGE:
     def _set_requires_grad(module, enabled):
         for parameter in module.parameters():
             parameter.requires_grad = enabled
+    
+    @staticmethod
+    def _check_audio_checkpoint_compatibility(
+        adapt_report,
+        strict_audio_checkpoint=False,
+        train_stage="full",
+    ):
+        """
+        Check whether audio-related modules were skipped or newly initialized
+        during checkpoint loading.
 
+        Why this matters:
+        - If current audio_dim=803 but checkpoint cond_projection.weight expects
+          another input dimension, adapt_checkpoint_state_dict will skip that
+          tensor and keep the newly initialized layer.
+        - In that case, we must not claim that the audio encoder/projection was
+          fully inherited from the pretrained checkpoint.
+        - This is especially dangerous in stage1/stage2, because those stages
+          may freeze audio-related modules. Freezing newly initialized audio
+          weights would preserve a random audio mapping.
+        """
+        audio_markers = (
+            "cond_projection",
+            "cond_encoder",
+            "non_attn_cond_projection",
+            "null_cond_embed",
+            "null_cond_hidden",
+        )
+
+        def normalize_key(key):
+            key = str(key)
+            if key.startswith("module."):
+                key = key[len("module."):]
+            return key
+
+        def is_audio_key(key):
+            key = normalize_key(key)
+            return any(marker in key for marker in audio_markers)
+
+        skipped_audio = []
+        for item in adapt_report.get("skipped_shape", []):
+            # skipped_shape item format:
+            # (key, checkpoint_shape, model_shape)
+            key = item[0] if isinstance(item, (list, tuple)) and item else str(item)
+            if is_audio_key(key):
+                skipped_audio.append(item)
+
+        kept_audio = [
+            key for key in adapt_report.get("kept_other", [])
+            if is_audio_key(key)
+        ]
+
+        if not skipped_audio and not kept_audio:
+            return
+
+        message = (
+            "\n⚠️ Audio checkpoint compatibility warning:\n"
+            f"  train_stage={train_stage}\n"
+            f"  skipped_audio_shape_keys={skipped_audio[:8]}\n"
+            f"  newly_initialized_audio_keys={kept_audio[:8]}\n"
+            "  说明：部分音频条件分支没有从 checkpoint 成功加载，"
+            "不能声称完整继承预训练音乐编码能力。\n"
+        )
+
+        print(message)
+
+        if train_stage in ["stage1", "stage2"]:
+            print(
+                "⚠️ 当前 train_stage 会冻结或部分冻结音频分支。"
+                "如果这些音频层是新初始化的，冻结它们会保留随机音频映射。"
+                "建议：1) 使用匹配 audio_dim 的 checkpoint；"
+                "2) 或改用 train_stage=full；"
+                "3) 或明确汇报音乐部分只是弱节奏引导。"
+            )
+
+        if strict_audio_checkpoint:
+            raise RuntimeError(
+                message
+                + "\n由于启用了 --strict_audio_checkpoint，训练已停止。"
+            )
     def _apply_stage_freezing(self, model, train_stage):
         """
         Training stages:
@@ -464,7 +555,6 @@ class EDGE:
     def train_loop(self, opt):
         data_path = opt.data_path
         is_dunhuang = "dunhuang" in data_path.lower()
-        
         if is_dunhuang:
             print(f"\n🪷 检测到敦煌数据集路径 ({data_path})，启动中华古典舞纯视觉微调模式！")
             if opt.audio_pairing_mode == "none":
@@ -476,13 +566,16 @@ class EDGE:
             else:
                 train_audio_sample_mode = "random"
                 val_audio_sample_mode = getattr(opt, "dunhuang_val_audio_mode", "best")
+            use_traj_cond = not getattr(opt, "disable_traj_cond", False)
+            if self.accelerator.is_main_process:
+                print(f"🧭 trajectory condition enabled: {use_traj_cond}")
             train_dataset = DunhuangDataset(
                 data_path=data_path,
                 train=True,
                 seq_len=opt.seq_len,
                 audio_dim=self.audio_dim,
                 normalizer=self.normalizer,
-                return_traj=True,
+                return_traj=use_traj_cond,
                 split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
                 split_seed=getattr(opt, "dunhuang_split_seed", 42),
                 audio_sample_mode=train_audio_sample_mode,
@@ -505,7 +598,7 @@ class EDGE:
                 seq_len=opt.seq_len,
                 audio_dim=self.audio_dim,
                 normalizer=self.normalizer,
-                return_traj=True,
+                return_traj=use_traj_cond,
                 split_ratio=getattr(opt, "dunhuang_split_ratio", 0.9),
                 split_seed=getattr(opt, "dunhuang_split_seed", 42),
                 audio_sample_mode=val_audio_sample_mode,
@@ -535,7 +628,7 @@ class EDGE:
                 backup_path=os.path.join(actual_data_path, "backup"),
                 feature_type=self.feature_type,
                 seq_len=opt.seq_len,
-                return_traj=True,
+                return_traj=use_traj_cond,
             )
             test_dataset = AISTPPDataset(
                 data_path=actual_data_path,
@@ -544,7 +637,7 @@ class EDGE:
                 feature_type=self.feature_type,
                 seq_len=opt.seq_len,
                 normalizer=train_dataset.normalizer,
-                return_traj=True,
+                return_traj=use_traj_cond,
             )
             self.normalizer = train_dataset.normalizer
             self.diffusion.normalizer = self.normalizer

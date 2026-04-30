@@ -200,6 +200,14 @@ def parse_train_opt():
         default=0.3,
         help="Probability of applying geometric trajectory augmentation to Dunhuang motion windows.",
     )
+    parser.add_argument(
+        "--disable_traj_cond",
+        action="store_true",
+        help=(
+            "Disable trajectory condition during training. "
+            "Use this for clean ablation: base/keyframe-only model without X/Z trajectory conditioning."
+        ),
+    )
 
     parser.add_argument(
         "--traj_aug_scale_min",
@@ -227,6 +235,14 @@ def parse_train_opt():
         default="full",
         choices=["full", "stage1", "stage2"],
         help="stage-wise training shortcut",
+    )
+    parser.add_argument(
+        "--strict_audio_checkpoint",
+        action="store_true",
+        help=(
+            "Raise an error if audio-related checkpoint weights are missing or shape-mismatched. "
+            "Use this when you want to claim inherited audio prior."
+        ),
     )
     # 🧹 清理：目前网络已默认支持通过传入 Trajectory 字典键名实现动态分支控制
     # 该开关已废弃，暂时注释掉避免与外部传参逻辑冲突
