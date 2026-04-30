@@ -107,9 +107,18 @@ class GaussianDiffusion(nn.Module):
         trajectory_velocity_loss_weight=0.25,
         force_audio_only_drop=False,
         disable_unpaired_audio_condition=True,
+        tto_trajectory_loss_weight=4.0,
+        tto_trajectory_velocity_loss_weight=0.5,
+        tto_root_acc_loss_weight=0.05,
+        tto_foot_loss_weight=0.25,
     ):
         super().__init__()
         self.disable_unpaired_audio_condition = bool(disable_unpaired_audio_condition)
+
+        self.tto_trajectory_loss_weight = float(tto_trajectory_loss_weight)
+        self.tto_trajectory_velocity_loss_weight = float(tto_trajectory_velocity_loss_weight)
+        self.tto_root_acc_loss_weight = float(tto_root_acc_loss_weight)
+        self.tto_foot_loss_weight = float(tto_foot_loss_weight)
 
         self.horizon = horizon
         self.transition_dim = repr_dim
@@ -462,6 +471,21 @@ class GaussianDiffusion(nn.Module):
                     start = max(0, frame - width)
                     end = min(s, frame + width + 1)
                     force_mask[batch_idx, start:end, 0] = 1.0
+
+        # If trajectory is provided, root X/Z should be controlled by the
+        # trajectory branch rather than by image-derived keyframes. This avoids
+        # conflicts between pose constraints and path constraints.
+        if (
+            x_start.shape[-1] == 151
+            and isinstance(cond, dict)
+            and cond.get("trajectory", None) is not None
+        ):
+            feature_mask = force_mask.expand(-1, -1, x_start.shape[-1]).clone()
+            feature_mask[..., self.root_x_idx] = 0.0
+            feature_mask[..., self.root_z_idx] = 0.0
+
+            force_value = x_start * feature_mask
+            return {"mask": feature_mask, "value": force_value}
 
         force_value = x_start * force_mask
         return {"mask": force_mask, "value": force_value}
@@ -1261,8 +1285,8 @@ class GaussianDiffusion(nn.Module):
 
             loss = (
                 loss
-                + float(self.trajectory_loss_weight) * traj_loss
-                + float(self.trajectory_velocity_loss_weight) * traj_velocity_loss
+                + float(self.tto_trajectory_loss_weight) * traj_loss
+                + float(self.tto_trajectory_velocity_loss_weight) * traj_velocity_loss
             )
 
         if self.beat_guidance_weight > 0 and isinstance(cond, dict):
@@ -1319,13 +1343,13 @@ class GaussianDiffusion(nn.Module):
 
         if root_xz.shape[1] > 2:
             root_acc = root_xz[:, 2:] - 2.0 * root_xz[:, 1:-1] + root_xz[:, :-2]
-            loss = loss + 0.05 * root_acc.pow(2).mean()
+            loss = loss + float(self.tto_root_acc_loss_weight) * root_acc.pow(2).mean()
 
         if pred_xstart.shape[-1] == 151:
             # During TTO there is no ground-truth target motion, so use predicted
             # contacts / fallback contact threshold only.
             foot_loss = self._foot_sliding_loss(pred_xstart)
-            loss = loss + 0.25 * foot_loss
+            loss = loss + float(self.tto_foot_loss_weight) * foot_loss
 
         return loss
 

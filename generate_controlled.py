@@ -495,6 +495,11 @@ def save_eval_assets(
         "tto_steps": int(getattr(args, "tto_steps", 1)),
         "tto_interval": int(getattr(args, "tto_interval", 50)),
         "tto_lr": float(getattr(args, "tto_lr", 0.03)),
+        "tto_contact_threshold": float(getattr(args, "tto_contact_threshold", 0.65)),
+        "tto_trajectory_loss_weight": float(getattr(args, "tto_trajectory_loss_weight", 4.0)),
+        "tto_trajectory_velocity_loss_weight": float(getattr(args, "tto_trajectory_velocity_loss_weight", 0.5)),
+        "tto_root_acc_loss_weight": float(getattr(args, "tto_root_acc_loss_weight", 0.05)),
+        "tto_foot_loss_weight": float(getattr(args, "tto_foot_loss_weight", 0.25)),
         "eval_command": " ".join(eval_cmd),
         "trajectory_control_mode": trajectory_control_mode,
         "report_warning": (
@@ -669,6 +674,30 @@ def build_arg_parser():
         default=0.65,
         help="TTO 中判断脚接触通道为接触的阈值。",
     )
+    parser.add_argument(
+        "--tto_trajectory_loss_weight",
+        type=float,
+        default=4.0,
+        help="TTO 中轨迹位置误差权重；只影响推理阶段优化，不影响训练 loss。",
+    )
+    parser.add_argument(
+        "--tto_trajectory_velocity_loss_weight",
+        type=float,
+        default=0.5,
+        help="TTO 中轨迹速度误差权重；用于约束沿轨迹的速度变化。",
+    )
+    parser.add_argument(
+        "--tto_root_acc_loss_weight",
+        type=float,
+        default=0.05,
+        help="TTO 中 root X/Z 加速度平滑权重；过大可能削弱急转弯轨迹。",
+    )
+    parser.add_argument(
+        "--tto_foot_loss_weight",
+        type=float,
+        default=0.25,
+        help="TTO 中脚滑惩罚权重；过大可能牺牲轨迹贴合。",
+    )
 
     parser.add_argument(
         "--save_controls",
@@ -704,13 +733,21 @@ def main():
     model.diffusion.tto_interval = int(args.tto_interval)
     model.diffusion.tto_lr = float(args.tto_lr)
     model.diffusion.tto_contact_threshold = float(args.tto_contact_threshold)
+    model.diffusion.tto_trajectory_loss_weight = float(args.tto_trajectory_loss_weight)
+    model.diffusion.tto_trajectory_velocity_loss_weight = float(args.tto_trajectory_velocity_loss_weight)
+    model.diffusion.tto_root_acc_loss_weight = float(args.tto_root_acc_loss_weight)
+    model.diffusion.tto_foot_loss_weight = float(args.tto_foot_loss_weight)
 
     print(
         "🧪 TTO config: "
         f"steps={model.diffusion.tto_steps}, "
         f"interval={model.diffusion.tto_interval}, "
         f"lr={model.diffusion.tto_lr}, "
-        f"contact_threshold={model.diffusion.tto_contact_threshold}"
+        f"contact_threshold={model.diffusion.tto_contact_threshold}, "
+        f"traj_w={model.diffusion.tto_trajectory_loss_weight}, "
+        f"traj_vel_w={model.diffusion.tto_trajectory_velocity_loss_weight}, "
+        f"root_acc_w={model.diffusion.tto_root_acc_loss_weight}, "
+        f"foot_w={model.diffusion.tto_foot_loss_weight}"
     )
 
     device = model.accelerator.device
@@ -869,6 +906,11 @@ def main():
             "tto_steps": args.tto_steps,
             "tto_interval": args.tto_interval,
             "tto_lr": args.tto_lr,
+            "tto_contact_threshold": args.tto_contact_threshold,
+            "tto_trajectory_loss_weight": args.tto_trajectory_loss_weight,
+            "tto_trajectory_velocity_loss_weight": args.tto_trajectory_velocity_loss_weight,
+            "tto_root_acc_loss_weight": args.tto_root_acc_loss_weight,
+            "tto_foot_loss_weight": args.tto_foot_loss_weight,
             "hard_keyframe_project": not args.no_hard_keyframe_project,
             "post_anchor_trajectory": args.post_anchor_trajectory,
             "trajectory_anchor_strength": args.trajectory_anchor_strength,

@@ -123,7 +123,20 @@ class AISTPPDataset(Dataset):
                     
             feature = torch.from_numpy(feature_np).float()
 
-        cond = {"audio": feature}
+        # AIST++ slices are true audio-motion pairs, so mark them as paired.
+        # This keeps GaussianDiffusion.disable_unpaired_audio_condition compatible
+        # with both AIST++ and Dunhuang proxy/no-audio modes.
+        if feature.shape[-1] > 768:
+            onset = feature[:, 768:769].clamp_min(0.0)
+            onset = onset / onset.amax().clamp_min(1e-6)
+        else:
+            onset = torch.zeros((self.seq_len, 1), dtype=torch.float32)
+
+        cond = {
+            "audio": feature,
+            "audio_paired": torch.tensor(1.0, dtype=torch.float32),
+            "onset": onset,
+        }
 
         if self.return_traj:
             # pose is already normalized; root X/Z are dimensions 4 and 6.
@@ -380,8 +393,12 @@ class DunhuangDataset(Dataset):
                 try:
                     record = np.load(rag_file, allow_pickle=True).item()
                     audio_feat = record.get("audio_feat", None)
+                    audio_feat = self._validate_audio_feature(
+                        audio_feat,
+                        source=rag_file,
+                    )
                     if audio_feat is not None:
-                        self.proxy_audios.append(np.asarray(audio_feat, dtype=np.float32))
+                        self.proxy_audios.append(audio_feat)
                 except Exception as e:
                     print(f"⚠️ 跳过损坏的 RAG 文件 {rag_file}: {e}")
 
@@ -589,14 +606,57 @@ class DunhuangDataset(Dataset):
                 return str(candidate)
         return None
 
+    def _validate_audio_feature(self, audio_feat, source=""):
+        """
+        Validate one audio feature array before using it as a model condition.
+
+        Why:
+        - Dunhuang has no guaranteed paired music-motion dataset.
+        - Proxy/RAG/weak-pair feature files can accidentally mix 768-D wav2vec,
+          803-D hybrid, empty arrays, or corrupted NaN/Inf values.
+        - Failing early in the dataset layer is safer than silently feeding bad
+          conditions into cond_projection.
+        """
+        if audio_feat is None:
+            return None
+
+        try:
+            audio_feat = np.asarray(audio_feat, dtype=np.float32)
+        except Exception as exc:
+            print(f"⚠️ 跳过音频特征 {source}: 无法转成 float32 ({exc})")
+            return None
+
+        if audio_feat.ndim != 2:
+            print(f"⚠️ 跳过音频特征 {source}: 期望 [T, C]，实际 {audio_feat.shape}")
+            return None
+
+        if audio_feat.shape[0] <= 0:
+            print(f"⚠️ 跳过音频特征 {source}: 时间长度为空 {audio_feat.shape}")
+            return None
+
+        if audio_feat.shape[1] != self.audio_dim:
+            print(
+                f"⚠️ 跳过音频特征 {source}: "
+                f"期望 audio_dim={self.audio_dim}，实际 {audio_feat.shape[1]}"
+            )
+            return None
+
+        if not np.isfinite(audio_feat).all():
+            print(f"⚠️ 跳过音频特征 {source}: 包含 NaN/Inf")
+            return None
+
+        return audio_feat
+
     def _get_weak_pair_audio(self, audio_path):
         feature_path = self._resolve_audio_feature_path(audio_path)
         if feature_path is None:
             return None
         if feature_path not in self.weak_pair_audio_cache:
             try:
-                self.weak_pair_audio_cache[feature_path] = np.asarray(
-                    np.load(feature_path), dtype=np.float32
+                loaded = np.load(feature_path)
+                self.weak_pair_audio_cache[feature_path] = self._validate_audio_feature(
+                    loaded,
+                    source=feature_path,
                 )
             except Exception as exc:
                 print(f"⚠️ 跳过 weak pair 音频特征 {feature_path}: {exc}")
@@ -693,21 +753,30 @@ class DunhuangDataset(Dataset):
         motion = torch.from_numpy(self.motions[idx])
 
         audio_feat = self._sample_audio_feature(idx)
+        audio_feat = self._validate_audio_feature(audio_feat, source=f"idx={idx}")
+
         if audio_feat is not None:
-            audio_feat = np.asarray(audio_feat, dtype=np.float32)
             if audio_feat.shape[0] > self.seq_len:
                 audio_feat = audio_feat[:self.seq_len]
             elif audio_feat.shape[0] < self.seq_len:
                 pad_len = self.seq_len - audio_feat.shape[0]
-                # ✨ 替换原来的直接 np.pad，引入安全循环
+                # Use safe reflect padding. Very short sequences fall back to
+                # repeat/edge behavior to avoid artificial high-frequency bounces.
                 if audio_feat.shape[0] == 1:
                     audio_feat = np.repeat(audio_feat, self.seq_len, axis=0)
+                elif audio_feat.shape[0] < 15:
+                    audio_feat = np.pad(audio_feat, ((0, pad_len), (0, 0)), mode="edge")
                 else:
                     curr_pad = pad_len
                     while curr_pad > 0:
                         step_pad = min(curr_pad, audio_feat.shape[0] - 1)
-                        audio_feat = np.pad(audio_feat, ((0, step_pad), (0, 0)), mode='reflect')
+                        audio_feat = np.pad(
+                            audio_feat,
+                            ((0, step_pad), (0, 0)),
+                            mode="reflect",
+                        )
                         curr_pad -= step_pad
+
             audio_tensor = torch.from_numpy(audio_feat).float()
         else:
             audio_tensor = torch.zeros((self.seq_len, self.audio_dim), dtype=torch.float32)

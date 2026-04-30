@@ -528,7 +528,7 @@ class DanceDecoder(nn.Module):
         t = self.to_time_cond(t_hidden)
         t_tokens = self.to_time_tokens(t_hidden)
 
-        null_cond_hidden = self.null_cond_hidden.to(t.dtype)
+        null_cond_hidden = self.null_cond_hidden.to(device=t.device, dtype=t.dtype)
 
         if trajectory_tokens is not None:
             null_traj_embed = self.null_trajectory_embed.to(
