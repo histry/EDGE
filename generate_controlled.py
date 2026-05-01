@@ -32,6 +32,15 @@ except Exception:
     foot_lock_root_correction = None
     blend_back_to_trajectory = None
 
+try:
+    from retrieved_clip_prior import (
+        install_retrieved_clip_prior_patch,
+        build_retrieved_clip_prior_from_plan,
+    )
+except Exception:
+    install_retrieved_clip_prior_patch = None
+    build_retrieved_clip_prior_from_plan = None
+
 
 
 ROOT_X_IDX = 4
@@ -513,9 +522,24 @@ def save_eval_assets(
         "mid_poses": getattr(args, "mid_poses", ""),
         "mid_pose_frames": getattr(args, "mid_pose_frames", ""),
         "auto_mid_keyframes": bool(getattr(args, "auto_mid_keyframes", False)),
+        "mmr_checkpoint": getattr(args, "mmr_checkpoint", ""),
+        "auto_mid_mmr_weight": float(getattr(args, "auto_mid_mmr_weight", 0.0)),
+        "auto_mid_pose_weight": float(getattr(args, "auto_mid_pose_weight", 1.0)),
+        "auto_mid_diversity_weight": float(getattr(args, "auto_mid_diversity_weight", 0.2)),
+        "auto_mid_energy_weight": float(getattr(args, "auto_mid_energy_weight", 0.4)),
+        "auto_mid_contact_weight": float(getattr(args, "auto_mid_contact_weight", 0.3)),
+        "auto_mid_end_weight": float(getattr(args, "auto_mid_end_weight", 0.3)),
         "auto_mid_count": int(getattr(args, "auto_mid_count", 0)),
         "rag_db": getattr(args, "rag_db", ""),
         "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
+        "retrieved_clip_prior_denoise": bool(getattr(args, "retrieved_clip_prior_denoise", False)),
+        "retrieved_prior_window": int(getattr(args, "retrieved_prior_window", 24)),
+        "retrieved_prior_strength": float(getattr(args, "retrieved_prior_strength", 0.18)),
+        "retrieved_prior_anneal_power": float(getattr(args, "retrieved_prior_anneal_power", 1.0)),
+        "retrieved_prior_body_part": getattr(args, "retrieved_prior_body_part", "upper"),
+        "retrieved_prior_source_pose_space": getattr(args, "retrieved_prior_source_pose_space", "auto"),
+        "retrieved_prior_protect_width": int(getattr(args, "retrieved_prior_protect_width", 2)),
+        "retrieved_prior_debug_path": getattr(args, "retrieved_prior_debug_path", ""),
         "trajectory": getattr(args, "trajectory", ""),
         "target_traj": getattr(args, "target_traj", ""),
         "motion_raw": str(raw_motion_path),
@@ -656,9 +680,106 @@ def build_arg_parser():
         help="自动选帧时轨迹转折权重。",
     )
     parser.add_argument(
+        "--mmr_checkpoint",
+        default="",
+        help="可选，真正 MMR 双塔 checkpoint。提供后 auto-mid 使用 AudioEncoder 与 MMR-RAG motion_embeddings 检索。",
+    )
+    parser.add_argument(
+        "--auto_mid_mmr_weight",
+        type=float,
+        default=0.5,
+        help="自动中间关键帧检索中的 MMR latent distance 权重。AIST++ zero-shot 建议 0.3~0.5。",
+    )
+    parser.add_argument(
+        "--auto_mid_pose_weight",
+        type=float,
+        default=1.0,
+        help="自动中间关键帧检索中的首尾/用户姿态过渡兼容权重。",
+    )
+    parser.add_argument(
+        "--auto_mid_diversity_weight",
+        type=float,
+        default=0.2,
+        help="自动中间关键帧检索中的多样性权重，避免多个 auto pose 太相似。",
+    )
+    parser.add_argument(
+        "--auto_mid_energy_weight",
+        type=float,
+        default=0.4,
+        help="自动中间关键帧检索中的 motion energy 权重，用于避免抽到静态片段。",
+    )
+    parser.add_argument(
+        "--auto_mid_contact_weight",
+        type=float,
+        default=0.3,
+        help="自动中间关键帧检索中的接触稳定性权重，用于减少后续 IK/脚滑冲突。",
+    )
+    parser.add_argument(
+        "--auto_mid_end_weight",
+        type=float,
+        default=0.3,
+        help="越靠近末尾的自动关键帧越要兼容 end_pose，避免最后突变。",
+    )
+    parser.add_argument(
         "--save_auto_keyframes",
         action="store_true",
         help="保存自动规划出的中间关键帧 .npy 和 plan.json，便于复现实验与评估。",
+    )
+
+    parser.add_argument(
+        "--retrieved_clip_prior_denoise",
+        action="store_true",
+        help=(
+            "把 MMR-RAG 检索到的连续 clip 作为 soft prior 注入 DDPM denoising loop。"
+            "不同于后处理 clipprior，这会在每个 x_start 预测后软融合 prior，再进入 q_posterior。"
+        ),
+    )
+    parser.add_argument(
+        "--retrieved_prior_window",
+        type=int,
+        default=24,
+        help="每个 auto mid frame 前后多少帧使用 retrieved clip prior。建议 16~32。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_strength",
+        type=float,
+        default=0.18,
+        help="denoising loop 中 retrieved clip soft prior 的最大融合强度。建议 0.10~0.30。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_anneal_power",
+        type=float,
+        default=1.0,
+        help="prior 随 denoising 后期增强的退火指数。1.0 线性；2.0 更保守。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_body_part",
+        default="upper",
+        choices=["arms", "upper", "torso", "all_rot"],
+        help="retrieved clip prior 影响哪些旋转通道。建议先用 upper 或 arms，不直接改 root。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_source_pose_space",
+        default="auto",
+        choices=["auto", "physical", "normalized"],
+        help="retrieved source clip 的空间。pkl pos/q 建议 auto；若 source 已是 normalized 151-D 用 normalized。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_protect_width",
+        type=int,
+        default=2,
+        help="保护 start/end/user-mid/auto-mid 附近 ±N 帧，防止 soft prior 破坏关键帧命中。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_temporal_smooth",
+        type=int,
+        default=0,
+        help="对 prior mask 做轻微平滑。0/1 表示关闭。",
+    )
+    parser.add_argument(
+        "--retrieved_prior_debug_assets",
+        action="store_true",
+        help="保存 retrieved prior value/mask/debug，便于确认 denoising prior 是否真正触达。",
     )
 
     parser.add_argument(
@@ -880,6 +1001,10 @@ def main():
     )
     model.eval()
 
+    if install_retrieved_clip_prior_patch is not None:
+        install_retrieved_clip_prior_patch()
+    model.diffusion.retrieved_clip_prior = None
+
     model.diffusion.tto_steps = int(args.tto_steps)
     model.diffusion.tto_interval = int(args.tto_interval)
     model.diffusion.tto_lr = float(args.tto_lr)
@@ -1004,6 +1129,14 @@ def main():
             sample_stride=args.auto_mid_sample_stride,
             music_weight=args.auto_mid_music_weight,
             trajectory_weight=args.auto_mid_trajectory_weight,
+            mmr_checkpoint=args.mmr_checkpoint,
+            mmr_device=str(device),
+            mmr_weight=args.auto_mid_mmr_weight if args.mmr_checkpoint else 0.0,
+            pose_weight=args.auto_mid_pose_weight,
+            diversity_weight=args.auto_mid_diversity_weight,
+            energy_weight=args.auto_mid_energy_weight,
+            contact_weight=args.auto_mid_contact_weight,
+            end_weight=args.auto_mid_end_weight,
         )
 
         auto_paths, auto_frames, auto_plan_path = save_auto_keyframes(
@@ -1041,6 +1174,64 @@ def main():
         )
 
     constraint = build_constraint(args, normalizer, num_frames, device)
+
+    # ------------------------------------------------------------------
+    # Retrieved clip prior in DDPM denoising loop.
+    # This is the real RAG-Diffusion v2 path: retrieved continuous clips are
+    # injected into predicted x_start inside p_mean_variance, not pasted after
+    # generation. Explicit keyframe constraints remain higher priority.
+    # ------------------------------------------------------------------
+    args.retrieved_prior_debug_path = ""
+    if bool(getattr(args, "retrieved_clip_prior_denoise", False)):
+        if build_retrieved_clip_prior_from_plan is None or install_retrieved_clip_prior_patch is None:
+            raise ImportError(
+                "retrieved_clip_prior_denoise requires retrieved_clip_prior.py in project root."
+            )
+        if not getattr(args, "auto_mid_plan_path", ""):
+            raise ValueError(
+                "--retrieved_clip_prior_denoise requires --auto_mid_keyframes so an auto_mid_plan.json exists."
+            )
+
+        prior_protect_frames = [0, num_frames - 1]
+        current_mid_paths = parse_list(args.mid_poses)
+        current_mid_frames = parse_mid_frames(args.mid_pose_frames, len(current_mid_paths), num_frames)
+        prior_protect_frames.extend(current_mid_frames)
+        prior_protect_frames = sorted(set(int(x) for x in prior_protect_frames))
+
+        debug_prefix = ""
+        if args.retrieved_prior_debug_assets:
+            outp = Path(args.out)
+            debug_prefix = str(outp.with_name(outp.stem + "_denoise_prior"))
+
+        prior = build_retrieved_clip_prior_from_plan(
+            auto_plan_path=args.auto_mid_plan_path,
+            num_frames=num_frames,
+            normalizer=normalizer,
+            device=device,
+            source_pose_space=args.retrieved_prior_source_pose_space,
+            window=args.retrieved_prior_window,
+            body_part=args.retrieved_prior_body_part,
+            protect_frames=prior_protect_frames,
+            protect_width=args.retrieved_prior_protect_width,
+            temporal_smooth=args.retrieved_prior_temporal_smooth,
+            debug_out_prefix=debug_prefix,
+        )
+        prior["strength"] = float(args.retrieved_prior_strength)
+        prior["anneal_power"] = float(args.retrieved_prior_anneal_power)
+
+        if int(prior.get("segments", 0)) <= 0 or float(prior.get("touched_ratio", 0.0)) <= 0.0:
+            print("⚠️ retrieved clip denoise prior 未触达任何帧：将不启用 prior。")
+            model.diffusion.retrieved_clip_prior = None
+        else:
+            model.diffusion.retrieved_clip_prior = prior
+            if debug_prefix:
+                args.retrieved_prior_debug_path = debug_prefix + "_retrieved_prior_debug.json"
+            print(
+                "🧬 retrieved clip prior 已注入 DDPM denoising loop: "
+                f"segments={prior.get('segments')}, touched_ratio={prior.get('touched_ratio'):.6f}, "
+                f"body_part={args.retrieved_prior_body_part}, strength={args.retrieved_prior_strength}, "
+                f"window={args.retrieved_prior_window}, protect={prior_protect_frames}"
+            )
 
     with torch.no_grad():
         sample_norm = sample_motion(model, cond, constraint, args, num_frames)
@@ -1153,6 +1344,14 @@ def main():
             "auto_mid_count": args.auto_mid_count,
             "rag_db": args.rag_db,
             "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
+            "retrieved_clip_prior_denoise": bool(getattr(args, "retrieved_clip_prior_denoise", False)),
+            "retrieved_prior_window": int(getattr(args, "retrieved_prior_window", 24)),
+            "retrieved_prior_strength": float(getattr(args, "retrieved_prior_strength", 0.18)),
+            "retrieved_prior_anneal_power": float(getattr(args, "retrieved_prior_anneal_power", 1.0)),
+            "retrieved_prior_body_part": getattr(args, "retrieved_prior_body_part", "upper"),
+            "retrieved_prior_source_pose_space": getattr(args, "retrieved_prior_source_pose_space", "auto"),
+            "retrieved_prior_protect_width": int(getattr(args, "retrieved_prior_protect_width", 2)),
+            "retrieved_prior_debug_path": getattr(args, "retrieved_prior_debug_path", ""),
             "auto_mid_min_gap": args.auto_mid_min_gap,
             "auto_mid_pose_space": args.auto_mid_pose_space,
             "auto_mid_max_candidates": args.auto_mid_max_candidates,
