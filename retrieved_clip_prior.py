@@ -37,11 +37,34 @@ ROOT_SLICE = slice(4, 7)
 ROT_SLICE = slice(7, 151)
 
 # SMPL-like 24-joint index convention used by EDGE.
+# SMPL-like 24-joint index convention used by EDGE.
+# IMPORTANT for the Dunhuang S-trajectory system:
+# - Do NOT guide joint 0 (pelvis/root orientation) in the main route.
+# - Do NOT guide hips/knees/ankles/feet in the main route.
+# Prior experiments showed that pelvis/root-orientation or leg-chain priors can
+# conflict with the hard S-trajectory anchor and explode foot sliding.
+# The current stable main route uses body_part="upper" with this safe joint set.
+UPPER_JOINTS = [
+    3, 6, 9,              # spine chain
+    12, 15,               # neck / head
+    13, 14,               # clavicles
+    16, 17, 18, 19,       # shoulders / elbows
+    20, 21, 22, 23,       # wrists / hands
+]
+
 JOINT_SETS = {
     "arms": [13, 14, 16, 17, 18, 19, 20, 21, 22, 23],
-    "upper": [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+    # Current stable main route: spine + neck/head + shoulders/arms, excluding
+    # pelvis/root orientation and legs.
+    "upper": UPPER_JOINTS,
+    # Backward-compatible alias from the ablation package.
+    "upper_safe_plus": UPPER_JOINTS,
     "torso": [3, 6, 9, 12, 15],
+    # The following modes are kept only for ablation/backward compatibility.
+    # They should NOT be used as the main route for the S-trajectory demo.
+    "torso_arms": [0, 3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
     "all_rot": list(range(24)),
+    "body_no_root": list(range(24)),
 }
 
 

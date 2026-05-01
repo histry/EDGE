@@ -226,6 +226,42 @@ def load_rag_candidates(
     raise ValueError(f"Invalid rag_db: {rag_db}")
 
 
+def annotate_candidate_statistics(candidates: List[Dict[str, object]]):
+    """Attach normalized ranking features to RAG candidates in-place.
+
+    MMR-RAG databases store raw motion_energy/contact_stability values whose
+    numeric scales differ across datasets.  We convert motion_energy to a robust
+    0..1 percentile score so the planner can do an energy-aware rerank without
+    letting raw scale dominate pose/keyframe compatibility.
+    """
+    if not candidates:
+        return
+
+    energies = []
+    for c in candidates:
+        v = c.get("motion_energy", None)
+        try:
+            v = float(v) if v is not None else 0.0
+        except Exception:
+            v = 0.0
+        if not np.isfinite(v):
+            v = 0.0
+        energies.append(max(0.0, v))
+
+    energies = np.asarray(energies, dtype=np.float32)
+    if float(energies.max() - energies.min()) > 1e-8:
+        lo, hi = np.percentile(energies, [10, 90])
+        if float(hi - lo) <= 1e-8:
+            lo, hi = float(energies.min()), float(energies.max())
+        denom = max(float(hi - lo), 1e-8)
+        e_norm = np.clip((energies - float(lo)) / denom, 0.0, 1.0)
+    else:
+        e_norm = np.zeros_like(energies, dtype=np.float32)
+
+    for c, en in zip(candidates, e_norm):
+        c["motion_energy_norm"] = float(en)
+
+
 def normalize_01(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     if len(x) == 0:
@@ -391,65 +427,212 @@ def cosine_distance(a, b) -> float:
     return 0.5 * (1.0 - np.clip(float(np.dot(a, b) / (na * nb)), -1.0, 1.0))
 
 
+def is_same_source_region(candidate, selected_keyframes, source_gap: int = 120, disallow_same_source: bool = False) -> Tuple[bool, str]:
+    """Hard source-diversity constraint for auto mid-keyframes.
+
+    The previous planner could select the exact same source clip and source_frame
+    for multiple mid keyframes, causing visually repeated hops.  This function
+    rejects a candidate if it is too close to any already selected source region.
+    """
+    src = str(candidate.get("source", ""))
+    sf = int(candidate.get("source_frame", -1))
+    gap = max(0, int(source_gap))
+    for prev in selected_keyframes:
+        prev_src = str(prev.source)
+        prev_sf = int(prev.source_frame)
+        if not src or not prev_src or src != prev_src:
+            continue
+        if bool(disallow_same_source):
+            return True, f"same_source:{src}"
+        if sf >= 0 and prev_sf >= 0 and abs(sf - prev_sf) < gap:
+            return True, f"same_source_region:{src}:{sf}~{prev_sf}:gap<{gap}"
+    return False, ""
+
+
+def contact_pattern(pose: np.ndarray) -> np.ndarray:
+    c = np.asarray(pose, dtype=np.float32).reshape(-1)[:4]
+    return (c > 0.5).astype(np.float32)
+
+
+def contact_diversity_cost(pose: np.ndarray, selected_poses: Sequence[np.ndarray]) -> float:
+    """Penalize repeating the same foot-contact pattern.
+
+    This helps reduce repeated one-leg support / one-leg hopping when several
+    auto mid-keyframes are chosen from similar contact states.
+    """
+    if not selected_poses:
+        return 0.0
+    cp = contact_pattern(pose)
+    sims = []
+    for prev in selected_poses:
+        pp = contact_pattern(prev)
+        sims.append(float((cp == pp).mean()))
+    return max(sims) if sims else 0.0
+
+
 def choose_candidate_for_frame(
     frame: int,
     candidates: List[Dict[str, object]],
     anchors: List[Tuple[int, np.ndarray]],
     traj_physical: np.ndarray,
     selected_poses: List[np.ndarray],
+    selected_keyframes: Optional[List[AutoKeyframe]] = None,
     audio_embedding: Optional[np.ndarray] = None,
     w_mmr: float = 0.0,
     w_pose: float = 1.0,
     w_traj: float = 0.25,
     w_diversity: float = 0.15,
     w_energy: float = 0.25,
-    w_contact: float = 0.15,
+    energy_target: float = 0.55,
+    energy_band: float = 0.25,
+    w_contact: float = 0.50,
+    w_contact_diversity: float = 0.30,
     w_end: float = 0.25,
+    source_gap: int = 120,
+    disallow_same_source: bool = False,
+    energy_rerank_top_k: int = 80,
+    energy_rerank_weight: float = 0.25,
 ) -> AutoKeyframe:
+    """Choose the best candidate for one auto-mid frame.
+
+    The first-stage score enforces compatibility: MMR distance, start/end pose
+    interpolation, trajectory direction, contact stability and source diversity.
+    Then a second-stage energy rerank is applied only within the top-K compatible
+    candidates, so the planner prefers more dynamic clips without sacrificing
+    transition plausibility.
+    """
     ref_feat = interpolate_pose_feature_at_frame(frame, anchors)
     tangent = target_traj_tangent(traj_physical, frame)
-    best = None
+    selected_keyframes = selected_keyframes or []
+    rejected_by_source = 0
+    scored = []
+
     for cand in candidates:
+        blocked, _reason = is_same_source_region(
+            cand,
+            selected_keyframes,
+            source_gap=source_gap,
+            disallow_same_source=disallow_same_source,
+        )
+        if blocked:
+            rejected_by_source += 1
+            continue
+
         pose = np.asarray(cand["pose"], dtype=np.float32)
         pfeat = pose_feature(pose)
         pose_cost = float(np.sqrt(np.mean((pfeat - ref_feat) ** 2)))
         traj_cost = direction_cost(cand.get("root_vel", None), tangent)
         diversity_cost = 0.0 if not selected_poses else 1.0 / (1.0 + min(pose_distance(pose, p) for p in selected_poses))
         mmr_cost = cosine_distance(audio_embedding, cand.get("motion_embedding", None))
-        energy_cost = 1.0 / (1.0 + max(0.0, float(cand.get("motion_energy") or 0.0)))
+
+        energy_norm = float(cand.get("motion_energy_norm", 0.0) or 0.0)
+        energy_norm = float(np.clip(energy_norm, 0.0, 1.0))
+
+        # Prefer medium-energy dance clips instead of blindly maximizing energy.
+        # Very high energy candidates often correspond to hops / fast steps, which
+        # conflict with post trajectory anchoring and worsen foot sliding.
+        e_target = float(np.clip(energy_target, 0.0, 1.0))
+        e_band = max(float(energy_band), 1e-6)
+        energy_cost = float(min(abs(energy_norm - e_target) / e_band, 2.0))
+
         contact_stability = cand.get("contact_stability", None)
         contact_cost = 0.25 if contact_stability is None else 1.0 - float(np.clip(contact_stability, 0.0, 1.0))
+        contact_div_cost = contact_diversity_cost(pose, selected_poses)
         end_alpha = float(frame) / max(float(anchors[-1][0]), 1.0)
         end_compat_cost = end_alpha * pose_distance(pose, anchors[-1][1])
-        score = (
+
+        base_score = (
             float(w_mmr) * mmr_cost
             + float(w_pose) * pose_cost
             + float(w_traj) * traj_cost
             + float(w_diversity) * diversity_cost
             + float(w_energy) * energy_cost
             + float(w_contact) * contact_cost
+            + float(w_contact_diversity) * contact_div_cost
             + float(w_end) * end_compat_cost
         )
-        if best is None or score < best.score:
-            best = AutoKeyframe(
-                frame=int(frame),
-                pose=pose.astype(np.float32),
-                score=float(score),
-                source=str(cand.get("source", "")),
-                source_frame=int(cand.get("source_frame", -1)),
-                score_parts={
-                    "mmr_cost": float(mmr_cost),
-                    "pose_cost": float(pose_cost),
-                    "trajectory_direction_cost": float(traj_cost),
-                    "diversity_cost": float(diversity_cost),
-                    "motion_energy_cost": float(energy_cost),
-                    "contact_stability_cost": float(contact_cost),
-                    "end_compat_cost": float(end_compat_cost),
-                },
+
+        kf = AutoKeyframe(
+            frame=int(frame),
+            pose=pose.astype(np.float32),
+            score=float(base_score),
+            source=str(cand.get("source", "")),
+            source_frame=int(cand.get("source_frame", -1)),
+            score_parts={
+                "base_score_before_energy_rerank": float(base_score),
+                "mmr_cost": float(mmr_cost),
+                "pose_cost": float(pose_cost),
+                "trajectory_direction_cost": float(traj_cost),
+                "diversity_cost": float(diversity_cost),
+                "motion_energy_cost": float(energy_cost),
+                "motion_energy_norm": float(energy_norm),
+                "motion_energy_target": float(np.clip(energy_target, 0.0, 1.0)),
+                "motion_energy_band": float(max(float(energy_band), 1e-6)),
+                "contact_stability_cost": float(contact_cost),
+                "contact_diversity_cost": float(contact_div_cost),
+                "end_compat_cost": float(end_compat_cost),
+                "rejected_by_source_before_pool": int(rejected_by_source),
+            },
+        )
+        scored.append((float(base_score), float(energy_norm), kf))
+
+    if not scored:
+        if selected_keyframes and (source_gap > 0 or disallow_same_source):
+            return choose_candidate_for_frame(
+                frame=frame,
+                candidates=candidates,
+                anchors=anchors,
+                traj_physical=traj_physical,
+                selected_poses=selected_poses,
+                selected_keyframes=[],
+                audio_embedding=audio_embedding,
+                w_mmr=w_mmr,
+                w_pose=w_pose,
+                w_traj=w_traj,
+                w_diversity=w_diversity,
+                w_energy=w_energy,
+                energy_target=energy_target,
+                energy_band=energy_band,
+                w_contact=w_contact,
+                w_contact_diversity=w_contact_diversity,
+                w_end=w_end,
+                source_gap=0,
+                disallow_same_source=False,
+                energy_rerank_top_k=energy_rerank_top_k,
+                energy_rerank_weight=energy_rerank_weight,
             )
-    if best is None:
         raise RuntimeError("No RAG candidate available")
-    return best
+
+    scored.sort(key=lambda x: x[0])
+    top_k = int(energy_rerank_top_k)
+    if top_k > 0 and float(energy_rerank_weight) > 0:
+        pool = scored[: min(top_k, len(scored))]
+        def rerank_key(item):
+            base_score, energy_norm_value, _kf = item
+            e_target = float(np.clip(energy_target, 0.0, 1.0))
+            e_band = max(float(energy_band), 1e-6)
+            target_cost = float(min(abs(float(energy_norm_value) - e_target) / e_band, 2.0))
+            return float(base_score) + float(energy_rerank_weight) * target_cost
+
+        best_base, best_energy_norm, best_kf = min(pool, key=rerank_key)
+        e_target = float(np.clip(energy_target, 0.0, 1.0))
+        e_band = max(float(energy_band), 1e-6)
+        energy_target_cost = float(min(abs(float(best_energy_norm) - e_target) / e_band, 2.0))
+        final_score = float(best_base + float(energy_rerank_weight) * energy_target_cost)
+        best_kf.score = final_score
+        best_kf.score_parts["energy_rerank_top_k"] = int(top_k)
+        best_kf.score_parts["energy_rerank_weight"] = float(energy_rerank_weight)
+        best_kf.score_parts["energy_rerank_target_cost"] = float(energy_target_cost)
+        best_kf.score_parts["energy_rerank_penalty"] = float(float(energy_rerank_weight) * energy_target_cost)
+        best_kf.score_parts["score_after_energy_rerank"] = final_score
+        best_kf.score_parts["compatible_pool_size"] = int(len(pool))
+        return best_kf
+
+    best_kf = scored[0][2]
+    best_kf.score_parts["energy_rerank_top_k"] = 0
+    best_kf.score_parts["energy_rerank_weight"] = 0.0
+    best_kf.score_parts["score_after_energy_rerank"] = float(best_kf.score)
+    return best_kf
 
 
 def plan_auto_keyframes(
@@ -473,14 +656,22 @@ def plan_auto_keyframes(
     mmr_device: str = "cpu",
     mmr_weight: float = 0.0,
     pose_weight: float = 1.0,
-    diversity_weight: float = 0.15,
-    energy_weight: float = 0.25,
-    contact_weight: float = 0.15,
+    diversity_weight: float = 0.25,
+    energy_weight: float = 0.60,
+    energy_target: float = 0.55,
+    energy_band: float = 0.25,
+    contact_weight: float = 0.50,
+    contact_diversity_weight: float = 0.30,
     end_weight: float = 0.25,
+    source_gap: int = 120,
+    disallow_same_source: bool = False,
+    energy_rerank_top_k: int = 80,
+    energy_rerank_weight: float = 0.25,
 ) -> AutoKeyframePlan:
     candidates = load_rag_candidates(rag_db, normalizer=normalizer, pose_space=rag_pose_space, max_candidates=max_candidates, sample_stride=sample_stride)
     if not candidates:
         raise RuntimeError(f"No valid RAG candidates found in {rag_db}")
+    annotate_candidate_statistics(candidates)
     anchors = [(0, start_pose), (num_frames - 1, end_pose)]
     for f, p in zip(user_mid_frames, user_mid_poses):
         anchors.append((int(f), np.asarray(p, dtype=np.float32)))
@@ -497,14 +688,22 @@ def plan_auto_keyframes(
             anchors=anchors + [(k.frame, k.pose) for k in selected],
             traj_physical=traj_physical,
             selected_poses=selected_poses,
+            selected_keyframes=selected,
             audio_embedding=audio_embedding,
             w_mmr=effective_mmr_weight,
             w_pose=pose_weight,
             w_traj=trajectory_weight,
             w_diversity=diversity_weight,
             w_energy=energy_weight,
+            energy_target=energy_target,
+            energy_band=energy_band,
             w_contact=contact_weight,
+            w_contact_diversity=contact_diversity_weight,
             w_end=end_weight,
+            source_gap=source_gap,
+            disallow_same_source=disallow_same_source,
+            energy_rerank_top_k=energy_rerank_top_k,
+            energy_rerank_weight=energy_rerank_weight,
         )
         selected.append(kf)
         selected_poses.append(kf.pose)
@@ -526,7 +725,12 @@ def plan_auto_keyframes(
             "diversity_weight": float(diversity_weight),
             "energy_weight": float(energy_weight),
             "contact_weight": float(contact_weight),
+            "contact_diversity_weight": float(contact_diversity_weight),
             "end_weight": float(end_weight),
+            "source_gap": int(source_gap),
+            "disallow_same_source": bool(disallow_same_source),
+            "energy_rerank_top_k": int(energy_rerank_top_k),
+            "energy_rerank_weight": float(energy_rerank_weight),
             "retrieval_mode": "mmr" if effective_mmr_weight > 0 else "proxy",
         },
     )

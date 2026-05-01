@@ -526,9 +526,14 @@ def save_eval_assets(
         "auto_mid_mmr_weight": float(getattr(args, "auto_mid_mmr_weight", 0.0)),
         "auto_mid_pose_weight": float(getattr(args, "auto_mid_pose_weight", 1.0)),
         "auto_mid_diversity_weight": float(getattr(args, "auto_mid_diversity_weight", 0.2)),
-        "auto_mid_energy_weight": float(getattr(args, "auto_mid_energy_weight", 0.4)),
-        "auto_mid_contact_weight": float(getattr(args, "auto_mid_contact_weight", 0.3)),
+        "auto_mid_energy_weight": float(getattr(args, "auto_mid_energy_weight", 0.45)),
+        "auto_mid_energy_target": float(getattr(args, "auto_mid_energy_target", 0.55)),
+        "auto_mid_energy_band": float(getattr(args, "auto_mid_energy_band", 0.25)),
+        "auto_mid_contact_weight": float(getattr(args, "auto_mid_contact_weight", 0.5)),
+        "auto_mid_contact_diversity_weight": float(getattr(args, "auto_mid_contact_diversity_weight", 0.3)),
         "auto_mid_end_weight": float(getattr(args, "auto_mid_end_weight", 0.3)),
+        "auto_mid_source_gap": int(getattr(args, "auto_mid_source_gap", 120)),
+        "auto_mid_disallow_same_source": bool(getattr(args, "auto_mid_disallow_same_source", False)),
         "auto_mid_count": int(getattr(args, "auto_mid_count", 0)),
         "rag_db": getattr(args, "rag_db", ""),
         "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
@@ -650,6 +655,20 @@ def build_arg_parser():
         help="自动关键帧与用户关键帧/其他自动关键帧的最小帧距。",
     )
     parser.add_argument(
+        "--auto_mid_source_gap",
+        type=int,
+        default=150,
+        help=(
+            "自动中间关键帧的 source-frame 去重间隔。若两个候选来自同一 source 且 "
+            "source_frame 距离小于该值，则后选候选会被硬过滤，避免同一个动作片段重复出现。"
+        ),
+    )
+    parser.add_argument(
+        "--auto_mid_disallow_same_source",
+        action="store_true",
+        help="更严格的 source diversity：不同 auto mid 不允许来自同一个 source 文件。",
+    )
+    parser.add_argument(
         "--auto_mid_pose_space",
         default="normalized",
         choices=["normalized", "physical"],
@@ -699,20 +718,50 @@ def build_arg_parser():
     parser.add_argument(
         "--auto_mid_diversity_weight",
         type=float,
-        default=0.2,
+        default=0.25,
         help="自动中间关键帧检索中的多样性权重，避免多个 auto pose 太相似。",
     )
     parser.add_argument(
         "--auto_mid_energy_weight",
         type=float,
-        default=0.4,
-        help="自动中间关键帧检索中的 motion energy 权重，用于避免抽到静态片段。",
+        default=0.45,
+        help="自动中间关键帧检索中的中等 motion energy 权重。不是越大越好，避免选到跳跃/脚接触冲突片段。",
+    )
+    parser.add_argument(
+        "--auto_mid_energy_rerank_top_k",
+        type=int,
+        default=80,
+        help="动作能量重排：先按兼容性取 top-K，再在其中偏向 motion_energy 更高的候选。0=关闭。",
+    )
+    parser.add_argument(
+        "--auto_mid_energy_rerank_weight",
+        type=float,
+        default=0.08,
+        help="动作能量重排 penalty 权重：在兼容候选中偏向接近 auto_mid_energy_target 的中等能量片段。",
+    )
+    parser.add_argument(
+        "--auto_mid_energy_target",
+        type=float,
+        default=0.55,
+        help="动作能量目标分位，0~1。建议 0.45~0.60；过高容易选择跳跃/快速脚部变化片段。",
+    )
+    parser.add_argument(
+        "--auto_mid_energy_band",
+        type=float,
+        default=0.25,
+        help="动作能量容忍带宽。候选离 target 越远惩罚越大，用于选择中等能量而不是最高能量。",
     )
     parser.add_argument(
         "--auto_mid_contact_weight",
         type=float,
-        default=0.3,
+        default=0.85,
         help="自动中间关键帧检索中的接触稳定性权重，用于减少后续 IK/脚滑冲突。",
+    )
+    parser.add_argument(
+        "--auto_mid_contact_diversity_weight",
+        type=float,
+        default=0.60,
+        help="自动中间关键帧检索中的接触模式多样性权重，避免反复选择同一种单脚支撑。",
     )
     parser.add_argument(
         "--auto_mid_end_weight",
@@ -743,8 +792,8 @@ def build_arg_parser():
     parser.add_argument(
         "--retrieved_prior_strength",
         type=float,
-        default=0.18,
-        help="denoising loop 中 retrieved clip soft prior 的最大融合强度。建议 0.10~0.30。",
+        default=0.16,
+        help="denoising loop 中 retrieved clip soft prior 的最大融合强度。当前主线建议 0.16，优先靠 planner 改善，不扩大 prior 范围。",
     )
     parser.add_argument(
         "--retrieved_prior_anneal_power",
@@ -755,8 +804,12 @@ def build_arg_parser():
     parser.add_argument(
         "--retrieved_prior_body_part",
         default="upper",
-        choices=["arms", "upper", "torso", "all_rot"],
-        help="retrieved clip prior 影响哪些旋转通道。建议先用 upper 或 arms，不直接改 root。",
+        choices=["arms", "upper", "upper_safe_plus", "torso", "torso_arms", "all_rot", "body_no_root"],
+        help=(
+            "retrieved clip prior 影响哪些旋转通道。当前主线推荐 upper："
+            "spine + neck/head + shoulders/arms，不包含 joint 0 pelvis/root orientation，"
+            "也不包含 hips/knees/ankles/feet。不要再用 body_no_root/torso_arms 作为主线。"
+        ),
     )
     parser.add_argument(
         "--retrieved_prior_source_pose_space",
@@ -1136,7 +1189,14 @@ def main():
             diversity_weight=args.auto_mid_diversity_weight,
             energy_weight=args.auto_mid_energy_weight,
             contact_weight=args.auto_mid_contact_weight,
+            contact_diversity_weight=args.auto_mid_contact_diversity_weight,
             end_weight=args.auto_mid_end_weight,
+            source_gap=args.auto_mid_source_gap,
+            disallow_same_source=args.auto_mid_disallow_same_source,
+            energy_rerank_top_k=args.auto_mid_energy_rerank_top_k,
+            energy_rerank_weight=args.auto_mid_energy_rerank_weight,
+            energy_target=args.auto_mid_energy_target,
+            energy_band=args.auto_mid_energy_band,
         )
 
         auto_paths, auto_frames, auto_plan_path = save_auto_keyframes(
@@ -1353,6 +1413,13 @@ def main():
             "retrieved_prior_protect_width": int(getattr(args, "retrieved_prior_protect_width", 2)),
             "retrieved_prior_debug_path": getattr(args, "retrieved_prior_debug_path", ""),
             "auto_mid_min_gap": args.auto_mid_min_gap,
+            "auto_mid_source_gap": args.auto_mid_source_gap,
+            "auto_mid_disallow_same_source": args.auto_mid_disallow_same_source,
+            "auto_mid_contact_diversity_weight": args.auto_mid_contact_diversity_weight,
+            "auto_mid_energy_rerank_top_k": args.auto_mid_energy_rerank_top_k,
+            "auto_mid_energy_rerank_weight": args.auto_mid_energy_rerank_weight,
+            "auto_mid_energy_target": args.auto_mid_energy_target,
+            "auto_mid_energy_band": args.auto_mid_energy_band,
             "auto_mid_pose_space": args.auto_mid_pose_space,
             "auto_mid_max_candidates": args.auto_mid_max_candidates,
             "auto_mid_sample_stride": args.auto_mid_sample_stride,
