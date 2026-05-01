@@ -1,13 +1,15 @@
-"""Auto middle-keyframe planner with optional true MMR-RAG retrieval.
+"""Transition-aware auto middle-keyframe planner with optional MMR-RAG retrieval.
 
-Modes:
-- Proxy RAG: use onset/trajectory/pose distance/diversity.
-- True MMR-RAG: if --mmr_checkpoint and an MMR clip index with
-  motion_embeddings are provided, encode input music with AudioEncoder and rank
-  Dunhuang motion clips by shared latent-space similarity.
+Drop-in replacement for the original auto_keyframe_planner.py.
 
-The output is still standard .npy mid-keyframes, so generate_controlled.py and
-existing eval_quantitative.py do not need structural changes.
+What changed vs. the old pose-only planner:
+- still exports plan_auto_keyframes(), save_auto_keyframes(), append_csv();
+- keeps compatibility with generate_controlled.py and retrieved_clip_prior.py;
+- adds transition/contact-phase aware scoring to reduce repeated one-leg hops;
+- writes richer auto_mid_plan.json fields for later diagnosis.
+
+The planner still outputs .npy middle keyframe poses, so downstream generation
+and evaluation scripts do not need structural changes.
 """
 from __future__ import annotations
 
@@ -20,13 +22,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 try:
     from dataset.quaternion import ax_to_6v
     from dataset.preprocess import vectorize_many, Normalizer
     from vis import SMPLSkeleton
-except Exception:
+except Exception:  # keeps CLI/import safe in partial environments
     ax_to_6v = None
     vectorize_many = None
     Normalizer = None
@@ -152,6 +153,16 @@ def _load_npy_motion(path: Path):
     return arr.astype(np.float32)
 
 
+def _safe_float(v, default=0.0) -> float:
+    try:
+        out = float(v)
+    except Exception:
+        out = float(default)
+    if not np.isfinite(out):
+        out = float(default)
+    return out
+
+
 def load_rag_candidates(
     rag_db: str,
     normalizer=None,
@@ -159,9 +170,16 @@ def load_rag_candidates(
     max_candidates: int = 5000,
     sample_stride: int = 1,
 ) -> List[Dict[str, object]]:
-    """Load pose-level or MMR clip-level RAG candidates."""
+    """Load pose-level or MMR clip-level RAG candidates.
+
+    The resulting candidate dict intentionally keeps the old fields used by the
+    previous planner and adds segment fields when available. For flat .npz RAG
+    indices, segment_start/end are approximate but useful for debugging and
+    downstream prior construction.
+    """
     path = Path(rag_db)
     candidates: List[Dict[str, object]] = []
+    stride = max(1, int(sample_stride))
 
     if path.is_file() and path.suffix == ".npz":
         data = np.load(path, allow_pickle=True)
@@ -179,11 +197,14 @@ def load_rag_candidates(
         motion_energy = data["motion_energy"] if "motion_energy" in data.files else None
         contact_stability = data["contact_stability"] if "contact_stability" in data.files else None
 
-        for i in range(0, len(poses), max(1, int(sample_stride))):
+        for i in range(0, len(poses), stride):
+            sf = int(source_frame[i])
             candidates.append({
                 "pose": poses[i].astype(np.float32),
                 "source": str(source[i]),
-                "source_frame": int(source_frame[i]),
+                "source_frame": sf,
+                "source_segment_start": max(0, sf - stride),
+                "source_segment_end": sf + stride,
                 "root_vel": np.asarray(root_vel[i], dtype=np.float32),
                 "motion_embedding": None if motion_embedding is None else np.asarray(motion_embedding[i], dtype=np.float32),
                 "motion_energy": None if motion_energy is None else float(motion_energy[i]),
@@ -199,65 +220,54 @@ def load_rag_candidates(
             if len(candidates) >= max_candidates:
                 break
             if file.suffix == ".npz":
-                candidates.extend(load_rag_candidates(str(file), normalizer, pose_space, max_candidates - len(candidates), sample_stride))
-            else:
-                motion = _pkl_to_motion_151(file) if file.suffix == ".pkl" else _load_npy_motion(file)
-                if motion is None:
-                    continue
-                motion = normalize_motion_if_needed(motion, normalizer, pose_space)
-                root = motion[:, [ROOT_X_IDX, ROOT_Z_IDX]]
-                root_vel = np.zeros_like(root)
-                if len(root) > 1:
-                    root_vel[1:] = root[1:] - root[:-1]
-                for i in range(0, len(motion), max(1, int(sample_stride))):
-                    candidates.append({
-                        "pose": motion[i].astype(np.float32),
-                        "source": str(file),
-                        "source_frame": int(i),
-                        "root_vel": root_vel[i].astype(np.float32),
-                        "motion_embedding": None,
-                        "motion_energy": None,
-                        "contact_stability": None,
-                    })
-                    if len(candidates) >= max_candidates:
-                        break
+                candidates.extend(load_rag_candidates(str(file), normalizer, pose_space, max_candidates - len(candidates), stride))
+                continue
+
+            motion = _pkl_to_motion_151(file) if file.suffix == ".pkl" else _load_npy_motion(file)
+            if motion is None:
+                continue
+            motion = normalize_motion_if_needed(motion, normalizer, pose_space)
+            root = motion[:, [ROOT_X_IDX, ROOT_Z_IDX]]
+            root_vel = np.zeros_like(root)
+            if len(root) > 1:
+                root_vel[1:] = root[1:] - root[:-1]
+            pose_vel = np.zeros((len(motion),), dtype=np.float32)
+            if len(motion) > 1:
+                pose_vel[1:] = np.sqrt(np.mean((pose_feature_many(motion[1:]) - pose_feature_many(motion[:-1])) ** 2, axis=1))
+            contacts = (motion[:, CONTACT_SLICE] > 0.5).astype(np.float32)
+            contact_stability = 1.0 - np.clip(np.mean(np.abs(np.diff(contacts, axis=0)), axis=1, keepdims=False), 0.0, 1.0) if len(motion) > 1 else np.ones((1,), dtype=np.float32)
+            contact_stability = np.r_[contact_stability[:1], contact_stability] if len(contact_stability) < len(motion) else contact_stability
+            for i in range(0, len(motion), stride):
+                candidates.append({
+                    "pose": motion[i].astype(np.float32),
+                    "source": str(file),
+                    "source_frame": int(i),
+                    "source_segment_start": max(0, int(i) - stride),
+                    "source_segment_end": min(len(motion) - 1, int(i) + stride),
+                    "root_vel": root_vel[i].astype(np.float32),
+                    "motion_embedding": None,
+                    "motion_energy": float(pose_vel[i]),
+                    "contact_stability": float(contact_stability[i]),
+                })
+                if len(candidates) >= max_candidates:
+                    break
         return candidates[:max_candidates]
 
     raise ValueError(f"Invalid rag_db: {rag_db}")
 
 
 def annotate_candidate_statistics(candidates: List[Dict[str, object]]):
-    """Attach normalized ranking features to RAG candidates in-place.
-
-    MMR-RAG databases store raw motion_energy/contact_stability values whose
-    numeric scales differ across datasets.  We convert motion_energy to a robust
-    0..1 percentile score so the planner can do an energy-aware rerank without
-    letting raw scale dominate pose/keyframe compatibility.
-    """
+    """Attach robust normalized motion-energy stats to candidates."""
     if not candidates:
         return
-
-    energies = []
-    for c in candidates:
-        v = c.get("motion_energy", None)
-        try:
-            v = float(v) if v is not None else 0.0
-        except Exception:
-            v = 0.0
-        if not np.isfinite(v):
-            v = 0.0
-        energies.append(max(0.0, v))
-
-    energies = np.asarray(energies, dtype=np.float32)
+    energies = np.asarray([max(0.0, _safe_float(c.get("motion_energy", 0.0))) for c in candidates], dtype=np.float32)
     if float(energies.max() - energies.min()) > 1e-8:
         lo, hi = np.percentile(energies, [10, 90])
         if float(hi - lo) <= 1e-8:
             lo, hi = float(energies.min()), float(energies.max())
-        denom = max(float(hi - lo), 1e-8)
-        e_norm = np.clip((energies - float(lo)) / denom, 0.0, 1.0)
+        e_norm = np.clip((energies - float(lo)) / max(float(hi - lo), 1e-8), 0.0, 1.0)
     else:
         e_norm = np.zeros_like(energies, dtype=np.float32)
-
     for c, en in zip(candidates, e_norm):
         c["motion_energy_norm"] = float(en)
 
@@ -312,9 +322,8 @@ def trajectory_curvature_score(traj_physical: np.ndarray) -> np.ndarray:
     n1 = np.linalg.norm(v1, axis=1)
     n2 = np.linalg.norm(v2, axis=1)
     cos = np.sum(v1 * v2, axis=1) / np.clip(n1 * n2, 1e-8, None)
-    turn = 1.0 - np.clip(cos, -1.0, 1.0)
     out = np.zeros((len(traj),), dtype=np.float32)
-    out[1:-1] = turn.astype(np.float32)
+    out[1:-1] = 1.0 - np.clip(cos, -1.0, 1.0)
     return normalize_01(smooth_1d(out, 5))
 
 
@@ -323,10 +332,10 @@ def choose_auto_frames(audio_feature, traj_physical, num_frames, count, existing
         return []
     onset = audio_onset_score(audio_feature)
     if len(onset) != num_frames:
-        onset = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, len(onset)), onset).astype(np.float32)
+        onset = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, max(len(onset), 1)), onset if len(onset) else [0.0]).astype(np.float32)
     curvature = trajectory_curvature_score(traj_physical)
     if len(curvature) != num_frames:
-        curvature = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, len(curvature)), curvature).astype(np.float32)
+        curvature = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, max(len(curvature), 1)), curvature if len(curvature) else [0.0]).astype(np.float32)
     score = float(music_weight) * normalize_01(onset) + float(trajectory_weight) * normalize_01(curvature)
     blocked = np.zeros((num_frames,), dtype=bool)
     for frame in list(existing_frames) + [0, num_frames - 1]:
@@ -356,6 +365,11 @@ def pose_feature(pose: np.ndarray) -> np.ndarray:
     return np.asarray(pose, dtype=np.float32).reshape(-1)[POSE_FEATURE_INDEX].astype(np.float32)
 
 
+def pose_feature_many(motion: np.ndarray) -> np.ndarray:
+    motion = np.asarray(motion, dtype=np.float32)
+    return motion[:, POSE_FEATURE_INDEX].astype(np.float32)
+
+
 def pose_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(np.mean((pose_feature(a) - pose_feature(b)) ** 2)))
 
@@ -371,6 +385,34 @@ def interpolate_pose_feature_at_frame(frame: int, anchors: List[Tuple[int, np.nd
             alpha = (frame - f0) / max(float(f1 - f0), 1.0)
             return (1.0 - alpha) * pose_feature(p0) + alpha * pose_feature(p1)
     return pose_feature(anchors[-1][1])
+
+
+def bracketing_anchors(frame: int, anchors: List[Tuple[int, np.ndarray]]) -> Tuple[Tuple[int, np.ndarray], Tuple[int, np.ndarray]]:
+    anchors = sorted([(int(f), np.asarray(p, dtype=np.float32)) for f, p in anchors], key=lambda x: x[0])
+    prev_a = anchors[0]
+    next_a = anchors[-1]
+    for a in anchors:
+        if a[0] <= frame:
+            prev_a = a
+        if a[0] >= frame:
+            next_a = a
+            break
+    if prev_a[0] == frame and len(anchors) > 1:
+        idx = anchors.index(prev_a)
+        prev_a = anchors[max(0, idx - 1)]
+    if next_a[0] == frame and len(anchors) > 1:
+        idx = anchors.index(next_a)
+        next_a = anchors[min(len(anchors) - 1, idx + 1)]
+    return prev_a, next_a
+
+
+def _traj_at(traj_physical: np.ndarray, frame: int) -> np.ndarray:
+    traj = np.asarray(traj_physical, dtype=np.float32)
+    if traj.ndim == 3:
+        traj = traj[0]
+    traj = traj[:, :2]
+    frame = max(0, min(len(traj) - 1, int(frame)))
+    return traj[frame]
 
 
 def target_traj_tangent(traj_physical: np.ndarray, frame: int) -> np.ndarray:
@@ -398,6 +440,24 @@ def direction_cost(candidate_vel, target_tangent) -> float:
         return 0.5
     cos = float(np.dot(v, t) / (nv * nt))
     return 0.5 * (1.0 - np.clip(cos, -1.0, 1.0))
+
+
+def velocity_compatibility_cost(candidate_vel, traj_physical, prev_frame: int, frame: int, next_frame: int) -> float:
+    if candidate_vel is None:
+        return 0.5
+    v = np.asarray(candidate_vel, dtype=np.float32).reshape(-1)[:2]
+    speed = float(np.linalg.norm(v))
+    prev_gap = max(1, int(frame) - int(prev_frame))
+    next_gap = max(1, int(next_frame) - int(frame))
+    v_in = (_traj_at(traj_physical, frame) - _traj_at(traj_physical, prev_frame)) / float(prev_gap)
+    v_out = (_traj_at(traj_physical, next_frame) - _traj_at(traj_physical, frame)) / float(next_gap)
+    expected = 0.5 * (v_in + v_out)
+    exp_speed = float(np.linalg.norm(expected))
+    if exp_speed <= 1e-8 and speed <= 1e-8:
+        return 0.0
+    dir_c = direction_cost(v, expected)
+    speed_c = abs(speed - exp_speed) / max(exp_speed + speed, 1e-6)
+    return float(np.clip(0.65 * dir_c + 0.35 * speed_c, 0.0, 2.0))
 
 
 def encode_audio_with_mmr(audio_feature: np.ndarray, mmr_checkpoint: str, device: str = "cpu") -> Optional[np.ndarray]:
@@ -428,12 +488,6 @@ def cosine_distance(a, b) -> float:
 
 
 def is_same_source_region(candidate, selected_keyframes, source_gap: int = 120, disallow_same_source: bool = False) -> Tuple[bool, str]:
-    """Hard source-diversity constraint for auto mid-keyframes.
-
-    The previous planner could select the exact same source clip and source_frame
-    for multiple mid keyframes, causing visually repeated hops.  This function
-    rejects a candidate if it is too close to any already selected source region.
-    """
     src = str(candidate.get("source", ""))
     sf = int(candidate.get("source_frame", -1))
     gap = max(0, int(source_gap))
@@ -454,20 +508,60 @@ def contact_pattern(pose: np.ndarray) -> np.ndarray:
     return (c > 0.5).astype(np.float32)
 
 
-def contact_diversity_cost(pose: np.ndarray, selected_poses: Sequence[np.ndarray]) -> float:
-    """Penalize repeating the same foot-contact pattern.
+def contact_phase(pose: np.ndarray) -> str:
+    c = contact_pattern(pose)
+    left = bool(c[0] or c[2])
+    right = bool(c[1] or c[3])
+    if left and right:
+        return "both"
+    if left:
+        return "left_only"
+    if right:
+        return "right_only"
+    return "none"
 
-    This helps reduce repeated one-leg support / one-leg hopping when several
-    auto mid-keyframes are chosen from similar contact states.
-    """
+
+def contact_diversity_cost(pose: np.ndarray, selected_poses: Sequence[np.ndarray]) -> float:
     if not selected_poses:
         return 0.0
     cp = contact_pattern(pose)
-    sims = []
-    for prev in selected_poses:
-        pp = contact_pattern(prev)
-        sims.append(float((cp == pp).mean()))
+    sims = [float((cp == contact_pattern(prev)).mean()) for prev in selected_poses]
     return max(sims) if sims else 0.0
+
+
+def contact_phase_continuity_cost(pose: np.ndarray, selected_poses: Sequence[np.ndarray]) -> float:
+    """Extra penalty for repeated one-foot support, the main visual hop failure."""
+    if not selected_poses:
+        return 0.0
+    phase = contact_phase(pose)
+    prev_phase = contact_phase(selected_poses[-1])
+    if phase == prev_phase and phase in {"left_only", "right_only", "none"}:
+        return 1.0
+    if phase == prev_phase:
+        return 0.35
+    return 0.0
+
+
+def pose_direction_cost(prev_pose: np.ndarray, candidate_pose: np.ndarray, next_pose: np.ndarray) -> float:
+    prev_f = pose_feature(prev_pose)
+    cand_f = pose_feature(candidate_pose)
+    next_f = pose_feature(next_pose)
+    candidate_dir = cand_f - prev_f
+    global_dir = next_f - prev_f
+    return cosine_distance(candidate_dir, global_dir)
+
+
+def transition_cost(prev_pose: np.ndarray, pose: np.ndarray, next_pose: np.ndarray, prev_gap: int, next_gap: int) -> Tuple[float, float, float]:
+    """Return in, out, and balanced transition cost.
+
+    Costs are divided by sqrt(frame gap), because a larger temporal interval can
+    naturally support a larger pose change. This makes the planner less likely
+    to reject expressive but connectable poses while still penalizing snapping.
+    """
+    in_c = pose_distance(prev_pose, pose) / max(np.sqrt(max(1, prev_gap)), 1.0)
+    out_c = pose_distance(pose, next_pose) / max(np.sqrt(max(1, next_gap)), 1.0)
+    balance = abs(in_c - out_c) / max(in_c + out_c, 1e-6)
+    return float(in_c), float(out_c), float(balance)
 
 
 def choose_candidate_for_frame(
@@ -492,28 +586,25 @@ def choose_candidate_for_frame(
     disallow_same_source: bool = False,
     energy_rerank_top_k: int = 80,
     energy_rerank_weight: float = 0.25,
+    w_transition: float = 0.75,
+    w_velocity: float = 0.35,
+    w_pose_direction: float = 0.25,
+    w_contact_phase: float = 0.45,
 ) -> AutoKeyframe:
-    """Choose the best candidate for one auto-mid frame.
-
-    The first-stage score enforces compatibility: MMR distance, start/end pose
-    interpolation, trajectory direction, contact stability and source diversity.
-    Then a second-stage energy rerank is applied only within the top-K compatible
-    candidates, so the planner prefers more dynamic clips without sacrificing
-    transition plausibility.
-    """
     ref_feat = interpolate_pose_feature_at_frame(frame, anchors)
     tangent = target_traj_tangent(traj_physical, frame)
+    prev_anchor, next_anchor = bracketing_anchors(frame, anchors)
+    prev_frame, prev_pose = prev_anchor
+    next_frame, next_pose = next_anchor
+    prev_gap = max(1, int(frame) - int(prev_frame))
+    next_gap = max(1, int(next_frame) - int(frame))
+
     selected_keyframes = selected_keyframes or []
     rejected_by_source = 0
     scored = []
 
     for cand in candidates:
-        blocked, _reason = is_same_source_region(
-            cand,
-            selected_keyframes,
-            source_gap=source_gap,
-            disallow_same_source=disallow_same_source,
-        )
+        blocked, _reason = is_same_source_region(cand, selected_keyframes, source_gap=source_gap, disallow_same_source=disallow_same_source)
         if blocked:
             rejected_by_source += 1
             continue
@@ -525,19 +616,19 @@ def choose_candidate_for_frame(
         diversity_cost = 0.0 if not selected_poses else 1.0 / (1.0 + min(pose_distance(pose, p) for p in selected_poses))
         mmr_cost = cosine_distance(audio_embedding, cand.get("motion_embedding", None))
 
-        energy_norm = float(cand.get("motion_energy_norm", 0.0) or 0.0)
-        energy_norm = float(np.clip(energy_norm, 0.0, 1.0))
-
-        # Prefer medium-energy dance clips instead of blindly maximizing energy.
-        # Very high energy candidates often correspond to hops / fast steps, which
-        # conflict with post trajectory anchoring and worsen foot sliding.
+        energy_norm = float(np.clip(_safe_float(cand.get("motion_energy_norm", 0.0)), 0.0, 1.0))
         e_target = float(np.clip(energy_target, 0.0, 1.0))
         e_band = max(float(energy_band), 1e-6)
         energy_cost = float(min(abs(energy_norm - e_target) / e_band, 2.0))
 
         contact_stability = cand.get("contact_stability", None)
-        contact_cost = 0.25 if contact_stability is None else 1.0 - float(np.clip(contact_stability, 0.0, 1.0))
+        contact_cost = 0.25 if contact_stability is None else 1.0 - float(np.clip(_safe_float(contact_stability, 0.5), 0.0, 1.0))
         contact_div_cost = contact_diversity_cost(pose, selected_poses)
+        phase_cost = contact_phase_continuity_cost(pose, selected_poses)
+        in_cost, out_cost, balance_cost = transition_cost(prev_pose, pose, next_pose, prev_gap, next_gap)
+        transition_total = in_cost + out_cost + 0.5 * balance_cost
+        vel_cost = velocity_compatibility_cost(cand.get("root_vel", None), traj_physical, prev_frame, frame, next_frame)
+        dir_cost = pose_direction_cost(prev_pose, pose, next_pose)
         end_alpha = float(frame) / max(float(anchors[-1][0]), 1.0)
         end_compat_cost = end_alpha * pose_distance(pose, anchors[-1][1])
 
@@ -550,7 +641,41 @@ def choose_candidate_for_frame(
             + float(w_contact) * contact_cost
             + float(w_contact_diversity) * contact_div_cost
             + float(w_end) * end_compat_cost
+            + float(w_transition) * transition_total
+            + float(w_velocity) * vel_cost
+            + float(w_pose_direction) * dir_cost
+            + float(w_contact_phase) * phase_cost
         )
+
+        score_parts = {
+            "base_score_before_energy_rerank": float(base_score),
+            "mmr_cost": float(mmr_cost),
+            "pose_cost": float(pose_cost),
+            "trajectory_direction_cost": float(traj_cost),
+            "diversity_cost": float(diversity_cost),
+            "motion_energy_cost": float(energy_cost),
+            "motion_energy_norm": float(energy_norm),
+            "motion_energy_target": float(e_target),
+            "motion_energy_band": float(e_band),
+            "contact_stability_cost": float(contact_cost),
+            "contact_diversity_cost": float(contact_div_cost),
+            "contact_phase_continuity_cost": float(phase_cost),
+            "transition_in_cost": float(in_cost),
+            "transition_out_cost": float(out_cost),
+            "transition_balance_cost": float(balance_cost),
+            "transition_total_cost": float(transition_total),
+            "transition_velocity_cost": float(vel_cost),
+            "pose_direction_cost": float(dir_cost),
+            "end_compat_cost": float(end_compat_cost),
+            "contact_phase": contact_phase(pose),
+            "segment_energy": float(energy_norm),
+            "segment_velocity": float(np.linalg.norm(np.asarray(cand.get("root_vel", [0.0, 0.0]), dtype=np.float32).reshape(-1)[:2])),
+            "source_segment_start": int(cand.get("source_segment_start", cand.get("source_frame", -1))),
+            "source_segment_end": int(cand.get("source_segment_end", cand.get("source_frame", -1))),
+            "prev_anchor_frame": int(prev_frame),
+            "next_anchor_frame": int(next_frame),
+            "rejected_by_source_before_pool": int(rejected_by_source),
+        }
 
         kf = AutoKeyframe(
             frame=int(frame),
@@ -558,21 +683,7 @@ def choose_candidate_for_frame(
             score=float(base_score),
             source=str(cand.get("source", "")),
             source_frame=int(cand.get("source_frame", -1)),
-            score_parts={
-                "base_score_before_energy_rerank": float(base_score),
-                "mmr_cost": float(mmr_cost),
-                "pose_cost": float(pose_cost),
-                "trajectory_direction_cost": float(traj_cost),
-                "diversity_cost": float(diversity_cost),
-                "motion_energy_cost": float(energy_cost),
-                "motion_energy_norm": float(energy_norm),
-                "motion_energy_target": float(np.clip(energy_target, 0.0, 1.0)),
-                "motion_energy_band": float(max(float(energy_band), 1e-6)),
-                "contact_stability_cost": float(contact_cost),
-                "contact_diversity_cost": float(contact_div_cost),
-                "end_compat_cost": float(end_compat_cost),
-                "rejected_by_source_before_pool": int(rejected_by_source),
-            },
+            score_parts=score_parts,
         )
         scored.append((float(base_score), float(energy_norm), kf))
 
@@ -600,6 +711,10 @@ def choose_candidate_for_frame(
                 disallow_same_source=False,
                 energy_rerank_top_k=energy_rerank_top_k,
                 energy_rerank_weight=energy_rerank_weight,
+                w_transition=w_transition,
+                w_velocity=w_velocity,
+                w_pose_direction=w_pose_direction,
+                w_contact_phase=w_contact_phase,
             )
         raise RuntimeError("No RAG candidate available")
 
@@ -607,16 +722,13 @@ def choose_candidate_for_frame(
     top_k = int(energy_rerank_top_k)
     if top_k > 0 and float(energy_rerank_weight) > 0:
         pool = scored[: min(top_k, len(scored))]
+
         def rerank_key(item):
             base_score, energy_norm_value, _kf = item
-            e_target = float(np.clip(energy_target, 0.0, 1.0))
-            e_band = max(float(energy_band), 1e-6)
             target_cost = float(min(abs(float(energy_norm_value) - e_target) / e_band, 2.0))
             return float(base_score) + float(energy_rerank_weight) * target_cost
 
         best_base, best_energy_norm, best_kf = min(pool, key=rerank_key)
-        e_target = float(np.clip(energy_target, 0.0, 1.0))
-        e_band = max(float(energy_band), 1e-6)
         energy_target_cost = float(min(abs(float(best_energy_norm) - e_target) / e_band, 2.0))
         final_score = float(best_base + float(energy_rerank_weight) * energy_target_cost)
         best_kf.score = final_score
@@ -667,25 +779,51 @@ def plan_auto_keyframes(
     disallow_same_source: bool = False,
     energy_rerank_top_k: int = 80,
     energy_rerank_weight: float = 0.25,
+    # New Planner-v3 weights. generate_controlled.py can ignore these safely.
+    transition_weight: float = 0.75,
+    transition_velocity_weight: float = 0.35,
+    pose_direction_weight: float = 0.25,
+    contact_phase_weight: float = 0.45,
 ) -> AutoKeyframePlan:
-    candidates = load_rag_candidates(rag_db, normalizer=normalizer, pose_space=rag_pose_space, max_candidates=max_candidates, sample_stride=sample_stride)
+    candidates = load_rag_candidates(
+        rag_db,
+        normalizer=normalizer,
+        pose_space=rag_pose_space,
+        max_candidates=max_candidates,
+        sample_stride=sample_stride,
+    )
     if not candidates:
         raise RuntimeError(f"No valid RAG candidates found in {rag_db}")
     annotate_candidate_statistics(candidates)
-    anchors = [(0, start_pose), (num_frames - 1, end_pose)]
+
+    anchors = [(0, np.asarray(start_pose, dtype=np.float32)), (num_frames - 1, np.asarray(end_pose, dtype=np.float32))]
     for f, p in zip(user_mid_frames, user_mid_poses):
         anchors.append((int(f), np.asarray(p, dtype=np.float32)))
     anchors = sorted(anchors, key=lambda x: x[0])
-    frames = choose_auto_frames(audio_feature, traj_physical, num_frames, int(max_auto_keyframes), [f for f, _ in anchors], int(min_gap), music_weight=music_weight, trajectory_weight=trajectory_weight)
+
+    frames = choose_auto_frames(
+        audio_feature,
+        traj_physical,
+        num_frames,
+        int(max_auto_keyframes),
+        [f for f, _ in anchors],
+        int(min_gap),
+        music_weight=music_weight,
+        trajectory_weight=trajectory_weight,
+    )
     audio_embedding = encode_audio_with_mmr(audio_feature, mmr_checkpoint, mmr_device) if mmr_checkpoint else None
     effective_mmr_weight = float(mmr_weight) if audio_embedding is not None else 0.0
+
     selected: List[AutoKeyframe] = []
     selected_poses: List[np.ndarray] = []
     for frame in frames:
+        # Include already selected auto keyframes as temporary anchors, so later
+        # choices are scored against the actual planned transition chain.
+        dynamic_anchors = anchors + [(k.frame, k.pose) for k in selected]
         kf = choose_candidate_for_frame(
             frame=frame,
             candidates=candidates,
-            anchors=anchors + [(k.frame, k.pose) for k in selected],
+            anchors=dynamic_anchors,
             traj_physical=traj_physical,
             selected_poses=selected_poses,
             selected_keyframes=selected,
@@ -704,9 +842,14 @@ def plan_auto_keyframes(
             disallow_same_source=disallow_same_source,
             energy_rerank_top_k=energy_rerank_top_k,
             energy_rerank_weight=energy_rerank_weight,
+            w_transition=transition_weight,
+            w_velocity=transition_velocity_weight,
+            w_pose_direction=pose_direction_weight,
+            w_contact_phase=contact_phase_weight,
         )
         selected.append(kf)
         selected_poses.append(kf.pose)
+
     selected = sorted(selected, key=lambda x: x.frame)
     return AutoKeyframePlan(
         keyframes=selected,
@@ -727,11 +870,16 @@ def plan_auto_keyframes(
             "contact_weight": float(contact_weight),
             "contact_diversity_weight": float(contact_diversity_weight),
             "end_weight": float(end_weight),
+            "transition_weight": float(transition_weight),
+            "transition_velocity_weight": float(transition_velocity_weight),
+            "pose_direction_weight": float(pose_direction_weight),
+            "contact_phase_weight": float(contact_phase_weight),
             "source_gap": int(source_gap),
             "disallow_same_source": bool(disallow_same_source),
             "energy_rerank_top_k": int(energy_rerank_top_k),
             "energy_rerank_weight": float(energy_rerank_weight),
             "retrieval_mode": "mmr" if effective_mmr_weight > 0 else "proxy",
+            "planner_version": "v3_transition_contact_segment_aware",
         },
     )
 
@@ -754,6 +902,13 @@ def save_auto_keyframes(plan: AutoKeyframePlan, out_motion_path: str, prefix: st
             "score": float(kf.score),
             "source": kf.source,
             "source_frame": int(kf.source_frame),
+            "source_segment_start": int(kf.score_parts.get("source_segment_start", kf.source_frame)),
+            "source_segment_end": int(kf.score_parts.get("source_segment_end", kf.source_frame)),
+            "contact_phase": str(kf.score_parts.get("contact_phase", contact_phase(kf.pose))),
+            "transition_in_cost": float(kf.score_parts.get("transition_in_cost", 0.0)),
+            "transition_out_cost": float(kf.score_parts.get("transition_out_cost", 0.0)),
+            "segment_energy": float(kf.score_parts.get("segment_energy", 0.0)),
+            "segment_velocity": float(kf.score_parts.get("segment_velocity", 0.0)),
             "score_parts": kf.score_parts,
         })
     meta_path = out_dir / f"{stem}_{prefix}_plan.json"
@@ -773,9 +928,11 @@ def _cli():
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--pose_space", default="normalized", choices=["normalized", "physical"])
     parser.add_argument("--max_candidates", type=int, default=5000)
+    parser.add_argument("--sample_stride", type=int, default=3)
     args = parser.parse_args()
     normalizer = load_normalizer_from_checkpoint(args.checkpoint)
-    cands = load_rag_candidates(args.rag_db, normalizer, args.pose_space, args.max_candidates)
+    cands = load_rag_candidates(args.rag_db, normalizer, args.pose_space, args.max_candidates, args.sample_stride)
+    annotate_candidate_statistics(cands)
     print(f"loaded candidates: {len(cands)}")
     if cands:
         print({k: v for k, v in cands[0].items() if k != "pose"})
