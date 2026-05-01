@@ -202,6 +202,7 @@ def skeleton_render(
     render=True,
     camera_mode="follow",
     output_path=None,
+    render_smooth_window=9,
 ):
     if render:
         Path(out).mkdir(parents=True, exist_ok=True)
@@ -238,7 +239,10 @@ def skeleton_render(
             contact = contact > 0.95
 
         # 对渲染序列做轻量时域平滑，改善观感上的抖动和僵硬感。
-        render_poses = smooth_sequence(poses.copy(), window=9)
+        render_poses = smooth_sequence(
+            poses.copy(),
+            window=max(1, int(render_smooth_window)),
+        )
 
         vis_poses = render_poses.copy()
         vis_poses[:, :, 1] = -render_poses[:, :, 2]  # Depth

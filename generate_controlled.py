@@ -15,6 +15,12 @@ except Exception:
 from EDGE import EDGE
 from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
 
+try:
+    from postprocess_footlock import foot_lock_root_correction, blend_back_to_trajectory
+except Exception:
+    foot_lock_root_correction = None
+    blend_back_to_trajectory = None
+
 
 ROOT_X_IDX = 4
 ROOT_Y_IDX = 5
@@ -332,9 +338,22 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
     def add_pose(path: str, frame: int, name: str):
         pose = load_151_pose(path)
         pose = normalize_pose_if_needed(pose, normalizer, args.pose_space)
-        value[frame] = pose
-        mask[frame] = frame_mask
-        print(f"✅ 已添加 {name} 关键帧: frame={frame}, path={path}")
+
+        width = max(0, int(getattr(args, "infer_keyframe_width", 0)))
+        start = max(0, frame - width)
+        end = min(num_frames, frame + width + 1)
+
+        for f in range(start, end):
+            value[f] = pose
+            mask[f] = frame_mask
+
+        if width > 0:
+            print(
+                f"✅ 已添加 {name} 关键帧窗口: "
+                f"center={frame}, range=[{start}, {end - 1}], path={path}"
+            )
+        else:
+            print(f"✅ 已添加 {name} 关键帧: frame={frame}, path={path}")
 
     add_pose(args.start_pose, 0, "start")
     add_pose(args.end_pose, num_frames - 1, "end")
@@ -490,6 +509,13 @@ def save_eval_assets(
         "eval_csv": str(eval_csv_path),
         "post_anchor_trajectory": bool(getattr(args, "post_anchor_trajectory", False)),
         "trajectory_anchor_strength": float(getattr(args, "trajectory_anchor_strength", 0.0)),
+        "post_foot_lock": bool(getattr(args, "post_foot_lock", False)),
+        "foot_lock_strength": float(getattr(args, "foot_lock_strength", 0.75)),
+        "foot_lock_traj_keep": float(getattr(args, "foot_lock_traj_keep", 0.65)),
+        "foot_lock_height_threshold": float(getattr(args, "foot_lock_height_threshold", 0.035)),
+        "foot_lock_speed_threshold": float(getattr(args, "foot_lock_speed_threshold", 0.08)),
+        "foot_lock_min_contact_len": int(getattr(args, "foot_lock_min_contact_len", 3)),
+        "foot_lock_smooth_window": int(getattr(args, "foot_lock_smooth_window", 9)),
         "sampler": getattr(args, "sampler", "ddpm"),
         "use_tto": not getattr(args, "no_tto", False),
         "tto_steps": int(getattr(args, "tto_steps", 1)),
@@ -549,6 +575,16 @@ def build_arg_parser():
         "--mid_pose_frames",
         default="",
         help="可选，中间关键帧位置，例如 '0.33,0.66' 或 '50,100'。",
+    )
+    parser.add_argument(
+        "--infer_keyframe_width",
+        type=int,
+        default=0,
+        help=(
+            "推理阶段关键帧约束宽度。0 表示只约束单帧；"
+            "3 表示约束 frame-3 到 frame+3。"
+            "用于减少 start/mid/end 附近的突变。"
+        ),
     )
 
     parser.add_argument(
@@ -648,6 +684,47 @@ def build_arg_parser():
             "0 表示不后处理，1 表示严格替换为目标轨迹。"
             "建议展示视频用 0.6~0.9。"
         ),
+    )
+    parser.add_argument(
+        "--post_foot_lock",
+        action="store_true",
+        help="生成后执行 contact-aware foot lock，降低 post trajectory anchor 导致的脚滑。",
+    )
+    parser.add_argument(
+        "--foot_lock_strength",
+        type=float,
+        default=0.75,
+        help="foot lock root 修正强度，建议 0.5~0.85。",
+    )
+    parser.add_argument(
+        "--foot_lock_traj_keep",
+        type=float,
+        default=0.65,
+        help="foot lock 后保留目标轨迹的比例，越大轨迹越准，越小脚滑越少。",
+    )
+    parser.add_argument(
+        "--foot_lock_height_threshold",
+        type=float,
+        default=0.035,
+        help="高度接触阈值，单位米。",
+    )
+    parser.add_argument(
+        "--foot_lock_speed_threshold",
+        type=float,
+        default=0.08,
+        help="脚底水平速度接触阈值，单位 m/s。",
+    )
+    parser.add_argument(
+        "--foot_lock_min_contact_len",
+        type=int,
+        default=3,
+        help="连续多少帧以上才认为是一段有效脚接触。",
+    )
+    parser.add_argument(
+        "--foot_lock_smooth_window",
+        type=int,
+        default=9,
+        help="root correction 平滑窗口。",
     )
 
     parser.add_argument(
@@ -857,6 +934,40 @@ def main():
     else:
         print("✅ 未启用 post trajectory anchor：final motion 等于 raw model/TTO output。")
 
+    if args.post_foot_lock:
+        if foot_lock_root_correction is None or blend_back_to_trajectory is None:
+            raise ImportError(
+                "post_foot_lock requires postprocess_footlock.py in project root."
+            )
+
+        print("🦶 post_foot_lock 已开启：执行 contact-aware root correction。")
+
+        motion_physical_final, footlock_debug = foot_lock_root_correction(
+            motion_physical_final,
+            device=str(device),
+            fps=args.fps,
+            height_threshold=args.foot_lock_height_threshold,
+            speed_threshold=args.foot_lock_speed_threshold,
+            min_contact_len=args.foot_lock_min_contact_len,
+            lock_strength=args.foot_lock_strength,
+            smooth_window=args.foot_lock_smooth_window,
+        )
+
+        if args.post_anchor_trajectory or float(args.trajectory_anchor_strength) > 0.0:
+            motion_physical_final = blend_back_to_trajectory(
+                motion_physical_final,
+                target_traj=traj_physical,
+                traj_keep=args.foot_lock_traj_keep,
+                keep_endpoints=True,
+            )
+
+        if trajectory_control_mode.startswith("postprocess"):
+            trajectory_control_mode = trajectory_control_mode + "+foot_lock"
+        else:
+            trajectory_control_mode = "postprocess_foot_lock"
+
+        print(f"🦶 foot lock debug: {footlock_debug}")
+
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     if args.save_eval_assets:
@@ -914,6 +1025,13 @@ def main():
             "hard_keyframe_project": not args.no_hard_keyframe_project,
             "post_anchor_trajectory": args.post_anchor_trajectory,
             "trajectory_anchor_strength": args.trajectory_anchor_strength,
+            "post_foot_lock": args.post_foot_lock,
+            "foot_lock_strength": args.foot_lock_strength,
+            "foot_lock_traj_keep": args.foot_lock_traj_keep,
+            "foot_lock_height_threshold": args.foot_lock_height_threshold,
+            "foot_lock_speed_threshold": args.foot_lock_speed_threshold,
+            "foot_lock_min_contact_len": args.foot_lock_min_contact_len,
+            "foot_lock_smooth_window": args.foot_lock_smooth_window,
             "beat_guidance_weight": args.beat_guidance_weight,
             "keep_trajectory_absolute": args.keep_trajectory_absolute,
             "uniform_trajectory_timing": args.uniform_trajectory_timing,
