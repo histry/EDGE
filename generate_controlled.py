@@ -16,10 +16,22 @@ from EDGE import EDGE
 from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
 
 try:
+    from auto_keyframe_planner import (
+        append_csv,
+        plan_auto_keyframes,
+        save_auto_keyframes,
+    )
+except Exception:
+    append_csv = None
+    plan_auto_keyframes = None
+    save_auto_keyframes = None
+
+try:
     from postprocess_footlock import foot_lock_root_correction, blend_back_to_trajectory
 except Exception:
     foot_lock_root_correction = None
     blend_back_to_trajectory = None
+
 
 
 ROOT_X_IDX = 4
@@ -500,6 +512,10 @@ def save_eval_assets(
         "end_pose": args.end_pose,
         "mid_poses": getattr(args, "mid_poses", ""),
         "mid_pose_frames": getattr(args, "mid_pose_frames", ""),
+        "auto_mid_keyframes": bool(getattr(args, "auto_mid_keyframes", False)),
+        "auto_mid_count": int(getattr(args, "auto_mid_count", 0)),
+        "rag_db": getattr(args, "rag_db", ""),
+        "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
         "trajectory": getattr(args, "trajectory", ""),
         "target_traj": getattr(args, "target_traj", ""),
         "motion_raw": str(raw_motion_path),
@@ -576,15 +592,73 @@ def build_arg_parser():
         default="",
         help="可选，中间关键帧位置，例如 '0.33,0.66' 或 '50,100'。",
     )
+
     parser.add_argument(
         "--infer_keyframe_width",
         type=int,
         default=0,
         help=(
-            "推理阶段关键帧约束宽度。0 表示只约束单帧；"
-            "3 表示约束 frame-3 到 frame+3。"
-            "用于减少 start/mid/end 附近的突变。"
+            "推理阶段关键帧约束窗口半径。0=只锁单帧；"
+            "1=锁 frame-1~frame+1。自动中间关键帧建议 0~1，"
+            "手工 4key 如果最后突变可试 2~3。"
         ),
+    )
+    parser.add_argument(
+        "--auto_mid_keyframes",
+        action="store_true",
+        help="启用系统自动中间关键帧规划：根据音乐 onset、轨迹转折和 RAG 姿态库自动插入中间姿态。",
+    )
+    parser.add_argument(
+        "--rag_db",
+        default="data/dunhuang_rag_db/rag_index.npz",
+        help="RAG 姿态库路径。可为 build_dunhuang_rag_db.py 生成的 rag_index.npz，也可为包含 .npy/.pkl 的目录。",
+    )
+    parser.add_argument(
+        "--auto_mid_count",
+        type=int,
+        default=3,
+        help="系统自动插入的中间关键帧数量。",
+    )
+    parser.add_argument(
+        "--auto_mid_min_gap",
+        type=int,
+        default=18,
+        help="自动关键帧与用户关键帧/其他自动关键帧的最小帧距。",
+    )
+    parser.add_argument(
+        "--auto_mid_pose_space",
+        default="normalized",
+        choices=["normalized", "physical"],
+        help="RAG 数据库里 151-D motion/pose 的空间。build_dunhuang_rag_db.py 默认输出 normalized。",
+    )
+    parser.add_argument(
+        "--auto_mid_max_candidates",
+        type=int,
+        default=5000,
+        help="RAG 检索时最多加载多少候选姿态。",
+    )
+    parser.add_argument(
+        "--auto_mid_sample_stride",
+        type=int,
+        default=3,
+        help="RAG 检索时对候选姿态的采样间隔，越大越快但候选更少。",
+    )
+    parser.add_argument(
+        "--auto_mid_music_weight",
+        type=float,
+        default=0.6,
+        help="自动选帧时音乐 onset 权重。",
+    )
+    parser.add_argument(
+        "--auto_mid_trajectory_weight",
+        type=float,
+        default=0.4,
+        help="自动选帧时轨迹转折权重。",
+    )
+    parser.add_argument(
+        "--save_auto_keyframes",
+        action="store_true",
+        help="保存自动规划出的中间关键帧 .npy 和 plan.json，便于复现实验与评估。",
     )
 
     parser.add_argument(
@@ -688,7 +762,7 @@ def build_arg_parser():
     parser.add_argument(
         "--post_foot_lock",
         action="store_true",
-        help="生成后执行 contact-aware foot lock，降低 post trajectory anchor 导致的脚滑。",
+        help="生成后执行 contact-aware root-only foot lock。注意：目前更推荐单独使用 postprocess_leg_ik.py。",
     )
     parser.add_argument(
         "--foot_lock_strength",
@@ -876,6 +950,77 @@ def main():
         smooth=not args.linear_trajectory,
     )
 
+    # ------------------------------------------------------------------
+    # 自动中间关键帧规划：用户只给 start/end 或少量 mid，系统从 RAG 库检索补全。
+    # 注意：这里会把自动关键帧保存为 .npy，并追加到 args.mid_poses/args.mid_pose_frames，
+    # 因而后续 build_constraint 与 eval_quantitative.py 无需额外改动。
+    # ------------------------------------------------------------------
+    args.auto_mid_plan_path = ""
+    if bool(getattr(args, "auto_mid_keyframes", False)):
+        if plan_auto_keyframes is None or save_auto_keyframes is None or append_csv is None:
+            raise ImportError(
+                "auto_mid_keyframes requires auto_keyframe_planner.py in project root."
+            )
+
+        print("🧠 启用自动中间关键帧规划：music/trajectory/RAG retrieval。")
+
+        start_pose_norm = normalize_pose_if_needed(
+            load_151_pose(args.start_pose),
+            normalizer,
+            args.pose_space,
+        )
+        end_pose_norm = normalize_pose_if_needed(
+            load_151_pose(args.end_pose),
+            normalizer,
+            args.pose_space,
+        )
+
+        user_mid_paths = parse_list(args.mid_poses)
+        user_mid_frames = parse_mid_frames(args.mid_pose_frames, len(user_mid_paths), num_frames)
+        user_mid_poses = [
+            normalize_pose_if_needed(load_151_pose(path), normalizer, args.pose_space)
+            for path in user_mid_paths
+        ]
+
+        # 如果用户没有显式写 mid_pose_frames，但提供了 mid_poses，
+        # 先把自动推断出的 user mid frames 固化，避免追加 auto frames 后数量不一致。
+        if user_mid_paths:
+            args.mid_pose_frames = ",".join(str(int(f)) for f in user_mid_frames)
+
+        auto_plan = plan_auto_keyframes(
+            start_pose=start_pose_norm,
+            end_pose=end_pose_norm,
+            user_mid_poses=user_mid_poses,
+            user_mid_frames=user_mid_frames,
+            audio_feature=audio_feature,
+            traj_physical=traj_physical,
+            rag_db=args.rag_db,
+            normalizer=normalizer,
+            num_frames=num_frames,
+            max_auto_keyframes=args.auto_mid_count,
+            min_gap=args.auto_mid_min_gap,
+            rag_pose_space=args.auto_mid_pose_space,
+            max_candidates=args.auto_mid_max_candidates,
+            sample_stride=args.auto_mid_sample_stride,
+            music_weight=args.auto_mid_music_weight,
+            trajectory_weight=args.auto_mid_trajectory_weight,
+        )
+
+        auto_paths, auto_frames, auto_plan_path = save_auto_keyframes(
+            auto_plan,
+            out_motion_path=args.out,
+            prefix="auto_mid",
+        )
+        args.auto_mid_plan_path = auto_plan_path
+
+        args.mid_poses = append_csv(args.mid_poses, auto_paths)
+        args.mid_pose_frames = append_csv(args.mid_pose_frames, auto_frames)
+
+        print("✅ 自动中间关键帧规划完成：")
+        for path, frame in zip(auto_paths, auto_frames):
+            print(f"  - frame={frame}, pose={path}")
+        print(f"✅ auto plan: {auto_plan_path}")
+
     cond = {
         "audio": torch.from_numpy(audio_feature[None]).to(
             device=device,
@@ -1004,6 +1149,16 @@ def main():
                 len(parse_list(args.mid_poses)),
                 num_frames,
             ),
+            "auto_mid_keyframes": args.auto_mid_keyframes,
+            "auto_mid_count": args.auto_mid_count,
+            "rag_db": args.rag_db,
+            "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
+            "auto_mid_min_gap": args.auto_mid_min_gap,
+            "auto_mid_pose_space": args.auto_mid_pose_space,
+            "auto_mid_max_candidates": args.auto_mid_max_candidates,
+            "auto_mid_sample_stride": args.auto_mid_sample_stride,
+            "auto_mid_music_weight": args.auto_mid_music_weight,
+            "auto_mid_trajectory_weight": args.auto_mid_trajectory_weight,
             "trajectory": args.trajectory,
             "target_traj": args.target_traj,
             "target_traj_saved": str(traj_path),
