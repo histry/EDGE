@@ -179,44 +179,54 @@ def _adam_or_momentum_tto(self, x, cond, t, constraint=None):
     m = torch.zeros_like(x_opt)
     v = torch.zeros_like(x_opt)
 
-    for step in range(1, steps + 1):
-        x_var = x_opt.detach().requires_grad_(True)
+    # p_sample_loop / generate_controlled may call sampling under torch.no_grad().
+    # TTO is the one place where gradients are required, so explicitly re-enable
+    # them only for this local optimization block.
+    with torch.enable_grad():
+        for step in range(1, steps + 1):
+            x_var = x_opt.detach().requires_grad_(True)
 
-        _, x_start = self.model_predictions(
-            x_var,
-            cond,
-            t,
-            clip_x_start=False,
-            constraint=constraint,
-        )
-        loss = _generic_tto_loss(self, x_start, cond, t, constraint=constraint)
+            _, x_start = self.model_predictions(
+                x_var,
+                cond,
+                t,
+                clip_x_start=False,
+                constraint=constraint,
+            )
+            loss = _generic_tto_loss(self, x_start, cond, t, constraint=constraint)
 
-        if not torch.isfinite(loss):
-            break
+            if not torch.isfinite(loss):
+                break
 
-        grad = torch.autograd.grad(loss, x_var, retain_graph=False, create_graph=False, allow_unused=False)[0]
-        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+            grad = torch.autograd.grad(
+                loss,
+                x_var,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+            grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if grad_clip > 0:
-            grad_norm = grad.flatten(1).norm(dim=1).view(-1, 1, 1).clamp_min(1e-8)
-            factor = (grad_clip / grad_norm).clamp(max=1.0)
-            grad = grad * factor
+            if grad_clip > 0:
+                grad_norm = grad.flatten(1).norm(dim=1).view(-1, 1, 1).clamp_min(1e-8)
+                factor = (grad_clip / grad_norm).clamp(max=1.0)
+                grad = grad * factor
 
-        if optimizer == "sgd":
-            update = grad
-        elif optimizer == "momentum":
-            m = momentum * m + grad
-            update = m
-        else:
-            # Adam is the default because complex pose/path constraints can
-            # otherwise oscillate with raw SGD.
-            m = beta1 * m + (1.0 - beta1) * grad
-            v = beta2 * v + (1.0 - beta2) * grad.pow(2)
-            m_hat = m / (1.0 - beta1 ** step)
-            v_hat = v / (1.0 - beta2 ** step)
-            update = m_hat / (v_hat.sqrt() + eps)
+            if optimizer == "sgd":
+                update = grad
+            elif optimizer == "momentum":
+                m = momentum * m + grad
+                update = m
+            else:
+                # Adam is the default because complex pose/path constraints can
+                # otherwise oscillate with raw SGD.
+                m = beta1 * m + (1.0 - beta1) * grad
+                v = beta2 * v + (1.0 - beta2) * grad.pow(2)
+                m_hat = m / (1.0 - beta1 ** step)
+                v_hat = v / (1.0 - beta2 ** step)
+                update = m_hat / (v_hat.sqrt() + eps)
 
-        x_opt = x_var.detach() - lr * update.detach()
+            x_opt = x_var.detach() - lr * update.detach()
 
     return x_opt.detach()
 

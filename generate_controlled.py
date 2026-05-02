@@ -700,7 +700,8 @@ def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_fram
         print("⚠️ auto_keyframe_planner 不可用，跳过 auto mid。")
         return
 
-    if int(getattr(args, "auto_mid_count", 0)) <= 0:
+    auto_count = int(getattr(args, "auto_mid_count", 0))
+    if auto_count <= 0:
         return
 
     out_dir = Path(args.out).parent
@@ -710,28 +711,57 @@ def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_fram
     manual_paths = parse_list(args.mid_poses)
     manual_frames = parse_mid_frames(args.mid_pose_frames, len(manual_paths), num_frames)
 
+    try:
+        start_pose_np = normalize_pose_if_needed(
+            load_151_pose(args.start_pose),
+            normalizer,
+            args.pose_space,
+        )
+        end_pose_np = normalize_pose_if_needed(
+            load_151_pose(args.end_pose),
+            normalizer,
+            args.pose_space,
+        )
+        user_mid_poses_np = [
+            normalize_pose_if_needed(load_151_pose(path), normalizer, args.pose_space)
+            for path in manual_paths
+        ]
+    except Exception as exc:
+        print(f"⚠️ auto mid 读取 start/end/user mid pose 失败，跳过 auto mid: {exc}")
+        return
+
+    # auto_keyframe_planner.plan_auto_keyframes in main requires:
+    # start_pose, end_pose, user_mid_poses, user_mid_frames, audio_feature,
+    # traj_physical, rag_db.  Older versions used different names, so keep
+    # aliases; _call_with_supported_kwargs will pass only supported arguments.
     planner_kwargs = dict(
+        start_pose=start_pose_np,
+        end_pose=end_pose_np,
+        user_mid_poses=user_mid_poses_np,
+        user_mid_frames=manual_frames,
         audio_feature=audio_feature,
         audio_features=audio_feature,
         traj_physical=traj_physical,
         traj_xz=traj_physical,
         trajectory=traj_physical,
-        start_pose_path=args.start_pose,
-        end_pose_path=args.end_pose,
-        start_pose=args.start_pose,
-        end_pose=args.end_pose,
+        rag_db=getattr(args, "rag_db", ""),
         normalizer=normalizer,
         num_frames=num_frames,
-        rag_db=getattr(args, "rag_db", ""),
-        count=int(getattr(args, "auto_mid_count", 1)),
-        num_keyframes=int(getattr(args, "auto_mid_count", 1)),
+
+        max_auto_keyframes=auto_count,
+        count=auto_count,
+        num_keyframes=auto_count,
         existing_frames=manual_frames,
+
         min_gap=int(getattr(args, "auto_mid_min_gap", 18)),
         source_gap=int(getattr(args, "auto_mid_source_gap", 150)),
         disallow_same_source=bool(getattr(args, "auto_mid_disallow_same_source", False)),
+
+        rag_pose_space=getattr(args, "auto_mid_pose_space", "normalized"),
         pose_space=getattr(args, "auto_mid_pose_space", "normalized"),
         max_candidates=int(getattr(args, "auto_mid_max_candidates", 5000)),
         sample_stride=int(getattr(args, "auto_mid_sample_stride", 3)),
+
         music_weight=float(getattr(args, "auto_mid_music_weight", 0.6)),
         trajectory_weight=float(getattr(args, "auto_mid_trajectory_weight", 0.4)),
         mmr_checkpoint=getattr(args, "mmr_checkpoint", ""),
@@ -744,6 +774,9 @@ def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_fram
         contact_weight=float(getattr(args, "auto_mid_contact_weight", 0.85)),
         contact_diversity_weight=float(getattr(args, "auto_mid_contact_diversity_weight", 0.60)),
         end_weight=float(getattr(args, "auto_mid_end_weight", 0.30)),
+
+        start_pose_path=args.start_pose,
+        end_pose_path=args.end_pose,
     )
 
     try:
