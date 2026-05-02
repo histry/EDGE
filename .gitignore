@@ -94,3 +94,4 @@ data/*.bvh
 *.obj
 *.exe
 *.log
+实验日志/
