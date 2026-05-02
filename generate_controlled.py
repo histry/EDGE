@@ -22,6 +22,11 @@ from EDGE import EDGE
 from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
 
 try:
+    from data.audio_extraction.baseline_features import extract as baseline_extract
+except Exception:
+    baseline_extract = None
+
+try:
     from auto_keyframe_planner import (
         append_csv,
         plan_auto_keyframes,
@@ -54,6 +59,22 @@ def to_numpy(x) -> np.ndarray:
     if torch.is_tensor(x):
         return x.detach().cpu().numpy()
     return np.asarray(x)
+
+
+def extract_audio_feature(path: str, feature_type: str) -> np.ndarray:
+    feature_type = str(feature_type).lower()
+    if feature_type == "baseline":
+        if baseline_extract is None:
+            raise RuntimeError("baseline audio extraction requested, but baseline_features.extract is unavailable")
+        result = baseline_extract(path)
+        if isinstance(result, tuple):
+            result = result[0]
+        return np.asarray(result, dtype=np.float32)
+
+    # stage-4/5 training commonly uses hybrid 803-D features.  For jukebox
+    # generation, upstream project usually provides precomputed features; this
+    # controlled script keeps hybrid extraction as the safe default.
+    return np.asarray(hybrid_extract(path), dtype=np.float32)
 
 
 def load_151_pose(path: str) -> np.ndarray:
@@ -173,24 +194,90 @@ def resample_feature(feature: np.ndarray, target_frames: int) -> np.ndarray:
     return tensor.transpose(1, 2).squeeze(0).numpy().astype(np.float32)
 
 
+def _safe_normalize_1d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.maximum(x, 0.0)
+    max_val = float(x.max()) if x.size else 0.0
+    if max_val <= 1e-8:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x / (max_val + 1e-8)).astype(np.float32)
+
+
+def extract_onset_strength_from_feature(
+    audio_feature: np.ndarray,
+    onset_index="auto",
+) -> np.ndarray:
+    """Return a safe onset/proxy-rhythm curve for any audio feature dimension.
+
+    Hybrid features historically place onset around index 768.  Baseline
+    features put onset at index 0.  For unknown dimensions, fall back to the
+    frame-to-frame feature-difference norm, which is always valid and prevents
+    IndexError when feature_dim <= 768.
+    """
+    audio_feature = np.asarray(audio_feature, dtype=np.float32)
+
+    if audio_feature.ndim != 2:
+        raise ValueError(f"audio_feature must be [T,C], got {audio_feature.shape}")
+
+    num_frames, feature_dim = audio_feature.shape
+    if num_frames == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    selected = None
+
+    if isinstance(onset_index, str):
+        onset_index = onset_index.strip().lower()
+        if onset_index not in {"", "auto", "none"}:
+            try:
+                onset_index = int(onset_index)
+            except ValueError:
+                onset_index = "auto"
+
+    if isinstance(onset_index, int):
+        if 0 <= onset_index < feature_dim:
+            selected = audio_feature[:, onset_index]
+        else:
+            print(
+                f"⚠️ onset_index={onset_index} 超出音频特征维度 {feature_dim}，"
+                "回退到自动节奏代理。"
+            )
+
+    if selected is None:
+        if feature_dim > 768:
+            selected = audio_feature[:, 768]
+        elif feature_dim >= 35:
+            # baseline_features layout: [envelope, 20 mfcc, 12 chroma, peak, beat]
+            selected = audio_feature[:, 0] + 0.5 * audio_feature[:, -2] + 0.5 * audio_feature[:, -1]
+        elif feature_dim > 1:
+            diff = np.zeros((num_frames,), dtype=np.float32)
+            if num_frames > 1:
+                delta = audio_feature[1:] - audio_feature[:-1]
+                diff[1:] = np.linalg.norm(delta, axis=-1)
+                diff[0] = diff[1]
+            selected = diff
+        else:
+            selected = audio_feature[:, 0]
+
+    return _safe_normalize_1d(selected)
+
+
 def build_trajectory_progress(
     audio_feature: np.ndarray,
     use_audio_timing: bool = True,
-    onset_index: int = 768,
+    onset_index="auto",
     min_speed_bias: float = 0.20,
 ) -> np.ndarray:
     num_frames = audio_feature.shape[0]
 
-    if (not use_audio_timing) or audio_feature.shape[1] <= onset_index:
+    if (not use_audio_timing) or num_frames <= 1:
         return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
 
-    onset = audio_feature[:, onset_index].astype(np.float32)
-    onset = np.maximum(onset, 0.0)
+    onset = extract_onset_strength_from_feature(audio_feature, onset_index=onset_index)
 
-    if float(onset.max()) <= 1e-8:
+    if onset.shape[0] != num_frames or float(onset.max()) <= 1e-8:
         return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
 
-    onset = onset / (float(onset.max()) + 1e-8)
     speed = onset + float(min_speed_bias)
     progress = np.cumsum(speed)
     progress = progress - progress[0]
@@ -266,6 +353,7 @@ def build_control_trajectory(
     keep_absolute: bool = False,
     uniform_timing: bool = False,
     smooth: bool = True,
+    onset_index="auto",
 ):
     num_frames = audio_feature.shape[0]
 
@@ -289,6 +377,7 @@ def build_control_trajectory(
         progress = build_trajectory_progress(
             audio_feature=audio_feature,
             use_audio_timing=not uniform_timing,
+            onset_index=onset_index,
         )
         traj_physical = interpolate_trajectory_smooth(
             points=points,
@@ -329,7 +418,6 @@ def make_keyframe_feature_mask(constrain_contacts: bool) -> np.ndarray:
     if constrain_contacts:
         mask_one_frame[CONTACT_SLICE] = 1.0
 
-    # root X/Z 由 root trajectory generator 控制，不在关键帧里锁死。
     mask_one_frame[ROOT_Y_IDX] = 1.0
     mask_one_frame[ROT_SLICE] = 1.0
     return mask_one_frame
@@ -360,17 +448,10 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
             value[f] = pose
             mask[f] = frame_mask * strength
 
-        if width > 0:
-            print(
-                f"✅ 已添加 {name} 关键帧窗口: "
-                f"center={frame}, range=[{start}, {end - 1}], "
-                f"strength={strength:.3f}, path={path}"
-            )
-        else:
-            print(
-                f"✅ 已添加 {name} 关键帧: "
-                f"frame={frame}, strength={strength:.3f}, path={path}"
-            )
+        print(
+            f"✅ 已添加 {name} 关键帧: frame={frame}, "
+            f"window=[{start},{end - 1}], strength={strength:.3f}, path={path}"
+        )
 
     endpoint_strength = float(getattr(args, "endpoint_keyframe_strength", 1.0))
     mid_strength = float(getattr(args, "mid_keyframe_strength", 0.35))
@@ -477,6 +558,9 @@ def save_eval_assets(
     meta = {
         "checkpoint": args.checkpoint,
         "music": args.music,
+        "feature_type": args.feature_type,
+        "audio_dim": int(args.audio_dim),
+        "trajectory_onset_index": str(getattr(args, "trajectory_onset_index", "auto")),
         "start_pose": args.start_pose,
         "end_pose": args.end_pose,
         "mid_poses": getattr(args, "mid_poses", ""),
@@ -496,12 +580,6 @@ def save_eval_assets(
         "sampler": getattr(args, "sampler", "ddpm"),
         "use_tto": not getattr(args, "no_tto", False),
         "trajectory_control_mode": trajectory_control_mode,
-        "architecture": {
-            "stage4": "ControlNet-like trajectory adapters in every decoder layer",
-            "stage5": "root trajectory generator + local pose diffusion residual",
-            "trajectory_feature": "normalized absolute X/Z + internal ΔX/ΔZ velocity",
-            "soft_keyframe": "mask strength is confidence; pose value is not numerically scaled",
-        },
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -521,28 +599,19 @@ def save_eval_assets(
 
 
 def _call_with_supported_kwargs(func, **kwargs):
-    """Call a function with only kwargs accepted by its current signature."""
     try:
         sig = inspect.signature(func)
     except Exception:
         return func(**kwargs)
 
-    if any(
-        param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in sig.parameters.values()
-    ):
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()):
         return func(**kwargs)
 
-    supported = {
-        name: value
-        for name, value in kwargs.items()
-        if name in sig.parameters
-    }
+    supported = {name: value for name, value in kwargs.items() if name in sig.parameters}
     return func(**supported)
 
 
 def _as_auto_keyframe_list(plan):
-    """Normalize planner outputs into a list of objects/dicts with frame+pose."""
     if plan is None:
         return []
     if hasattr(plan, "keyframes"):
@@ -577,52 +646,6 @@ def _save_auto_mid_fallback(keyframes, out_dir: Path, prefix: str):
         np.save(path, np.asarray(pose, dtype=np.float32))
         saved.append({"path": str(path), "frame": int(frame)})
     return saved
-
-
-def _normalize_saved_keyframe_records(saved, fallback_keyframes):
-    """Accept save_auto_keyframes return formats from old/new planner versions."""
-    if saved is None:
-        saved = []
-
-    records = []
-
-    if isinstance(saved, dict):
-        if "keyframes" in saved:
-            saved = saved["keyframes"]
-        else:
-            saved = [saved]
-
-    for item in list(saved):
-        if isinstance(item, (str, Path)):
-            records.append({"path": str(item), "frame": None})
-            continue
-        if isinstance(item, dict):
-            path = item.get("path") or item.get("pose_path") or item.get("file")
-            frame = item.get("frame")
-            if path is not None:
-                records.append({"path": str(path), "frame": frame})
-            continue
-        path = getattr(item, "path", None) or getattr(item, "pose_path", None)
-        frame = getattr(item, "frame", None)
-        if path is not None:
-            records.append({"path": str(path), "frame": frame})
-
-    if not records:
-        return []
-
-    fallback_frames = [
-        int(_get_keyframe_field(item, "frame"))
-        for item in fallback_keyframes
-        if _get_keyframe_field(item, "frame", None) is not None
-    ]
-
-    for i, record in enumerate(records):
-        if record["frame"] is None and i < len(fallback_frames):
-            record["frame"] = fallback_frames[i]
-        if record["frame"] is not None:
-            record["frame"] = int(record["frame"])
-
-    return [r for r in records if r.get("path") and r.get("frame") is not None]
 
 
 def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_frames):
@@ -688,7 +711,6 @@ def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_fram
             return
 
         saved_records = []
-
         if save_auto_keyframes is not None:
             try:
                 saved = _call_with_supported_kwargs(
@@ -699,7 +721,17 @@ def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_fram
                     output_dir=out_dir,
                     prefix=prefix,
                 )
-                saved_records = _normalize_saved_keyframe_records(saved, keyframes)
+                if isinstance(saved, dict) and "keyframes" in saved:
+                    saved = saved["keyframes"]
+                for item in list(saved or []):
+                    if isinstance(item, dict):
+                        path = item.get("path") or item.get("pose_path")
+                        frame = item.get("frame")
+                    else:
+                        path = getattr(item, "path", None) or getattr(item, "pose_path", None)
+                        frame = getattr(item, "frame", None)
+                    if path is not None and frame is not None:
+                        saved_records.append({"path": str(path), "frame": int(frame)})
             except Exception as exc:
                 print(f"⚠️ save_auto_keyframes 失败，使用 fallback 保存: {exc}")
 
@@ -719,28 +751,11 @@ def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_fram
         args.mid_poses = ",".join(all_paths)
         args.mid_pose_frames = ",".join(str(x) for x in all_frames)
 
-        plan_debug_path = out_dir / f"{prefix}_auto_mid_plan.json"
-        try:
-            debug_items = []
-            for path, frame, item in zip(auto_pose_paths, auto_frames, keyframes):
-                debug_items.append(
-                    {
-                        "path": path,
-                        "frame": int(frame),
-                        "score": float(_get_keyframe_field(item, "score", 0.0) or 0.0),
-                        "source": str(_get_keyframe_field(item, "source", "")),
-                        "source_frame": int(_get_keyframe_field(item, "source_frame", -1) or -1),
-                    }
-                )
-            with open(plan_debug_path, "w", encoding="utf-8") as f:
-                json.dump(debug_items, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
         print(f"✅ auto mid 已加入: count={len(auto_pose_paths)}, frames={auto_frames}")
 
     except Exception as exc:
         print(f"⚠️ 自动关键帧规划失败，跳过 auto mid: {exc}")
+
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -759,6 +774,15 @@ def build_arg_parser():
     parser.add_argument("--num_frames", type=int, default=150)
     parser.add_argument("--mixed_precision", default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--sampler", default="ddpm", choices=["ddpm", "ddim"])
+    parser.add_argument(
+        "--trajectory_onset_index",
+        default="auto",
+        help=(
+            "Feature index used for trajectory timing. "
+            "'auto' safely chooses hybrid index 768 when available, baseline onset/beat when not, "
+            "or frame-difference fallback for arbitrary feature dimensions."
+        ),
+    )
 
     parser.add_argument("--mid_poses", default="")
     parser.add_argument("--mid_pose_frames", default="")
@@ -783,7 +807,6 @@ def build_arg_parser():
     parser.add_argument("--tto_lr", type=float, default=0.03)
     parser.add_argument("--tto_contact_threshold", type=float, default=0.65)
 
-    # Auto-middle keyframe planner args.  Kept here so old experiment commands still run.
     parser.add_argument("--auto_mid_keyframes", action="store_true")
     parser.add_argument("--rag_db", default="data/dunhuang_rag_db/rag_index.npz")
     parser.add_argument("--auto_mid_count", type=int, default=0)
@@ -810,14 +833,10 @@ def build_arg_parser():
 
 
 def main():
-    parser = build_arg_parser()
-    args, unknown = parser.parse_known_args()
-    if unknown:
-        print(f"⚠️ 以下参数当前 generate_controlled.py 未使用，将被忽略: {unknown}")
+    args = build_arg_parser().parse_args()
     ensure_parent(args.out)
 
-    audio_feature = hybrid_extract(args.music)
-    audio_feature = np.asarray(audio_feature, dtype=np.float32)
+    audio_feature = extract_audio_feature(args.music, args.feature_type)
 
     if audio_feature.ndim != 2:
         raise ValueError(f"audio feature 应该是 [T,C]，当前是 {audio_feature.shape}")
@@ -846,6 +865,7 @@ def main():
         keep_absolute=args.keep_absolute_trajectory,
         uniform_timing=args.uniform_trajectory_timing,
         smooth=not args.linear_trajectory,
+        onset_index=args.trajectory_onset_index,
     )
 
     maybe_plan_auto_mid(
@@ -888,7 +908,6 @@ def main():
 
     motion_norm = to_numpy(sample)[0].astype(np.float32)
     motion_raw_physical = unnormalize_motion(normalizer, motion_norm)
-
     motion_final_physical = motion_raw_physical.copy()
 
     if args.post_anchor_trajectory or float(args.trajectory_anchor_strength) > 0:
