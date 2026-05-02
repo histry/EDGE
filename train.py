@@ -1,3 +1,8 @@
+try:
+    from trajectory_native_control import install_native_trajectory_control_patch
+    install_native_trajectory_control_patch(verbose=True)
+except Exception as exc:
+    print(f"⚠️ native trajectory patch not installed: {exc}")
 from args import parse_train_opt
 from EDGE import EDGE
 

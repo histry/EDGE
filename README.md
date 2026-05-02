@@ -32,3 +32,20 @@
 总计 4 + 3 + 144 = 151 维。
 
 For data and music-supervision limitations, see `docs/data_limitations.md`.
+
+我们发现目前 trajectory control 主要依赖 TTO 和后处理 anchor，模型原生循迹能力不足。为此新增了 native trajectory control patch：
+
+1. 在推理阶段加入 trajectory-specific classifier-free guidance。与普通 CFG 不同，它保留 audio 条件，只 drop trajectory 条件作为 baseline，因此能增强空间循迹而尽量不破坏音乐节奏。
+
+2. 在训练阶段将 trajectory loss 改为 time-dependent 权重，高噪声阶段更强调 root X/Z 宏观路径，低噪声阶段保留姿态细节生成。
+
+3. 将轨迹监督从单一绝对坐标 MSE 扩展为位置、相对速度、加速度和 endpoint 联合损失，降低长程漂移和终点误差。
+
+这个版本不依赖 TTO，也不强制后处理替换 root，因此能作为下一阶段提升原生可控性的基础。
+
+7. 后续如果这个补丁仍不够
+如果 native CFG + 动态 loss 仍然不足，再进入更大改动：
+阶段 2：把 trajectory 表征从绝对位置改成 ΔX/ΔZ 速度条件。
+阶段 3：新增 trajectory encoder / memory tokens。
+阶段 4：ControlNet-like 逐层 trajectory adapter。
+阶段 5：root trajectory generator + local pose diffusion 的分层生成。
