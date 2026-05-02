@@ -1,17 +1,20 @@
-"""Auto middle-keyframe planner with optional true MMR-RAG retrieval.
+"""Safe auto middle-keyframe planner for EDGE.
 
-Modes:
-- Proxy RAG: use onset/trajectory/pose distance/diversity.
-- True MMR-RAG: if --mmr_checkpoint and an MMR clip index with
-  motion_embeddings are provided, encode input music with AudioEncoder and rank
-  Dunhuang motion clips by shared latent-space similarity.
+This replacement keeps the original public API while adding safeguards for
+short 150-frame sequences:
 
-The output is still standard .npy mid-keyframes, so generate_controlled.py and
-existing eval_quantitative.py do not need structural changes.
+- adaptive limit on number of auto mid keyframes;
+- adaptive min_gap based on sequence length;
+- source-region diversity;
+- soft reporting metadata so experiments can be audited.
+
+It does not train the model.  It only affects inference-time auto keyframe
+selection used by generate_controlled.py.
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import pickle
 from dataclasses import dataclass
@@ -20,7 +23,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 try:
     from dataset.quaternion import ax_to_6v
@@ -36,6 +38,7 @@ try:
     from model.mmr_encoder import load_mmr_model
 except Exception:
     load_mmr_model = None
+
 
 ROOT_X_IDX = 4
 ROOT_Y_IDX = 5
@@ -116,7 +119,8 @@ def normalize_motion_if_needed(motion: np.ndarray, normalizer, pose_space: str) 
 def _pkl_to_motion_151(path: Path) -> Optional[np.ndarray]:
     if SMPLSkeleton is None or ax_to_6v is None or vectorize_many is None:
         return None
-    data = pickle.load(open(path, "rb"))
+    with open(path, "rb") as f:
+        data = pickle.load(f)
     if "pos" not in data or "q" not in data:
         return None
     pos = torch.tensor(data["pos"], dtype=torch.float32).unsqueeze(0)
@@ -159,7 +163,6 @@ def load_rag_candidates(
     max_candidates: int = 5000,
     sample_stride: int = 1,
 ) -> List[Dict[str, object]]:
-    """Load pose-level or MMR clip-level RAG candidates."""
     path = Path(rag_db)
     candidates: List[Dict[str, object]] = []
 
@@ -227,13 +230,6 @@ def load_rag_candidates(
 
 
 def annotate_candidate_statistics(candidates: List[Dict[str, object]]):
-    """Attach normalized ranking features to RAG candidates in-place.
-
-    MMR-RAG databases store raw motion_energy/contact_stability values whose
-    numeric scales differ across datasets.  We convert motion_energy to a robust
-    0..1 percentile score so the planner can do an energy-aware rerank without
-    letting raw scale dominate pose/keyframe compatibility.
-    """
     if not candidates:
         return
 
@@ -318,21 +314,80 @@ def trajectory_curvature_score(traj_physical: np.ndarray) -> np.ndarray:
     return normalize_01(smooth_1d(out, 5))
 
 
-def choose_auto_frames(audio_feature, traj_physical, num_frames, count, existing_frames, min_gap=18, edge_margin=8, music_weight=0.6, trajectory_weight=0.4) -> List[int]:
+def adaptive_auto_mid_count(num_frames: int, requested_count: int, fps: int = 30) -> int:
+    """Cap auto-mid density to protect motion naturalness.
+
+    At 30 fps:
+      <= 5s  (<=150 frames): at most 1 auto mid
+      <= 8s  (<=240 frames): at most 2
+      longer: at most 3
+    """
+    requested_count = max(0, int(requested_count))
+    num_frames = max(1, int(num_frames))
+    if requested_count <= 0:
+        return 0
+
+    if num_frames <= int(5.0 * fps):
+        cap = 1
+    elif num_frames <= int(8.0 * fps):
+        cap = 2
+    else:
+        cap = 3
+
+    effective = min(requested_count, cap)
+    if effective < requested_count:
+        print(
+            f"⚠️ auto_mid_count={requested_count} is dense for num_frames={num_frames}; "
+            f"using effective_auto_mid_count={effective}. "
+            "Use longer sequences for 3 auto mid keyframes."
+        )
+    return effective
+
+
+def adaptive_min_gap(num_frames: int, count: int, requested_min_gap: int = 18, edge_margin: int = 8) -> int:
+    count = max(1, int(count))
+    available = max(1, int(num_frames) - 2 * int(edge_margin))
+    # Keep at least requested_min_gap, but avoid impossible spacing.
+    max_feasible_gap = max(1, available // (count + 2))
+    return int(max(1, min(int(requested_min_gap), max_feasible_gap)))
+
+
+def choose_auto_frames(
+    audio_feature,
+    traj_physical,
+    num_frames,
+    count,
+    existing_frames,
+    min_gap=18,
+    edge_margin=8,
+    music_weight=0.6,
+    trajectory_weight=0.4,
+    fps=30,
+) -> List[int]:
+    count = adaptive_auto_mid_count(num_frames, count, fps=fps)
     if count <= 0:
         return []
+
+    min_gap = adaptive_min_gap(num_frames, count, min_gap, edge_margin=edge_margin)
+
     onset = audio_onset_score(audio_feature)
     if len(onset) != num_frames:
-        onset = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, len(onset)), onset).astype(np.float32)
+        onset = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, max(1, len(onset))), onset if len(onset) else [0.0]).astype(np.float32)
+
     curvature = trajectory_curvature_score(traj_physical)
     if len(curvature) != num_frames:
-        curvature = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, len(curvature)), curvature).astype(np.float32)
+        curvature = np.interp(np.linspace(0, 1, num_frames), np.linspace(0, 1, max(1, len(curvature))), curvature if len(curvature) else [0.0]).astype(np.float32)
+
     score = float(music_weight) * normalize_01(onset) + float(trajectory_weight) * normalize_01(curvature)
     blocked = np.zeros((num_frames,), dtype=bool)
+
     for frame in list(existing_frames) + [0, num_frames - 1]:
         blocked[max(0, int(frame) - min_gap): min(num_frames, int(frame) + min_gap + 1)] = True
+
+    edge_margin = max(1, int(edge_margin))
     blocked[:edge_margin] = True
     blocked[num_frames - edge_margin:] = True
+
     frames = []
     for _ in range(int(count)):
         s = score.copy()
@@ -342,14 +397,20 @@ def choose_auto_frames(audio_feature, traj_physical, num_frames, count, existing
             break
         frames.append(frame)
         blocked[max(0, frame - min_gap): min(num_frames, frame + min_gap + 1)] = True
+
     if len(frames) < count:
         grid = [int(round((i + 1) * (num_frames - 1) / (count + 1))) for i in range(count)]
         for frame in grid:
             if len(frames) >= count:
                 break
+            frame = max(edge_margin, min(num_frames - edge_margin - 1, int(frame)))
             if all(abs(frame - f) >= min_gap for f in frames + list(existing_frames) + [0, num_frames - 1]):
-                frames.append(max(edge_margin, min(num_frames - edge_margin - 1, frame)))
-    return sorted(set(frames))[:count]
+                frames.append(frame)
+
+    frames = sorted(set(frames))[:count]
+    if len(frames) < count:
+        print(f"⚠️ only selected {len(frames)}/{count} auto mid frames under spacing constraints.")
+    return frames
 
 
 def pose_feature(pose: np.ndarray) -> np.ndarray:
@@ -428,12 +489,6 @@ def cosine_distance(a, b) -> float:
 
 
 def is_same_source_region(candidate, selected_keyframes, source_gap: int = 120, disallow_same_source: bool = False) -> Tuple[bool, str]:
-    """Hard source-diversity constraint for auto mid-keyframes.
-
-    The previous planner could select the exact same source clip and source_frame
-    for multiple mid keyframes, causing visually repeated hops.  This function
-    rejects a candidate if it is too close to any already selected source region.
-    """
     src = str(candidate.get("source", ""))
     sf = int(candidate.get("source_frame", -1))
     gap = max(0, int(source_gap))
@@ -455,11 +510,6 @@ def contact_pattern(pose: np.ndarray) -> np.ndarray:
 
 
 def contact_diversity_cost(pose: np.ndarray, selected_poses: Sequence[np.ndarray]) -> float:
-    """Penalize repeating the same foot-contact pattern.
-
-    This helps reduce repeated one-leg support / one-leg hopping when several
-    auto mid-keyframes are chosen from similar contact states.
-    """
     if not selected_poses:
         return 0.0
     cp = contact_pattern(pose)
@@ -493,14 +543,6 @@ def choose_candidate_for_frame(
     energy_rerank_top_k: int = 80,
     energy_rerank_weight: float = 0.25,
 ) -> AutoKeyframe:
-    """Choose the best candidate for one auto-mid frame.
-
-    The first-stage score enforces compatibility: MMR distance, start/end pose
-    interpolation, trajectory direction, contact stability and source diversity.
-    Then a second-stage energy rerank is applied only within the top-K compatible
-    candidates, so the planner prefers more dynamic clips without sacrificing
-    transition plausibility.
-    """
     ref_feat = interpolate_pose_feature_at_frame(frame, anchors)
     tangent = target_traj_tangent(traj_physical, frame)
     selected_keyframes = selected_keyframes or []
@@ -527,10 +569,6 @@ def choose_candidate_for_frame(
 
         energy_norm = float(cand.get("motion_energy_norm", 0.0) or 0.0)
         energy_norm = float(np.clip(energy_norm, 0.0, 1.0))
-
-        # Prefer medium-energy dance clips instead of blindly maximizing energy.
-        # Very high energy candidates often correspond to hops / fast steps, which
-        # conflict with post trajectory anchoring and worsen foot sliding.
         e_target = float(np.clip(energy_target, 0.0, 1.0))
         e_band = max(float(energy_band), 1e-6)
         energy_cost = float(min(abs(energy_norm - e_target) / e_band, 2.0))
@@ -566,8 +604,6 @@ def choose_candidate_for_frame(
                 "diversity_cost": float(diversity_cost),
                 "motion_energy_cost": float(energy_cost),
                 "motion_energy_norm": float(energy_norm),
-                "motion_energy_target": float(np.clip(energy_target, 0.0, 1.0)),
-                "motion_energy_band": float(max(float(energy_band), 1e-6)),
                 "contact_stability_cost": float(contact_cost),
                 "contact_diversity_cost": float(contact_div_cost),
                 "end_compat_cost": float(end_compat_cost),
@@ -607,6 +643,7 @@ def choose_candidate_for_frame(
     top_k = int(energy_rerank_top_k)
     if top_k > 0 and float(energy_rerank_weight) > 0:
         pool = scored[: min(top_k, len(scored))]
+
         def rerank_key(item):
             base_score, energy_norm_value, _kf = item
             e_target = float(np.clip(energy_target, 0.0, 1.0))
@@ -623,7 +660,6 @@ def choose_candidate_for_frame(
         best_kf.score_parts["energy_rerank_top_k"] = int(top_k)
         best_kf.score_parts["energy_rerank_weight"] = float(energy_rerank_weight)
         best_kf.score_parts["energy_rerank_target_cost"] = float(energy_target_cost)
-        best_kf.score_parts["energy_rerank_penalty"] = float(float(energy_rerank_weight) * energy_target_cost)
         best_kf.score_parts["score_after_energy_rerank"] = final_score
         best_kf.score_parts["compatible_pool_size"] = int(len(pool))
         return best_kf
@@ -667,30 +703,54 @@ def plan_auto_keyframes(
     disallow_same_source: bool = False,
     energy_rerank_top_k: int = 80,
     energy_rerank_weight: float = 0.25,
+    fps: int = 30,
 ) -> AutoKeyframePlan:
-    candidates = load_rag_candidates(rag_db, normalizer=normalizer, pose_space=rag_pose_space, max_candidates=max_candidates, sample_stride=sample_stride)
+    effective_count = adaptive_auto_mid_count(num_frames, max_auto_keyframes, fps=fps)
+    effective_gap = adaptive_min_gap(num_frames, max(1, effective_count), min_gap) if effective_count > 0 else int(min_gap)
+
+    candidates = load_rag_candidates(
+        rag_db,
+        normalizer=normalizer,
+        pose_space=rag_pose_space,
+        max_candidates=max_candidates,
+        sample_stride=sample_stride,
+    )
     if not candidates:
         raise RuntimeError(f"No valid RAG candidates found in {rag_db}")
+
     annotate_candidate_statistics(candidates)
-    anchors = [(0, start_pose), (num_frames - 1, end_pose)]
+
+    anchors = [(0, np.asarray(start_pose, dtype=np.float32)), (num_frames - 1, np.asarray(end_pose, dtype=np.float32))]
     for f, p in zip(user_mid_frames, user_mid_poses):
         anchors.append((int(f), np.asarray(p, dtype=np.float32)))
     anchors = sorted(anchors, key=lambda x: x[0])
-    frames = choose_auto_frames(audio_feature, traj_physical, num_frames, int(max_auto_keyframes), [f for f, _ in anchors], int(min_gap), music_weight=music_weight, trajectory_weight=trajectory_weight)
+
+    frames = choose_auto_frames(
+        audio_feature,
+        traj_physical,
+        num_frames,
+        effective_count,
+        [f for f, _ in anchors],
+        int(effective_gap),
+        music_weight=music_weight,
+        trajectory_weight=trajectory_weight,
+        fps=fps,
+    )
+
     audio_embedding = encode_audio_with_mmr(audio_feature, mmr_checkpoint, mmr_device) if mmr_checkpoint else None
-    effective_mmr_weight = float(mmr_weight) if audio_embedding is not None else 0.0
-    selected: List[AutoKeyframe] = []
-    selected_poses: List[np.ndarray] = []
+    keyframes: List[AutoKeyframe] = []
+    selected_poses = [np.asarray(p, dtype=np.float32) for _, p in anchors]
+
     for frame in frames:
         kf = choose_candidate_for_frame(
             frame=frame,
             candidates=candidates,
-            anchors=anchors + [(k.frame, k.pose) for k in selected],
+            anchors=anchors,
             traj_physical=traj_physical,
             selected_poses=selected_poses,
-            selected_keyframes=selected,
+            selected_keyframes=keyframes,
             audio_embedding=audio_embedding,
-            w_mmr=effective_mmr_weight,
+            w_mmr=mmr_weight,
             w_pose=pose_weight,
             w_traj=trajectory_weight,
             w_diversity=diversity_weight,
@@ -705,82 +765,143 @@ def plan_auto_keyframes(
             energy_rerank_top_k=energy_rerank_top_k,
             energy_rerank_weight=energy_rerank_weight,
         )
-        selected.append(kf)
+        keyframes.append(kf)
         selected_poses.append(kf.pose)
-    selected = sorted(selected, key=lambda x: x.frame)
-    return AutoKeyframePlan(
-        keyframes=selected,
-        frame_candidates=frames,
-        meta={
-            "rag_db": str(rag_db),
-            "candidate_count": len(candidates),
-            "max_auto_keyframes": int(max_auto_keyframes),
-            "min_gap": int(min_gap),
-            "music_weight": float(music_weight),
-            "trajectory_weight": float(trajectory_weight),
-            "rag_pose_space": rag_pose_space,
-            "mmr_checkpoint": str(mmr_checkpoint),
-            "mmr_weight": float(effective_mmr_weight),
-            "pose_weight": float(pose_weight),
-            "diversity_weight": float(diversity_weight),
-            "energy_weight": float(energy_weight),
-            "contact_weight": float(contact_weight),
-            "contact_diversity_weight": float(contact_diversity_weight),
-            "end_weight": float(end_weight),
-            "source_gap": int(source_gap),
-            "disallow_same_source": bool(disallow_same_source),
-            "energy_rerank_top_k": int(energy_rerank_top_k),
-            "energy_rerank_weight": float(energy_rerank_weight),
-            "retrieval_mode": "mmr" if effective_mmr_weight > 0 else "proxy",
-        },
-    )
+
+    meta = {
+        "requested_auto_keyframes": int(max_auto_keyframes),
+        "effective_auto_keyframes": int(effective_count),
+        "requested_min_gap": int(min_gap),
+        "effective_min_gap": int(effective_gap),
+        "num_frames": int(num_frames),
+        "fps": int(fps),
+        "rag_db": str(rag_db),
+        "num_candidates": int(len(candidates)),
+        "frame_candidates": [int(f) for f in frames],
+        "warning": (
+            "Auto mid count was capped for short sequence naturalness."
+            if effective_count < int(max_auto_keyframes)
+            else ""
+        ),
+    }
+
+    return AutoKeyframePlan(keyframes=keyframes, frame_candidates=frames, meta=meta)
 
 
-def save_auto_keyframes(plan: AutoKeyframePlan, out_motion_path: str, prefix: str = "auto_mid"):
-    out_motion_path = Path(out_motion_path)
-    out_dir = out_motion_path.parent
-    stem = out_motion_path.stem
+def save_auto_keyframes(
+    plan: Optional[AutoKeyframePlan] = None,
+    keyframes: Optional[Sequence[AutoKeyframe]] = None,
+    out_dir=None,
+    output_dir=None,
+    prefix: str = "auto_mid",
+    out_motion_path: str = "",
+):
+    """Save auto keyframes and return records.
+
+    Compatible with both older call sites requiring out_motion_path and newer
+    generate_controlled.py fallback style.
+    """
+    if keyframes is None:
+        keyframes = [] if plan is None else plan.keyframes
+
+    if out_dir is None:
+        out_dir = output_dir
+    if out_dir is None and out_motion_path:
+        out_dir = Path(out_motion_path).parent
+    if out_dir is None:
+        out_dir = "."
+
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths, frames, rows = [], [], []
-    for idx, kf in enumerate(plan.keyframes, start=1):
-        path = out_dir / f"{stem}_{prefix}{idx}_f{kf.frame:03d}.npy"
-        np.save(path, kf.pose.astype(np.float32))
-        paths.append(str(path))
-        frames.append(int(kf.frame))
-        rows.append({
-            "index": idx,
-            "frame": int(kf.frame),
+
+    records = []
+    for i, kf in enumerate(keyframes, start=1):
+        path = out_dir / f"{prefix}_auto_mid_{i:02d}.npy"
+        np.save(path, np.asarray(kf.pose, dtype=np.float32))
+        records.append({
+            "path": str(path),
             "pose_path": str(path),
+            "frame": int(kf.frame),
             "score": float(kf.score),
-            "source": kf.source,
+            "source": str(kf.source),
             "source_frame": int(kf.source_frame),
-            "score_parts": kf.score_parts,
+            "score_parts": dict(kf.score_parts),
         })
-    meta_path = out_dir / f"{stem}_{prefix}_plan.json"
+
+    meta_path = out_dir / f"{prefix}_auto_mid_plan.json"
+    meta = {} if plan is None else dict(plan.meta)
+    meta["keyframes"] = records
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump({"auto_keyframes": rows, "frame_candidates": plan.frame_candidates, "planner_meta": plan.meta}, f, ensure_ascii=False, indent=2)
-    return paths, frames, str(meta_path)
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return records
 
 
-def append_csv(existing: str, values: Sequence[object]) -> str:
-    old = [x.strip() for x in str(existing or "").replace(";", ",").split(",") if x.strip()]
-    return ",".join(old + [str(v) for v in values])
+def append_csv(path, row: Dict[str, object]):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(row.keys())
+    exists = path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
-def _cli():
-    parser = argparse.ArgumentParser()
+def _load_pose_151(path: str) -> np.ndarray:
+    arr = np.load(path, allow_pickle=True)
+    if arr.ndim == 0 and isinstance(arr.item(), dict):
+        data = arr.item()
+        for key in ("motion", "pose", "pose_151", "smpl_151"):
+            if key in data:
+                arr = data[key]
+                break
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[0]
+    arr = arr.reshape(-1)
+    if arr.shape[0] != 151:
+        raise ValueError(f"{path} must be 151-D, got {arr.shape}")
+    return arr.astype(np.float32)
+
+
+def main():
+    parser = argparse.ArgumentParser("Safe auto middle-keyframe planner")
+    parser.add_argument("--start_pose", required=True)
+    parser.add_argument("--end_pose", required=True)
     parser.add_argument("--rag_db", required=True)
-    parser.add_argument("--checkpoint", default="")
-    parser.add_argument("--pose_space", default="normalized", choices=["normalized", "physical"])
-    parser.add_argument("--max_candidates", type=int, default=5000)
+    parser.add_argument("--audio_feature", required=True, help="Path to [T,C] .npy audio feature")
+    parser.add_argument("--traj", required=True, help="Path to [T,2] .npy trajectory")
+    parser.add_argument("--out_dir", default="output/auto_mid")
+    parser.add_argument("--prefix", default="auto_mid")
+    parser.add_argument("--num_frames", type=int, default=150)
+    parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--min_gap", type=int, default=18)
+    parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args()
-    normalizer = load_normalizer_from_checkpoint(args.checkpoint)
-    cands = load_rag_candidates(args.rag_db, normalizer, args.pose_space, args.max_candidates)
-    print(f"loaded candidates: {len(cands)}")
-    if cands:
-        print({k: v for k, v in cands[0].items() if k != "pose"})
-        print("pose shape:", cands[0]["pose"].shape)
+
+    start = _load_pose_151(args.start_pose)
+    end = _load_pose_151(args.end_pose)
+    audio = np.asarray(np.load(args.audio_feature), dtype=np.float32)
+    traj = np.asarray(np.load(args.traj), dtype=np.float32)
+
+    plan = plan_auto_keyframes(
+        start_pose=start,
+        end_pose=end,
+        user_mid_poses=[],
+        user_mid_frames=[],
+        audio_feature=audio,
+        traj_physical=traj,
+        rag_db=args.rag_db,
+        num_frames=args.num_frames,
+        max_auto_keyframes=args.count,
+        min_gap=args.min_gap,
+        fps=args.fps,
+    )
+    records = save_auto_keyframes(plan=plan, out_dir=args.out_dir, prefix=args.prefix)
+    print(json.dumps({"records": records, "meta": plan.meta}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
-    _cli()
+    main()
