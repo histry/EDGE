@@ -61,20 +61,64 @@ def to_numpy(x) -> np.ndarray:
     return np.asarray(x)
 
 
+def _coerce_audio_extract_result(result, feature_type: str) -> np.ndarray:
+    """Normalize audio extractor return values to a [T, C] float32 array.
+
+    Some EDGE extractors return only the feature array, while the current
+    hybrid/baseline extractors may return (feature_array, save_path).  This
+    helper prevents np.asarray((array, path)) from producing an inhomogeneous
+    object array and crashing generation.
+    """
+    if isinstance(result, tuple):
+        for item in result:
+            if isinstance(item, (str, Path)):
+                continue
+            arr = np.asarray(item, dtype=np.float32)
+            if arr.ndim >= 2:
+                return arr
+        result = result[0]
+
+    if isinstance(result, (str, Path)):
+        result_path = Path(result)
+        if not result_path.exists():
+            raise FileNotFoundError(
+                f"{feature_type} audio extractor returned missing file: {result_path}"
+            )
+        result = np.load(result_path)
+
+    arr = np.asarray(result, dtype=np.float32)
+
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+
+    if arr.ndim != 2:
+        raise ValueError(
+            f"{feature_type} audio feature must be [T,C], got shape={arr.shape}"
+        )
+
+    return arr.astype(np.float32)
+
+
 def extract_audio_feature(path: str, feature_type: str) -> np.ndarray:
     feature_type = str(feature_type).lower()
+
     if feature_type == "baseline":
         if baseline_extract is None:
-            raise RuntimeError("baseline audio extraction requested, but baseline_features.extract is unavailable")
-        result = baseline_extract(path)
-        if isinstance(result, tuple):
-            result = result[0]
-        return np.asarray(result, dtype=np.float32)
+            raise RuntimeError(
+                "baseline audio extraction requested, but baseline_features.extract is unavailable"
+            )
+        return _coerce_audio_extract_result(
+            baseline_extract(path),
+            feature_type="baseline",
+        )
 
-    # stage-4/5 training commonly uses hybrid 803-D features.  For jukebox
-    # generation, upstream project usually provides precomputed features; this
-    # controlled script keeps hybrid extraction as the safe default.
-    return np.asarray(hybrid_extract(path), dtype=np.float32)
+    if feature_type in {"hybrid", "jukebox"}:
+        return _coerce_audio_extract_result(
+            hybrid_extract(path),
+            feature_type=feature_type,
+        )
+
+    raise ValueError(f"Unsupported feature_type: {feature_type}")
 
 
 def load_151_pose(path: str) -> np.ndarray:
