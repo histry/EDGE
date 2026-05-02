@@ -1,37 +1,96 @@
-# ==========================================
-# 1. 全局拦截：忽略所有文件和文件夹
-# ==========================================
+# 默认忽略所有文件
 *
 
-# ==========================================
-# 2. 全局放行：允许追踪文件夹及指定后缀文件
-# ==========================================
-# 允许追踪所有文件夹（这是为了让Git能进入子目录寻找允许的文件）
+# 允许 Git 进入目录
 !*/
 
-# 允许追踪指定的代码和文档文件
+# 代码、文档、环境、配置
 !*.py
 !*.md
+
 !environment.yml
 !requirements-edge.txt
 !requirements-jukebox-optional.txt
 !setup_edge_env.sh
 
-# 允许追踪 .gitignore 自身
+!LICENSE
+!NOTICE
+!CITATION.cff
+
+!pyproject.toml
+!setup.cfg
+!setup.py
+!MANIFEST.in
+
+!*.yaml
+!*.yml
+!*.toml
+
 !.gitignore
 
-# ==========================================
-# 3. 局部封杀：绝对不追踪的特定文件夹
-# （放在最后，用来覆盖上面的 "!*/" 和 "!*.py" 规则）
-# ==========================================
-train/
-test/
-edge_aistpp/
-dataset_backups/
-runs/
+# 文档归档目录
+!READ/
+!READ/**/*.md
+
+# GitHub Actions / CI
+!.github/
+!.github/**
+
+# 可复现实验脚本
+!scripts/
+!scripts/*.sh
+
+# 临时文件、训练输出、数据、权重
 wandb/
-renders/
-.ipynb_checkpoints/
+tmp/
+tmp*/
 __pycache__/
+*.py[cod]
+
+runs/
+renders/
+output/
+checkpoints/
+weights/
 cached_features/
+
 custom_music/
+proxy_music/
+raw_data/
+media/
+test_keyframes/
+test_music_bank/
+
+SMPL-to-FBX/
+
+data/aist/
+data/aist_audio/
+data/backup/
+data/dunhuang_bvh/
+data/dunhuang_rag_db/
+data/mmr_aist/
+data/proxy_weak_pairs/
+data/rag_segment_pairs/
+data/splits/
+data/test/
+data/train/
+data/*.pkl
+data/*.bvh
+
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.gif
+*.bvh
+*.fbx
+*.obj
+*.exe
+*.log
