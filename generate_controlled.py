@@ -1,8 +1,14 @@
+try:
+    from trajectory_native_control import install_native_trajectory_control_patch
+    install_native_trajectory_control_patch(verbose=True)
+except Exception as exc:
+    print(f"⚠️ native trajectory patch not installed: {exc}")
+
 import argparse
+import inspect
 import json
 from pathlib import Path
 
-import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,16 +37,6 @@ try:
 except Exception:
     foot_lock_root_correction = None
     blend_back_to_trajectory = None
-
-try:
-    from retrieved_clip_prior import (
-        install_retrieved_clip_prior_patch,
-        build_retrieved_clip_prior_from_plan,
-    )
-except Exception:
-    install_retrieved_clip_prior_patch = None
-    build_retrieved_clip_prior_from_plan = None
-
 
 
 ROOT_X_IDX = 4
@@ -121,7 +117,6 @@ def parse_mid_frames(text: str, num_mid: int, num_frames: int):
 
 def parse_trajectory_points(text: str) -> np.ndarray:
     points = []
-
     for item in text.split(";"):
         item = item.strip()
         if not item:
@@ -196,12 +191,10 @@ def build_trajectory_progress(
         return np.linspace(0.0, 1.0, num_frames, dtype=np.float32)
 
     onset = onset / (float(onset.max()) + 1e-8)
-
     speed = onset + float(min_speed_bias)
     progress = np.cumsum(speed)
     progress = progress - progress[0]
     progress = progress / max(float(progress[-1]), 1e-8)
-
     return progress.astype(np.float32)
 
 
@@ -225,7 +218,6 @@ def interpolate_trajectory_smooth(
 
     if smooth and spi is not None and len(points) >= 3:
         k = min(3, len(points) - 1)
-
         try:
             tck, _ = spi.splprep(
                 [points[:, 0], points[:, 1]],
@@ -240,7 +232,6 @@ def interpolate_trajectory_smooth(
 
     x_new = np.interp(progress, u, points[:, 0])
     z_new = np.interp(progress, u, points[:, 1])
-
     return np.stack([x_new, z_new], axis=-1).astype(np.float32)
 
 
@@ -293,15 +284,12 @@ def build_control_trajectory(
 
         if len(traj_physical) != num_frames:
             traj_physical = resample_feature(traj_physical, num_frames)
-
     else:
         points = parse_trajectory_points(trajectory_text)
-
         progress = build_trajectory_progress(
             audio_feature=audio_feature,
             use_audio_timing=not uniform_timing,
         )
-
         traj_physical = interpolate_trajectory_smooth(
             points=points,
             progress=progress,
@@ -341,10 +329,9 @@ def make_keyframe_feature_mask(constrain_contacts: bool) -> np.ndarray:
     if constrain_contacts:
         mask_one_frame[CONTACT_SLICE] = 1.0
 
-    # root X/Z 由 trajectory 控制，不在关键帧里锁死。
+    # root X/Z 由 root trajectory generator 控制，不在关键帧里锁死。
     mask_one_frame[ROOT_Y_IDX] = 1.0
     mask_one_frame[ROT_SLICE] = 1.0
-
     return mask_one_frame
 
 
@@ -356,7 +343,7 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
         constrain_contacts=args.constrain_contacts,
     )
 
-    def add_pose(path: str, frame: int, name: str):
+    def add_pose(path: str, frame: int, name: str, strength: float = 1.0):
         pose = load_151_pose(path)
         pose = normalize_pose_if_needed(pose, normalizer, args.pose_space)
 
@@ -364,26 +351,38 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
         start = max(0, frame - width)
         end = min(num_frames, frame + width + 1)
 
+        strength = float(np.clip(strength, 0.0, 1.0))
+        if strength <= 0.0:
+            print(f"⏭️ 跳过 {name} 关键帧: strength={strength:.3f}, path={path}")
+            return
+
         for f in range(start, end):
             value[f] = pose
-            mask[f] = frame_mask
+            mask[f] = frame_mask * strength
 
         if width > 0:
             print(
                 f"✅ 已添加 {name} 关键帧窗口: "
-                f"center={frame}, range=[{start}, {end - 1}], path={path}"
+                f"center={frame}, range=[{start}, {end - 1}], "
+                f"strength={strength:.3f}, path={path}"
             )
         else:
-            print(f"✅ 已添加 {name} 关键帧: frame={frame}, path={path}")
+            print(
+                f"✅ 已添加 {name} 关键帧: "
+                f"frame={frame}, strength={strength:.3f}, path={path}"
+            )
 
-    add_pose(args.start_pose, 0, "start")
-    add_pose(args.end_pose, num_frames - 1, "end")
+    endpoint_strength = float(getattr(args, "endpoint_keyframe_strength", 1.0))
+    mid_strength = float(getattr(args, "mid_keyframe_strength", 0.35))
+
+    add_pose(args.start_pose, 0, "start", strength=endpoint_strength)
+    add_pose(args.end_pose, num_frames - 1, "end", strength=endpoint_strength)
 
     mid_paths = parse_list(args.mid_poses)
     mid_frames = parse_mid_frames(args.mid_pose_frames, len(mid_paths), num_frames)
 
     for i, (path, frame) in enumerate(zip(mid_paths, mid_frames), start=1):
-        add_pose(path, frame, f"mid{i}")
+        add_pose(path, frame, f"mid{i}", strength=mid_strength)
 
     return {
         "value": torch.from_numpy(value[None]).to(device=device, dtype=torch.float32),
@@ -395,14 +394,14 @@ def sample_motion(model: EDGE, cond: dict, constraint: dict, args, num_frames: i
     shape = (1, num_frames, model.repr_dim)
 
     if args.sampler == "ddim":
-        print("🚀 使用 DDIM 采样，速度更快；轨迹主要依赖条件分支和 hard projection。")
+        print("🚀 使用 DDIM 采样。")
         return model.diffusion.ddim_sample(
             shape,
             cond,
             constraint=constraint,
         )
 
-    print("🚀 使用 DDPM 采样；若开启 TTO，可获得更强轨迹/关键帧优化，但速度更慢。")
+    print("🚀 使用 DDPM 采样。")
     return model.diffusion.p_sample_loop(
         shape,
         cond,
@@ -416,14 +415,6 @@ def apply_trajectory_anchor(
     traj_physical: np.ndarray,
     strength: float,
 ) -> np.ndarray:
-    """
-    Softly anchor generated root X/Z to the target trajectory.
-
-    strength:
-      0.0 = keep generated trajectory
-      1.0 = strictly replace root X/Z with target trajectory
-      0~1 = soft blend, useful for display videos
-    """
     motion = motion_physical.copy()
     traj = np.asarray(traj_physical, dtype=np.float32)
 
@@ -434,12 +425,10 @@ def apply_trajectory_anchor(
         raise ValueError(f"traj_physical 应该是 [T,2] 或 [1,T,2]，当前是 {traj.shape}")
 
     traj = traj[:, :2]
-
     if len(traj) != len(motion):
         traj = resample_feature(traj, len(motion))
 
     strength = float(np.clip(strength, 0.0, 1.0))
-
     if strength <= 0.0:
         return motion.astype(np.float32)
 
@@ -449,8 +438,17 @@ def apply_trajectory_anchor(
     motion[:, ROOT_Z_IDX] = (
         (1.0 - strength) * motion[:, ROOT_Z_IDX] + strength * traj[:, 1]
     )
-
     return motion.astype(np.float32)
+
+
+def unnormalize_motion(normalizer, motion_norm: np.ndarray) -> np.ndarray:
+    if normalizer is None:
+        return motion_norm.astype(np.float32)
+
+    motion_t = torch.from_numpy(motion_norm[None]).float()
+    motion_physical = normalizer.unnormalize(motion_t)
+    motion_physical = to_numpy(motion_physical)[0]
+    return motion_physical.astype(np.float32)
 
 
 def save_eval_assets(
@@ -459,7 +457,7 @@ def save_eval_assets(
     motion_final_physical: np.ndarray,
     traj_physical: np.ndarray,
     args,
-    trajectory_control_mode: str = "unknown",
+    trajectory_control_mode: str = "stage4_stage5_direct",
 ):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,49 +468,11 @@ def save_eval_assets(
     raw_motion_path = out_dir / f"{stem}_raw.npy"
     final_motion_path = out_path
     target_traj_path = out_dir / f"{stem}_target_traj.npy"
-    eval_json_path = out_dir / f"{stem}_metrics.json"
-    eval_csv_path = out_dir / f"{stem}_metrics.csv"
     meta_path = out_dir / f"{stem}_meta.json"
 
     np.save(raw_motion_path, motion_raw_physical.astype(np.float32))
     np.save(final_motion_path, motion_final_physical.astype(np.float32))
     np.save(target_traj_path, traj_physical.astype(np.float32))
-
-    eval_cmd = [
-        "python",
-        "eval_quantitative.py",
-        "--motion",
-        str(final_motion_path),
-        "--raw_motion",
-        str(raw_motion_path),
-        "--post_motion",
-        str(final_motion_path),
-        "--checkpoint",
-        args.checkpoint,
-        "--audio",
-        args.music,
-        "--target_traj",
-        str(target_traj_path),
-        "--start_pose",
-        args.start_pose,
-        "--end_pose",
-        args.end_pose,
-        "--out_json",
-        str(eval_json_path),
-        "--out_csv",
-        str(eval_csv_path),
-    ]
-
-    if getattr(args, "mid_poses", ""):
-        eval_cmd.extend(["--mid_poses", args.mid_poses])
-
-    if getattr(args, "mid_pose_frames", ""):
-        eval_cmd.extend(["--mid_pose_frames", args.mid_pose_frames])
-
-    if getattr(args, "pose_space", "normalized") == "physical":
-        eval_cmd.extend(["--keyframe_space", "physical"])
-    else:
-        eval_cmd.extend(["--keyframe_space", "normalized"])
 
     meta = {
         "checkpoint": args.checkpoint,
@@ -522,61 +482,26 @@ def save_eval_assets(
         "mid_poses": getattr(args, "mid_poses", ""),
         "mid_pose_frames": getattr(args, "mid_pose_frames", ""),
         "auto_mid_keyframes": bool(getattr(args, "auto_mid_keyframes", False)),
-        "mmr_checkpoint": getattr(args, "mmr_checkpoint", ""),
-        "auto_mid_mmr_weight": float(getattr(args, "auto_mid_mmr_weight", 0.0)),
-        "auto_mid_pose_weight": float(getattr(args, "auto_mid_pose_weight", 1.0)),
-        "auto_mid_diversity_weight": float(getattr(args, "auto_mid_diversity_weight", 0.2)),
-        "auto_mid_energy_weight": float(getattr(args, "auto_mid_energy_weight", 0.45)),
-        "auto_mid_energy_target": float(getattr(args, "auto_mid_energy_target", 0.55)),
-        "auto_mid_energy_band": float(getattr(args, "auto_mid_energy_band", 0.25)),
-        "auto_mid_contact_weight": float(getattr(args, "auto_mid_contact_weight", 0.5)),
-        "auto_mid_contact_diversity_weight": float(getattr(args, "auto_mid_contact_diversity_weight", 0.3)),
-        "auto_mid_end_weight": float(getattr(args, "auto_mid_end_weight", 0.3)),
-        "auto_mid_source_gap": int(getattr(args, "auto_mid_source_gap", 120)),
-        "auto_mid_disallow_same_source": bool(getattr(args, "auto_mid_disallow_same_source", False)),
         "auto_mid_count": int(getattr(args, "auto_mid_count", 0)),
-        "rag_db": getattr(args, "rag_db", ""),
-        "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
-        "retrieved_clip_prior_denoise": bool(getattr(args, "retrieved_clip_prior_denoise", False)),
-        "retrieved_prior_window": int(getattr(args, "retrieved_prior_window", 24)),
-        "retrieved_prior_strength": float(getattr(args, "retrieved_prior_strength", 0.18)),
-        "retrieved_prior_anneal_power": float(getattr(args, "retrieved_prior_anneal_power", 1.0)),
-        "retrieved_prior_body_part": getattr(args, "retrieved_prior_body_part", "upper"),
-        "retrieved_prior_source_pose_space": getattr(args, "retrieved_prior_source_pose_space", "auto"),
-        "retrieved_prior_protect_width": int(getattr(args, "retrieved_prior_protect_width", 2)),
-        "retrieved_prior_debug_path": getattr(args, "retrieved_prior_debug_path", ""),
         "trajectory": getattr(args, "trajectory", ""),
         "target_traj": getattr(args, "target_traj", ""),
         "motion_raw": str(raw_motion_path),
         "motion_final": str(final_motion_path),
         "target_traj_saved": str(target_traj_path),
-        "eval_json": str(eval_json_path),
-        "eval_csv": str(eval_csv_path),
         "post_anchor_trajectory": bool(getattr(args, "post_anchor_trajectory", False)),
         "trajectory_anchor_strength": float(getattr(args, "trajectory_anchor_strength", 0.0)),
-        "post_foot_lock": bool(getattr(args, "post_foot_lock", False)),
-        "foot_lock_strength": float(getattr(args, "foot_lock_strength", 0.75)),
-        "foot_lock_traj_keep": float(getattr(args, "foot_lock_traj_keep", 0.65)),
-        "foot_lock_height_threshold": float(getattr(args, "foot_lock_height_threshold", 0.035)),
-        "foot_lock_speed_threshold": float(getattr(args, "foot_lock_speed_threshold", 0.08)),
-        "foot_lock_min_contact_len": int(getattr(args, "foot_lock_min_contact_len", 3)),
-        "foot_lock_smooth_window": int(getattr(args, "foot_lock_smooth_window", 9)),
+        "endpoint_keyframe_strength": float(getattr(args, "endpoint_keyframe_strength", 1.0)),
+        "mid_keyframe_strength": float(getattr(args, "mid_keyframe_strength", 0.35)),
+        "infer_keyframe_width": int(getattr(args, "infer_keyframe_width", 0)),
         "sampler": getattr(args, "sampler", "ddpm"),
         "use_tto": not getattr(args, "no_tto", False),
-        "tto_steps": int(getattr(args, "tto_steps", 1)),
-        "tto_interval": int(getattr(args, "tto_interval", 50)),
-        "tto_lr": float(getattr(args, "tto_lr", 0.03)),
-        "tto_contact_threshold": float(getattr(args, "tto_contact_threshold", 0.65)),
-        "tto_trajectory_loss_weight": float(getattr(args, "tto_trajectory_loss_weight", 4.0)),
-        "tto_trajectory_velocity_loss_weight": float(getattr(args, "tto_trajectory_velocity_loss_weight", 0.5)),
-        "tto_root_acc_loss_weight": float(getattr(args, "tto_root_acc_loss_weight", 0.05)),
-        "tto_foot_loss_weight": float(getattr(args, "tto_foot_loss_weight", 0.25)),
-        "eval_command": " ".join(eval_cmd),
         "trajectory_control_mode": trajectory_control_mode,
-        "report_warning": (
-            "If trajectory_control_mode starts with postprocess, report raw and final "
-            "metrics separately. Final trajectory error may include post-processing."
-        ),
+        "architecture": {
+            "stage4": "ControlNet-like trajectory adapters in every decoder layer",
+            "stage5": "root trajectory generator + local pose diffusion residual",
+            "trajectory_feature": "normalized absolute X/Z + internal ΔX/ΔZ velocity",
+            "soft_keyframe": "mask strength is confidence; pose value is not numerically scaled",
+        },
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -586,23 +511,240 @@ def save_eval_assets(
     print(f"✅ final motion: {final_motion_path}")
     print(f"✅ target trajectory: {target_traj_path}")
     print(f"✅ meta: {meta_path}")
-    print("\n📏 可直接运行以下评估命令：")
-    print(" ".join(eval_cmd))
 
     return {
         "raw_motion": str(raw_motion_path),
         "final_motion": str(final_motion_path),
         "target_traj": str(target_traj_path),
         "meta": str(meta_path),
-        "eval_json": str(eval_json_path),
-        "eval_csv": str(eval_csv_path),
-        "eval_cmd": eval_cmd,
     }
 
 
+def _call_with_supported_kwargs(func, **kwargs):
+    """Call a function with only kwargs accepted by its current signature."""
+    try:
+        sig = inspect.signature(func)
+    except Exception:
+        return func(**kwargs)
+
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in sig.parameters.values()
+    ):
+        return func(**kwargs)
+
+    supported = {
+        name: value
+        for name, value in kwargs.items()
+        if name in sig.parameters
+    }
+    return func(**supported)
+
+
+def _as_auto_keyframe_list(plan):
+    """Normalize planner outputs into a list of objects/dicts with frame+pose."""
+    if plan is None:
+        return []
+    if hasattr(plan, "keyframes"):
+        return list(getattr(plan, "keyframes"))
+    if isinstance(plan, dict):
+        if "keyframes" in plan:
+            return list(plan["keyframes"])
+        if "poses" in plan and "frames" in plan:
+            return [
+                {"frame": int(frame), "pose": pose}
+                for frame, pose in zip(plan["frames"], plan["poses"])
+            ]
+    if isinstance(plan, (list, tuple)):
+        return list(plan)
+    return []
+
+
+def _get_keyframe_field(item, name, default=None):
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def _save_auto_mid_fallback(keyframes, out_dir: Path, prefix: str):
+    saved = []
+    for i, item in enumerate(keyframes, start=1):
+        pose = _get_keyframe_field(item, "pose", None)
+        frame = _get_keyframe_field(item, "frame", None)
+        if pose is None or frame is None:
+            continue
+        path = out_dir / f"{prefix}_auto_mid_{i:02d}.npy"
+        np.save(path, np.asarray(pose, dtype=np.float32))
+        saved.append({"path": str(path), "frame": int(frame)})
+    return saved
+
+
+def _normalize_saved_keyframe_records(saved, fallback_keyframes):
+    """Accept save_auto_keyframes return formats from old/new planner versions."""
+    if saved is None:
+        saved = []
+
+    records = []
+
+    if isinstance(saved, dict):
+        if "keyframes" in saved:
+            saved = saved["keyframes"]
+        else:
+            saved = [saved]
+
+    for item in list(saved):
+        if isinstance(item, (str, Path)):
+            records.append({"path": str(item), "frame": None})
+            continue
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("pose_path") or item.get("file")
+            frame = item.get("frame")
+            if path is not None:
+                records.append({"path": str(path), "frame": frame})
+            continue
+        path = getattr(item, "path", None) or getattr(item, "pose_path", None)
+        frame = getattr(item, "frame", None)
+        if path is not None:
+            records.append({"path": str(path), "frame": frame})
+
+    if not records:
+        return []
+
+    fallback_frames = [
+        int(_get_keyframe_field(item, "frame"))
+        for item in fallback_keyframes
+        if _get_keyframe_field(item, "frame", None) is not None
+    ]
+
+    for i, record in enumerate(records):
+        if record["frame"] is None and i < len(fallback_frames):
+            record["frame"] = fallback_frames[i]
+        if record["frame"] is not None:
+            record["frame"] = int(record["frame"])
+
+    return [r for r in records if r.get("path") and r.get("frame") is not None]
+
+
+def maybe_plan_auto_mid(args, audio_feature, traj_physical, normalizer, num_frames):
+    if not getattr(args, "auto_mid_keyframes", False):
+        return
+
+    if plan_auto_keyframes is None:
+        print("⚠️ auto_keyframe_planner 不可用，跳过 auto mid。")
+        return
+
+    if int(getattr(args, "auto_mid_count", 0)) <= 0:
+        return
+
+    out_dir = Path(args.out).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = Path(args.out).stem
+
+    manual_paths = parse_list(args.mid_poses)
+    manual_frames = parse_mid_frames(args.mid_pose_frames, len(manual_paths), num_frames)
+
+    planner_kwargs = dict(
+        audio_feature=audio_feature,
+        audio_features=audio_feature,
+        traj_physical=traj_physical,
+        traj_xz=traj_physical,
+        trajectory=traj_physical,
+        start_pose_path=args.start_pose,
+        end_pose_path=args.end_pose,
+        start_pose=args.start_pose,
+        end_pose=args.end_pose,
+        normalizer=normalizer,
+        num_frames=num_frames,
+        rag_db=getattr(args, "rag_db", ""),
+        count=int(getattr(args, "auto_mid_count", 1)),
+        num_keyframes=int(getattr(args, "auto_mid_count", 1)),
+        existing_frames=manual_frames,
+        min_gap=int(getattr(args, "auto_mid_min_gap", 18)),
+        source_gap=int(getattr(args, "auto_mid_source_gap", 150)),
+        disallow_same_source=bool(getattr(args, "auto_mid_disallow_same_source", False)),
+        pose_space=getattr(args, "auto_mid_pose_space", "normalized"),
+        max_candidates=int(getattr(args, "auto_mid_max_candidates", 5000)),
+        sample_stride=int(getattr(args, "auto_mid_sample_stride", 3)),
+        music_weight=float(getattr(args, "auto_mid_music_weight", 0.6)),
+        trajectory_weight=float(getattr(args, "auto_mid_trajectory_weight", 0.4)),
+        mmr_checkpoint=getattr(args, "mmr_checkpoint", ""),
+        mmr_weight=float(getattr(args, "auto_mid_mmr_weight", 0.5)),
+        pose_weight=float(getattr(args, "auto_mid_pose_weight", 1.0)),
+        diversity_weight=float(getattr(args, "auto_mid_diversity_weight", 0.25)),
+        energy_weight=float(getattr(args, "auto_mid_energy_weight", 0.45)),
+        energy_target=float(getattr(args, "auto_mid_energy_target", 0.55)),
+        energy_band=float(getattr(args, "auto_mid_energy_band", 0.25)),
+        contact_weight=float(getattr(args, "auto_mid_contact_weight", 0.85)),
+        contact_diversity_weight=float(getattr(args, "auto_mid_contact_diversity_weight", 0.60)),
+        end_weight=float(getattr(args, "auto_mid_end_weight", 0.30)),
+    )
+
+    try:
+        plan = _call_with_supported_kwargs(plan_auto_keyframes, **planner_kwargs)
+        keyframes = _as_auto_keyframe_list(plan)
+
+        if not keyframes:
+            print("⚠️ auto_keyframe_planner 没有返回有效 keyframes，跳过 auto mid。")
+            return
+
+        saved_records = []
+
+        if save_auto_keyframes is not None:
+            try:
+                saved = _call_with_supported_kwargs(
+                    save_auto_keyframes,
+                    plan=plan,
+                    keyframes=keyframes,
+                    out_dir=out_dir,
+                    output_dir=out_dir,
+                    prefix=prefix,
+                )
+                saved_records = _normalize_saved_keyframe_records(saved, keyframes)
+            except Exception as exc:
+                print(f"⚠️ save_auto_keyframes 失败，使用 fallback 保存: {exc}")
+
+        if not saved_records:
+            saved_records = _save_auto_mid_fallback(keyframes, out_dir, prefix)
+
+        if not saved_records:
+            print("⚠️ auto mid 保存失败，未加入中间关键帧。")
+            return
+
+        auto_pose_paths = [str(item["path"]) for item in saved_records]
+        auto_frames = [int(item["frame"]) for item in saved_records]
+
+        all_paths = manual_paths + auto_pose_paths
+        all_frames = manual_frames + auto_frames
+
+        args.mid_poses = ",".join(all_paths)
+        args.mid_pose_frames = ",".join(str(x) for x in all_frames)
+
+        plan_debug_path = out_dir / f"{prefix}_auto_mid_plan.json"
+        try:
+            debug_items = []
+            for path, frame, item in zip(auto_pose_paths, auto_frames, keyframes):
+                debug_items.append(
+                    {
+                        "path": path,
+                        "frame": int(frame),
+                        "score": float(_get_keyframe_field(item, "score", 0.0) or 0.0),
+                        "source": str(_get_keyframe_field(item, "source", "")),
+                        "source_frame": int(_get_keyframe_field(item, "source_frame", -1) or -1),
+                    }
+                )
+            with open(plan_debug_path, "w", encoding="utf-8") as f:
+                json.dump(debug_items, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        print(f"✅ auto mid 已加入: count={len(auto_pose_paths)}, frames={auto_frames}")
+
+    except Exception as exc:
+        print(f"⚠️ 自动关键帧规划失败，跳过 auto mid: {exc}")
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Controlled EDGE generation: music + start/end keyframes + 2D trajectory."
+        description="Controlled EDGE generation with direct stage-4/5 trajectory control."
     )
 
     parser.add_argument("--checkpoint", required=True)
@@ -611,865 +753,159 @@ def build_arg_parser():
     parser.add_argument("--end_pose", required=True)
     parser.add_argument("--out", required=True)
 
-    parser.add_argument(
-        "--mid_poses",
-        default="",
-        help="可选，中间关键帧路径，逗号或分号分隔。",
-    )
-    parser.add_argument(
-        "--mid_pose_frames",
-        default="",
-        help="可选，中间关键帧位置，例如 '0.33,0.66' 或 '50,100'。",
-    )
-
-    parser.add_argument(
-        "--infer_keyframe_width",
-        type=int,
-        default=0,
-        help=(
-            "推理阶段关键帧约束窗口半径。0=只锁单帧；"
-            "1=锁 frame-1~frame+1。自动中间关键帧建议 0~1，"
-            "手工 4key 如果最后突变可试 2~3。"
-        ),
-    )
-    parser.add_argument(
-        "--auto_mid_keyframes",
-        action="store_true",
-        help="启用系统自动中间关键帧规划：根据音乐 onset、轨迹转折和 RAG 姿态库自动插入中间姿态。",
-    )
-    parser.add_argument(
-        "--rag_db",
-        default="data/dunhuang_rag_db/rag_index.npz",
-        help="RAG 姿态库路径。可为 build_dunhuang_rag_db.py 生成的 rag_index.npz，也可为包含 .npy/.pkl 的目录。",
-    )
-    parser.add_argument(
-        "--auto_mid_count",
-        type=int,
-        default=3,
-        help="系统自动插入的中间关键帧数量。",
-    )
-    parser.add_argument(
-        "--auto_mid_min_gap",
-        type=int,
-        default=18,
-        help="自动关键帧与用户关键帧/其他自动关键帧的最小帧距。",
-    )
-    parser.add_argument(
-        "--auto_mid_source_gap",
-        type=int,
-        default=150,
-        help=(
-            "自动中间关键帧的 source-frame 去重间隔。若两个候选来自同一 source 且 "
-            "source_frame 距离小于该值，则后选候选会被硬过滤，避免同一个动作片段重复出现。"
-        ),
-    )
-    parser.add_argument(
-        "--auto_mid_disallow_same_source",
-        action="store_true",
-        help="更严格的 source diversity：不同 auto mid 不允许来自同一个 source 文件。",
-    )
-    parser.add_argument(
-        "--auto_mid_pose_space",
-        default="normalized",
-        choices=["normalized", "physical"],
-        help="RAG 数据库里 151-D motion/pose 的空间。build_dunhuang_rag_db.py 默认输出 normalized。",
-    )
-    parser.add_argument(
-        "--auto_mid_max_candidates",
-        type=int,
-        default=5000,
-        help="RAG 检索时最多加载多少候选姿态。",
-    )
-    parser.add_argument(
-        "--auto_mid_sample_stride",
-        type=int,
-        default=3,
-        help="RAG 检索时对候选姿态的采样间隔，越大越快但候选更少。",
-    )
-    parser.add_argument(
-        "--auto_mid_music_weight",
-        type=float,
-        default=0.6,
-        help="自动选帧时音乐 onset 权重。",
-    )
-    parser.add_argument(
-        "--auto_mid_trajectory_weight",
-        type=float,
-        default=0.4,
-        help="自动选帧时轨迹转折权重。",
-    )
-    parser.add_argument(
-        "--mmr_checkpoint",
-        default="",
-        help="可选，真正 MMR 双塔 checkpoint。提供后 auto-mid 使用 AudioEncoder 与 MMR-RAG motion_embeddings 检索。",
-    )
-    parser.add_argument(
-        "--auto_mid_mmr_weight",
-        type=float,
-        default=0.5,
-        help="自动中间关键帧检索中的 MMR latent distance 权重。AIST++ zero-shot 建议 0.3~0.5。",
-    )
-    parser.add_argument(
-        "--auto_mid_pose_weight",
-        type=float,
-        default=1.0,
-        help="自动中间关键帧检索中的首尾/用户姿态过渡兼容权重。",
-    )
-    parser.add_argument(
-        "--auto_mid_diversity_weight",
-        type=float,
-        default=0.25,
-        help="自动中间关键帧检索中的多样性权重，避免多个 auto pose 太相似。",
-    )
-    parser.add_argument(
-        "--auto_mid_energy_weight",
-        type=float,
-        default=0.45,
-        help="自动中间关键帧检索中的中等 motion energy 权重。不是越大越好，避免选到跳跃/脚接触冲突片段。",
-    )
-    parser.add_argument(
-        "--auto_mid_energy_rerank_top_k",
-        type=int,
-        default=80,
-        help="动作能量重排：先按兼容性取 top-K，再在其中偏向 motion_energy 更高的候选。0=关闭。",
-    )
-    parser.add_argument(
-        "--auto_mid_energy_rerank_weight",
-        type=float,
-        default=0.08,
-        help="动作能量重排 penalty 权重：在兼容候选中偏向接近 auto_mid_energy_target 的中等能量片段。",
-    )
-    parser.add_argument(
-        "--auto_mid_energy_target",
-        type=float,
-        default=0.55,
-        help="动作能量目标分位，0~1。建议 0.45~0.60；过高容易选择跳跃/快速脚部变化片段。",
-    )
-    parser.add_argument(
-        "--auto_mid_energy_band",
-        type=float,
-        default=0.25,
-        help="动作能量容忍带宽。候选离 target 越远惩罚越大，用于选择中等能量而不是最高能量。",
-    )
-    parser.add_argument(
-        "--auto_mid_contact_weight",
-        type=float,
-        default=0.85,
-        help="自动中间关键帧检索中的接触稳定性权重，用于减少后续 IK/脚滑冲突。",
-    )
-    parser.add_argument(
-        "--auto_mid_contact_diversity_weight",
-        type=float,
-        default=0.60,
-        help="自动中间关键帧检索中的接触模式多样性权重，避免反复选择同一种单脚支撑。",
-    )
-    parser.add_argument(
-        "--auto_mid_end_weight",
-        type=float,
-        default=0.3,
-        help="越靠近末尾的自动关键帧越要兼容 end_pose，避免最后突变。",
-    )
-    parser.add_argument(
-        "--save_auto_keyframes",
-        action="store_true",
-        help="保存自动规划出的中间关键帧 .npy 和 plan.json，便于复现实验与评估。",
-    )
-
-    parser.add_argument(
-        "--retrieved_clip_prior_denoise",
-        action="store_true",
-        help=(
-            "把 MMR-RAG 检索到的连续 clip 作为 soft prior 注入 DDPM denoising loop。"
-            "不同于后处理 clipprior，这会在每个 x_start 预测后软融合 prior，再进入 q_posterior。"
-        ),
-    )
-    parser.add_argument(
-        "--retrieved_prior_window",
-        type=int,
-        default=24,
-        help="每个 auto mid frame 前后多少帧使用 retrieved clip prior。建议 16~32。",
-    )
-    parser.add_argument(
-        "--retrieved_prior_strength",
-        type=float,
-        default=0.16,
-        help="denoising loop 中 retrieved clip soft prior 的最大融合强度。当前主线建议 0.16，优先靠 planner 改善，不扩大 prior 范围。",
-    )
-    parser.add_argument(
-        "--retrieved_prior_anneal_power",
-        type=float,
-        default=1.0,
-        help="prior 随 denoising 后期增强的退火指数。1.0 线性；2.0 更保守。",
-    )
-    parser.add_argument(
-        "--retrieved_prior_body_part",
-        default="upper",
-        choices=["arms", "upper", "upper_safe_plus", "torso", "torso_arms", "all_rot", "body_no_root"],
-        help=(
-            "retrieved clip prior 影响哪些旋转通道。当前主线推荐 upper："
-            "spine + neck/head + shoulders/arms，不包含 joint 0 pelvis/root orientation，"
-            "也不包含 hips/knees/ankles/feet。不要再用 body_no_root/torso_arms 作为主线。"
-        ),
-    )
-    parser.add_argument(
-        "--retrieved_prior_source_pose_space",
-        default="auto",
-        choices=["auto", "physical", "normalized"],
-        help="retrieved source clip 的空间。pkl pos/q 建议 auto；若 source 已是 normalized 151-D 用 normalized。",
-    )
-    parser.add_argument(
-        "--retrieved_prior_protect_width",
-        type=int,
-        default=2,
-        help="保护 start/end/user-mid/auto-mid 附近 ±N 帧，防止 soft prior 破坏关键帧命中。",
-    )
-    parser.add_argument(
-        "--retrieved_prior_temporal_smooth",
-        type=int,
-        default=0,
-        help="对 prior mask 做轻微平滑。0/1 表示关闭。",
-    )
-    parser.add_argument(
-        "--retrieved_prior_debug_assets",
-        action="store_true",
-        help="保存 retrieved prior value/mask/debug，便于确认 denoising prior 是否真正触达。",
-    )
-
-    parser.add_argument(
-        "--trajectory",
-        default="0,0",
-        help="轨迹控制点，例如 '0,0;1,1;0,2;-1,3;0,4'。",
-    )
-    parser.add_argument(
-        "--target_traj",
-        default="",
-        help="可选，直接读取 [T,2] 或 [1,T,2] 的 .npy 轨迹，优先级高于 --trajectory。",
-    )
-
-    parser.add_argument("--feature_type", default="hybrid", choices=["hybrid"])
+    parser.add_argument("--feature_type", default="hybrid", choices=["hybrid", "baseline", "jukebox"])
     parser.add_argument("--audio_dim", type=int, default=803)
     parser.add_argument("--seq_len", type=int, default=150)
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--num_frames", type=int, default=150)
+    parser.add_argument("--mixed_precision", default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--sampler", default="ddpm", choices=["ddpm", "ddim"])
 
-    parser.add_argument(
-        "--num_frames",
-        type=int,
-        default=150,
-        help="默认 150 帧，即 5 秒。若要按整首音乐长度生成，使用 --use_full_music。",
-    )
-    parser.add_argument(
-        "--use_full_music",
-        action="store_true",
-        help="根据音乐实际时长设置 num_frames。",
-    )
+    parser.add_argument("--mid_poses", default="")
+    parser.add_argument("--mid_pose_frames", default="")
+    parser.add_argument("--infer_keyframe_width", type=int, default=0)
+    parser.add_argument("--endpoint_keyframe_strength", type=float, default=1.0)
+    parser.add_argument("--mid_keyframe_strength", type=float, default=0.35)
+    parser.add_argument("--pose_space", default="normalized", choices=["normalized", "physical"])
+    parser.add_argument("--constrain_contacts", action="store_true")
 
-    parser.add_argument(
-        "--pose_space",
-        default="normalized",
-        choices=["normalized", "physical"],
-        help="关键帧 .npy 的空间。图像转3D结果一般用 physical；训练切片中导出的可用 normalized。",
-    )
-    parser.add_argument(
-        "--constrain_contacts",
-        action="store_true",
-        help="是否锁定 0:4 的脚接触通道。2D 图像转姿态时通常不要开。",
-    )
-    parser.add_argument(
-        "--keep_trajectory_absolute",
-        action="store_true",
-        help="默认会把轨迹平移到从第一个点开始的相对轨迹；开启后保留绝对坐标。",
-    )
-    parser.add_argument(
-        "--uniform_trajectory_timing",
-        action="store_true",
-        help="默认使用音乐 onset 调整轨迹速度；开启后匀速走轨迹。",
-    )
-    parser.add_argument(
-        "--linear_trajectory",
-        action="store_true",
-        help="关闭 spline 平滑插值，改用线性折线轨迹。",
-    )
+    parser.add_argument("--trajectory", default="0,0;1,1;0,2")
+    parser.add_argument("--target_traj", default="")
+    parser.add_argument("--keep_absolute_trajectory", action="store_true")
+    parser.add_argument("--uniform_trajectory_timing", action="store_true")
+    parser.add_argument("--linear_trajectory", action="store_true")
 
-    parser.add_argument(
-        "--sampler",
-        choices=["ddim", "ddpm"],
-        default="ddpm",
-        help="ddpm 较慢但支持 TTO；ddim 较快。",
-    )
-    parser.add_argument(
-        "--no_tto",
-        action="store_true",
-        help="关闭 test-time optimization。",
-    )
-    parser.add_argument(
-        "--beat_guidance_weight",
-        type=float,
-        default=0.0,
-        help="推理阶段 beat/onset 弱引导权重。没有真实配对数据时建议小心使用。",
-    )
-    parser.add_argument(
-        "--no_hard_keyframe_project",
-        action="store_true",
-        help="关闭扩散过程中的硬关键帧投影。默认开启。",
-    )
-    parser.add_argument(
-        "--use_ema",
-        action="store_true",
-        help="默认使用 active 权重；开启后尝试使用 EMA 权重。",
-    )
+    parser.add_argument("--post_anchor_trajectory", action="store_true")
+    parser.add_argument("--trajectory_anchor_strength", type=float, default=0.0)
 
-    parser.add_argument(
-        "--post_anchor_trajectory",
-        action="store_true",
-        help="生成后强制把 root X/Z 替换成目标轨迹。轨迹误差最低，但可能增加脚滑。",
-    )
-    parser.add_argument(
-        "--trajectory_anchor_strength",
-        type=float,
-        default=0.0,
-        help=(
-            "生成后 root X/Z 贴合目标轨迹的软锚定强度。"
-            "0 表示不后处理，1 表示严格替换为目标轨迹。"
-            "建议展示视频用 0.6~0.9。"
-        ),
-    )
-    parser.add_argument(
-        "--post_foot_lock",
-        action="store_true",
-        help="生成后执行 contact-aware root-only foot lock。注意：目前更推荐单独使用 postprocess_leg_ik.py。",
-    )
-    parser.add_argument(
-        "--foot_lock_strength",
-        type=float,
-        default=0.75,
-        help="foot lock root 修正强度，建议 0.5~0.85。",
-    )
-    parser.add_argument(
-        "--foot_lock_traj_keep",
-        type=float,
-        default=0.65,
-        help="foot lock 后保留目标轨迹的比例，越大轨迹越准，越小脚滑越少。",
-    )
-    parser.add_argument(
-        "--foot_lock_height_threshold",
-        type=float,
-        default=0.035,
-        help="高度接触阈值，单位米。",
-    )
-    parser.add_argument(
-        "--foot_lock_speed_threshold",
-        type=float,
-        default=0.08,
-        help="脚底水平速度接触阈值，单位 m/s。",
-    )
-    parser.add_argument(
-        "--foot_lock_min_contact_len",
-        type=int,
-        default=3,
-        help="连续多少帧以上才认为是一段有效脚接触。",
-    )
-    parser.add_argument(
-        "--foot_lock_smooth_window",
-        type=int,
-        default=9,
-        help="root correction 平滑窗口。",
-    )
+    parser.add_argument("--no_tto", action="store_true")
+    parser.add_argument("--tto_steps", type=int, default=1)
+    parser.add_argument("--tto_interval", type=int, default=50)
+    parser.add_argument("--tto_lr", type=float, default=0.03)
+    parser.add_argument("--tto_contact_threshold", type=float, default=0.65)
 
-    parser.add_argument(
-        "--tto_steps",
-        type=int,
-        default=1,
-        help="每次 TTO 的梯度优化步数；增大可增强关键帧/轨迹约束，但会变慢。",
-    )
-    parser.add_argument(
-        "--tto_interval",
-        type=int,
-        default=50,
-        help="每隔多少 diffusion step 执行一次 TTO；越小约束越强但越慢。",
-    )
-    parser.add_argument(
-        "--tto_lr",
-        type=float,
-        default=0.03,
-        help="TTO 梯度步长。",
-    )
-    parser.add_argument(
-        "--tto_contact_threshold",
-        type=float,
-        default=0.65,
-        help="TTO 中判断脚接触通道为接触的阈值。",
-    )
-    parser.add_argument(
-        "--tto_trajectory_loss_weight",
-        type=float,
-        default=4.0,
-        help="TTO 中轨迹位置误差权重；只影响推理阶段优化，不影响训练 loss。",
-    )
-    parser.add_argument(
-        "--tto_trajectory_velocity_loss_weight",
-        type=float,
-        default=0.5,
-        help="TTO 中轨迹速度误差权重；用于约束沿轨迹的速度变化。",
-    )
-    parser.add_argument(
-        "--tto_root_acc_loss_weight",
-        type=float,
-        default=0.05,
-        help="TTO 中 root X/Z 加速度平滑权重；过大可能削弱急转弯轨迹。",
-    )
-    parser.add_argument(
-        "--tto_foot_loss_weight",
-        type=float,
-        default=0.25,
-        help="TTO 中脚滑惩罚权重；过大可能牺牲轨迹贴合。",
-    )
-
-    parser.add_argument(
-        "--save_controls",
-        action="store_true",
-        help="额外保存 target trajectory、raw motion 和 meta json，方便评估。",
-    )
-    parser.add_argument(
-        "--save_eval_assets",
-        action="store_true",
-        help="保存 raw motion、target trajectory、meta，并打印 eval_quantitative.py 命令。",
-    )
+    # Auto-middle keyframe planner args.  Kept here so old experiment commands still run.
+    parser.add_argument("--auto_mid_keyframes", action="store_true")
+    parser.add_argument("--rag_db", default="data/dunhuang_rag_db/rag_index.npz")
+    parser.add_argument("--auto_mid_count", type=int, default=0)
+    parser.add_argument("--auto_mid_min_gap", type=int, default=18)
+    parser.add_argument("--auto_mid_source_gap", type=int, default=150)
+    parser.add_argument("--auto_mid_disallow_same_source", action="store_true")
+    parser.add_argument("--auto_mid_pose_space", default="normalized", choices=["normalized", "physical"])
+    parser.add_argument("--auto_mid_max_candidates", type=int, default=5000)
+    parser.add_argument("--auto_mid_sample_stride", type=int, default=3)
+    parser.add_argument("--auto_mid_music_weight", type=float, default=0.6)
+    parser.add_argument("--auto_mid_trajectory_weight", type=float, default=0.4)
+    parser.add_argument("--mmr_checkpoint", default="")
+    parser.add_argument("--auto_mid_mmr_weight", type=float, default=0.5)
+    parser.add_argument("--auto_mid_pose_weight", type=float, default=1.0)
+    parser.add_argument("--auto_mid_diversity_weight", type=float, default=0.25)
+    parser.add_argument("--auto_mid_energy_weight", type=float, default=0.45)
+    parser.add_argument("--auto_mid_energy_target", type=float, default=0.55)
+    parser.add_argument("--auto_mid_energy_band", type=float, default=0.25)
+    parser.add_argument("--auto_mid_contact_weight", type=float, default=0.85)
+    parser.add_argument("--auto_mid_contact_diversity_weight", type=float, default=0.60)
+    parser.add_argument("--auto_mid_end_weight", type=float, default=0.30)
 
     return parser
 
 
 def main():
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"⚠️ 以下参数当前 generate_controlled.py 未使用，将被忽略: {unknown}")
+    ensure_parent(args.out)
 
-    print("🚀 初始化 EDGE controlled generator")
+    audio_feature = hybrid_extract(args.music)
+    audio_feature = np.asarray(audio_feature, dtype=np.float32)
+
+    if audio_feature.ndim != 2:
+        raise ValueError(f"audio feature 应该是 [T,C]，当前是 {audio_feature.shape}")
+
+    num_frames = int(args.num_frames or args.seq_len or audio_feature.shape[0])
+    audio_feature = resample_feature(audio_feature, num_frames)
+
     model = EDGE(
         feature_type=args.feature_type,
         checkpoint_path=args.checkpoint,
+        EMA=True,
         audio_dim=args.audio_dim,
-        seq_len=args.seq_len,
-        EMA=args.use_ema,
-        beat_guidance_weight=args.beat_guidance_weight,
-        hard_keyframe_project=not args.no_hard_keyframe_project,
+        seq_len=num_frames,
+        mixed_precision=args.mixed_precision,
     )
     model.eval()
-
-    if install_retrieved_clip_prior_patch is not None:
-        install_retrieved_clip_prior_patch()
-    model.diffusion.retrieved_clip_prior = None
-
-    model.diffusion.tto_steps = int(args.tto_steps)
-    model.diffusion.tto_interval = int(args.tto_interval)
-    model.diffusion.tto_lr = float(args.tto_lr)
-    model.diffusion.tto_contact_threshold = float(args.tto_contact_threshold)
-    model.diffusion.tto_trajectory_loss_weight = float(args.tto_trajectory_loss_weight)
-    model.diffusion.tto_trajectory_velocity_loss_weight = float(args.tto_trajectory_velocity_loss_weight)
-    model.diffusion.tto_root_acc_loss_weight = float(args.tto_root_acc_loss_weight)
-    model.diffusion.tto_foot_loss_weight = float(args.tto_foot_loss_weight)
-
-    print(
-        "🧪 TTO config: "
-        f"steps={model.diffusion.tto_steps}, "
-        f"interval={model.diffusion.tto_interval}, "
-        f"lr={model.diffusion.tto_lr}, "
-        f"contact_threshold={model.diffusion.tto_contact_threshold}, "
-        f"traj_w={model.diffusion.tto_trajectory_loss_weight}, "
-        f"traj_vel_w={model.diffusion.tto_trajectory_velocity_loss_weight}, "
-        f"root_acc_w={model.diffusion.tto_root_acc_loss_weight}, "
-        f"foot_w={model.diffusion.tto_foot_loss_weight}"
-    )
 
     device = model.accelerator.device
     normalizer = model.normalizer
 
-    if normalizer is None:
-        raise ValueError("checkpoint 中没有 normalizer，无法保证轨迹/姿态空间一致。")
-
-    print("🎵 提取 hybrid audio feature")
-    extracted = hybrid_extract(args.music)
-
-    if isinstance(extracted, tuple):
-        audio_feature, audio_feature_path = extracted
-    else:
-        audio_feature = extracted
-        audio_feature_path = ""
-
-    audio_feature = np.asarray(audio_feature, dtype=np.float32)
-
-    if audio_feature.ndim != 2:
-        raise ValueError(f"audio_feature 应该是 [T,C]，当前是 {audio_feature.shape}")
-
-    if audio_feature.shape[1] != args.audio_dim:
-        raise ValueError(
-            f"audio feature dim 与模型不一致: feature={audio_feature.shape[1]}, "
-            f"model/audio_dim={args.audio_dim}"
-        )
-
-    if args.use_full_music:
-        duration = librosa.get_duration(path=args.music)
-        num_frames = int(round(duration * args.fps))
-    else:
-        num_frames = int(args.num_frames)
-
-    if num_frames <= 1:
-        raise ValueError(f"num_frames 必须大于 1，当前为 {num_frames}")
-
-    audio_feature = resample_feature(audio_feature, num_frames)
-
-    print(f"📊 audio_feature={audio_feature.shape}, num_frames={num_frames}")
-
     traj_physical, traj_norm = build_control_trajectory(
         trajectory_text=args.trajectory,
         audio_feature=audio_feature,
-        normalizer=model.normalizer,
+        normalizer=normalizer,
         target_traj_path=args.target_traj,
-        keep_absolute=args.keep_trajectory_absolute,
+        keep_absolute=args.keep_absolute_trajectory,
         uniform_timing=args.uniform_trajectory_timing,
         smooth=not args.linear_trajectory,
     )
 
-    # ------------------------------------------------------------------
-    # 自动中间关键帧规划：用户只给 start/end 或少量 mid，系统从 RAG 库检索补全。
-    # 注意：这里会把自动关键帧保存为 .npy，并追加到 args.mid_poses/args.mid_pose_frames，
-    # 因而后续 build_constraint 与 eval_quantitative.py 无需额外改动。
-    # ------------------------------------------------------------------
-    args.auto_mid_plan_path = ""
-    if bool(getattr(args, "auto_mid_keyframes", False)):
-        if plan_auto_keyframes is None or save_auto_keyframes is None or append_csv is None:
-            raise ImportError(
-                "auto_mid_keyframes requires auto_keyframe_planner.py in project root."
-            )
-
-        print("🧠 启用自动中间关键帧规划：music/trajectory/RAG retrieval。")
-
-        start_pose_norm = normalize_pose_if_needed(
-            load_151_pose(args.start_pose),
-            normalizer,
-            args.pose_space,
-        )
-        end_pose_norm = normalize_pose_if_needed(
-            load_151_pose(args.end_pose),
-            normalizer,
-            args.pose_space,
-        )
-
-        user_mid_paths = parse_list(args.mid_poses)
-        user_mid_frames = parse_mid_frames(args.mid_pose_frames, len(user_mid_paths), num_frames)
-        user_mid_poses = [
-            normalize_pose_if_needed(load_151_pose(path), normalizer, args.pose_space)
-            for path in user_mid_paths
-        ]
-
-        # 如果用户没有显式写 mid_pose_frames，但提供了 mid_poses，
-        # 先把自动推断出的 user mid frames 固化，避免追加 auto frames 后数量不一致。
-        if user_mid_paths:
-            args.mid_pose_frames = ",".join(str(int(f)) for f in user_mid_frames)
-
-        auto_plan = plan_auto_keyframes(
-            start_pose=start_pose_norm,
-            end_pose=end_pose_norm,
-            user_mid_poses=user_mid_poses,
-            user_mid_frames=user_mid_frames,
-            audio_feature=audio_feature,
-            traj_physical=traj_physical,
-            rag_db=args.rag_db,
-            normalizer=normalizer,
-            num_frames=num_frames,
-            max_auto_keyframes=args.auto_mid_count,
-            min_gap=args.auto_mid_min_gap,
-            rag_pose_space=args.auto_mid_pose_space,
-            max_candidates=args.auto_mid_max_candidates,
-            sample_stride=args.auto_mid_sample_stride,
-            music_weight=args.auto_mid_music_weight,
-            trajectory_weight=args.auto_mid_trajectory_weight,
-            mmr_checkpoint=args.mmr_checkpoint,
-            mmr_device=str(device),
-            mmr_weight=args.auto_mid_mmr_weight if args.mmr_checkpoint else 0.0,
-            pose_weight=args.auto_mid_pose_weight,
-            diversity_weight=args.auto_mid_diversity_weight,
-            energy_weight=args.auto_mid_energy_weight,
-            contact_weight=args.auto_mid_contact_weight,
-            contact_diversity_weight=args.auto_mid_contact_diversity_weight,
-            end_weight=args.auto_mid_end_weight,
-            source_gap=args.auto_mid_source_gap,
-            disallow_same_source=args.auto_mid_disallow_same_source,
-            energy_rerank_top_k=args.auto_mid_energy_rerank_top_k,
-            energy_rerank_weight=args.auto_mid_energy_rerank_weight,
-            energy_target=args.auto_mid_energy_target,
-            energy_band=args.auto_mid_energy_band,
-        )
-
-        auto_paths, auto_frames, auto_plan_path = save_auto_keyframes(
-            auto_plan,
-            out_motion_path=args.out,
-            prefix="auto_mid",
-        )
-        args.auto_mid_plan_path = auto_plan_path
-
-        args.mid_poses = append_csv(args.mid_poses, auto_paths)
-        args.mid_pose_frames = append_csv(args.mid_pose_frames, auto_frames)
-
-        print("✅ 自动中间关键帧规划完成：")
-        for path, frame in zip(auto_paths, auto_frames):
-            print(f"  - frame={frame}, pose={path}")
-        print(f"✅ auto plan: {auto_plan_path}")
+    maybe_plan_auto_mid(
+        args=args,
+        audio_feature=audio_feature,
+        traj_physical=traj_physical,
+        normalizer=normalizer,
+        num_frames=num_frames,
+    )
 
     cond = {
-        "audio": torch.from_numpy(audio_feature[None]).to(
-            device=device,
-            dtype=torch.float32,
-        ),
-        "trajectory": torch.from_numpy(traj_norm[None]).to(
-            device=device,
-            dtype=torch.float32,
-        ),
+        "audio": torch.from_numpy(audio_feature[None]).to(device=device, dtype=torch.float32),
+        "trajectory": torch.from_numpy(traj_norm[None]).to(device=device, dtype=torch.float32),
     }
 
-    # 显式提供 onset，避免 diffusion.py 里只能从 audio[...,768] fallback。
-    if audio_feature.shape[1] > 768:
-        onset = audio_feature[:, 768:769].astype(np.float32)
-        cond["onset"] = torch.from_numpy(onset[None]).to(
-            device=device,
-            dtype=torch.float32,
-        )
+    constraint = build_constraint(
+        args=args,
+        normalizer=normalizer,
+        num_frames=num_frames,
+        device=device,
+    )
 
-    constraint = build_constraint(args, normalizer, num_frames, device)
-
-    # ------------------------------------------------------------------
-    # Retrieved clip prior in DDPM denoising loop.
-    # This is the real RAG-Diffusion v2 path: retrieved continuous clips are
-    # injected into predicted x_start inside p_mean_variance, not pasted after
-    # generation. Explicit keyframe constraints remain higher priority.
-    # ------------------------------------------------------------------
-    args.retrieved_prior_debug_path = ""
-    if bool(getattr(args, "retrieved_clip_prior_denoise", False)):
-        if build_retrieved_clip_prior_from_plan is None or install_retrieved_clip_prior_patch is None:
-            raise ImportError(
-                "retrieved_clip_prior_denoise requires retrieved_clip_prior.py in project root."
-            )
-        if not getattr(args, "auto_mid_plan_path", ""):
-            raise ValueError(
-                "--retrieved_clip_prior_denoise requires --auto_mid_keyframes so an auto_mid_plan.json exists."
-            )
-
-        prior_protect_frames = [0, num_frames - 1]
-        current_mid_paths = parse_list(args.mid_poses)
-        current_mid_frames = parse_mid_frames(args.mid_pose_frames, len(current_mid_paths), num_frames)
-        prior_protect_frames.extend(current_mid_frames)
-        prior_protect_frames = sorted(set(int(x) for x in prior_protect_frames))
-
-        debug_prefix = ""
-        if args.retrieved_prior_debug_assets:
-            outp = Path(args.out)
-            debug_prefix = str(outp.with_name(outp.stem + "_denoise_prior"))
-
-        prior = build_retrieved_clip_prior_from_plan(
-            auto_plan_path=args.auto_mid_plan_path,
-            num_frames=num_frames,
-            normalizer=normalizer,
-            device=device,
-            source_pose_space=args.retrieved_prior_source_pose_space,
-            window=args.retrieved_prior_window,
-            body_part=args.retrieved_prior_body_part,
-            protect_frames=prior_protect_frames,
-            protect_width=args.retrieved_prior_protect_width,
-            temporal_smooth=args.retrieved_prior_temporal_smooth,
-            debug_out_prefix=debug_prefix,
-        )
-        prior["strength"] = float(args.retrieved_prior_strength)
-        prior["anneal_power"] = float(args.retrieved_prior_anneal_power)
-
-        if int(prior.get("segments", 0)) <= 0 or float(prior.get("touched_ratio", 0.0)) <= 0.0:
-            print("⚠️ retrieved clip denoise prior 未触达任何帧：将不启用 prior。")
-            model.diffusion.retrieved_clip_prior = None
-        else:
-            model.diffusion.retrieved_clip_prior = prior
-            if debug_prefix:
-                args.retrieved_prior_debug_path = debug_prefix + "_retrieved_prior_debug.json"
-            print(
-                "🧬 retrieved clip prior 已注入 DDPM denoising loop: "
-                f"segments={prior.get('segments')}, touched_ratio={prior.get('touched_ratio'):.6f}, "
-                f"body_part={args.retrieved_prior_body_part}, strength={args.retrieved_prior_strength}, "
-                f"window={args.retrieved_prior_window}, protect={prior_protect_frames}"
-            )
+    if hasattr(model.diffusion, "tto_steps"):
+        model.diffusion.tto_steps = int(args.tto_steps)
+    if hasattr(model.diffusion, "tto_interval"):
+        model.diffusion.tto_interval = int(args.tto_interval)
+    if hasattr(model.diffusion, "tto_lr"):
+        model.diffusion.tto_lr = float(args.tto_lr)
+    if hasattr(model.diffusion, "tto_contact_threshold"):
+        model.diffusion.tto_contact_threshold = float(args.tto_contact_threshold)
 
     with torch.no_grad():
-        sample_norm = sample_motion(model, cond, constraint, args, num_frames)
-
-    motion_norm = sample_norm.detach().cpu()
-    motion_physical_raw = model.normalizer.unnormalize(motion_norm)
-    motion_physical_raw = to_numpy(motion_physical_raw)[0].astype(np.float32)
-    motion_physical_final = motion_physical_raw.copy()
-
-    trajectory_control_mode = "model_condition_tto_only"
-
-    if args.post_anchor_trajectory:
-        trajectory_control_mode = "postprocess_hard_anchor"
-        print(
-            "⚠️ post_anchor_trajectory 已开启：root X/Z 将被严格替换为目标轨迹。"
-            "该结果可以展示系统级轨迹控制，但不能单独声称是纯模型输出。"
-        )
-        motion_physical_final = apply_trajectory_anchor(
-            motion_physical_final,
-            traj_physical,
-            strength=1.0,
-        )
-
-    elif float(args.trajectory_anchor_strength) > 0.0:
-        trajectory_control_mode = "postprocess_soft_anchor"
-        print(
-            f"⚠️ soft trajectory anchor 已开启：strength={args.trajectory_anchor_strength:.3f}。"
-            "请同时报告 raw motion 和 final motion 指标。"
-        )
-        motion_physical_final = apply_trajectory_anchor(
-            motion_physical_final,
-            traj_physical,
-            strength=args.trajectory_anchor_strength,
-        )
-
-    else:
-        print("✅ 未启用 post trajectory anchor：final motion 等于 raw model/TTO output。")
-
-    if args.post_foot_lock:
-        if foot_lock_root_correction is None or blend_back_to_trajectory is None:
-            raise ImportError(
-                "post_foot_lock requires postprocess_footlock.py in project root."
-            )
-
-        print("🦶 post_foot_lock 已开启：执行 contact-aware root correction。")
-
-        motion_physical_final, footlock_debug = foot_lock_root_correction(
-            motion_physical_final,
-            device=str(device),
-            fps=args.fps,
-            height_threshold=args.foot_lock_height_threshold,
-            speed_threshold=args.foot_lock_speed_threshold,
-            min_contact_len=args.foot_lock_min_contact_len,
-            lock_strength=args.foot_lock_strength,
-            smooth_window=args.foot_lock_smooth_window,
-        )
-
-        if args.post_anchor_trajectory or float(args.trajectory_anchor_strength) > 0.0:
-            motion_physical_final = blend_back_to_trajectory(
-                motion_physical_final,
-                target_traj=traj_physical,
-                traj_keep=args.foot_lock_traj_keep,
-                keep_endpoints=True,
-            )
-
-        if trajectory_control_mode.startswith("postprocess"):
-            trajectory_control_mode = trajectory_control_mode + "+foot_lock"
-        else:
-            trajectory_control_mode = "postprocess_foot_lock"
-
-        print(f"🦶 foot lock debug: {footlock_debug}")
-
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-
-    if args.save_eval_assets:
-        save_eval_assets(
-            out_path=args.out,
-            motion_raw_physical=motion_physical_raw,
-            motion_final_physical=motion_physical_final,
-            traj_physical=traj_physical,
+        sample = sample_motion(
+            model=model,
+            cond=cond,
+            constraint=constraint,
             args=args,
-            trajectory_control_mode=trajectory_control_mode,
+            num_frames=num_frames,
         )
-    else:
-        np.save(args.out, motion_physical_final.astype(np.float32))
-        print(f"✅ saved motion: {args.out}, shape={motion_physical_final.shape}")
 
-    if args.save_controls:
-        out_path = Path(args.out)
-        traj_path = out_path.with_name(out_path.stem + "_target_traj.npy")
-        raw_path = out_path.with_name(out_path.stem + "_raw.npy")
-        meta_path = out_path.with_name(out_path.stem + "_meta.json")
+    motion_norm = to_numpy(sample)[0].astype(np.float32)
+    motion_raw_physical = unnormalize_motion(normalizer, motion_norm)
 
-        np.save(traj_path, traj_physical.astype(np.float32))
-        np.save(raw_path, motion_physical_raw.astype(np.float32))
+    motion_final_physical = motion_raw_physical.copy()
 
-        meta = {
-            "checkpoint": args.checkpoint,
-            "music": args.music,
-            "audio_feature_path": audio_feature_path,
-            "start_pose": args.start_pose,
-            "end_pose": args.end_pose,
-            "mid_poses": parse_list(args.mid_poses),
-            "mid_pose_frames": parse_mid_frames(
-                args.mid_pose_frames,
-                len(parse_list(args.mid_poses)),
-                num_frames,
-            ),
-            "auto_mid_keyframes": args.auto_mid_keyframes,
-            "auto_mid_count": args.auto_mid_count,
-            "rag_db": args.rag_db,
-            "auto_mid_plan": getattr(args, "auto_mid_plan_path", ""),
-            "retrieved_clip_prior_denoise": bool(getattr(args, "retrieved_clip_prior_denoise", False)),
-            "retrieved_prior_window": int(getattr(args, "retrieved_prior_window", 24)),
-            "retrieved_prior_strength": float(getattr(args, "retrieved_prior_strength", 0.18)),
-            "retrieved_prior_anneal_power": float(getattr(args, "retrieved_prior_anneal_power", 1.0)),
-            "retrieved_prior_body_part": getattr(args, "retrieved_prior_body_part", "upper"),
-            "retrieved_prior_source_pose_space": getattr(args, "retrieved_prior_source_pose_space", "auto"),
-            "retrieved_prior_protect_width": int(getattr(args, "retrieved_prior_protect_width", 2)),
-            "retrieved_prior_debug_path": getattr(args, "retrieved_prior_debug_path", ""),
-            "auto_mid_min_gap": args.auto_mid_min_gap,
-            "auto_mid_source_gap": args.auto_mid_source_gap,
-            "auto_mid_disallow_same_source": args.auto_mid_disallow_same_source,
-            "auto_mid_contact_diversity_weight": args.auto_mid_contact_diversity_weight,
-            "auto_mid_energy_rerank_top_k": args.auto_mid_energy_rerank_top_k,
-            "auto_mid_energy_rerank_weight": args.auto_mid_energy_rerank_weight,
-            "auto_mid_energy_target": args.auto_mid_energy_target,
-            "auto_mid_energy_band": args.auto_mid_energy_band,
-            "auto_mid_pose_space": args.auto_mid_pose_space,
-            "auto_mid_max_candidates": args.auto_mid_max_candidates,
-            "auto_mid_sample_stride": args.auto_mid_sample_stride,
-            "auto_mid_music_weight": args.auto_mid_music_weight,
-            "auto_mid_trajectory_weight": args.auto_mid_trajectory_weight,
-            "trajectory": args.trajectory,
-            "target_traj": args.target_traj,
-            "target_traj_saved": str(traj_path),
-            "raw_motion_saved": str(raw_path),
-            "out": args.out,
-            "num_frames": num_frames,
-            "fps": args.fps,
-            "pose_space": args.pose_space,
-            "sampler": args.sampler,
-            "use_tto": not args.no_tto,
-            "tto_steps": args.tto_steps,
-            "tto_interval": args.tto_interval,
-            "tto_lr": args.tto_lr,
-            "tto_contact_threshold": args.tto_contact_threshold,
-            "tto_trajectory_loss_weight": args.tto_trajectory_loss_weight,
-            "tto_trajectory_velocity_loss_weight": args.tto_trajectory_velocity_loss_weight,
-            "tto_root_acc_loss_weight": args.tto_root_acc_loss_weight,
-            "tto_foot_loss_weight": args.tto_foot_loss_weight,
-            "hard_keyframe_project": not args.no_hard_keyframe_project,
-            "post_anchor_trajectory": args.post_anchor_trajectory,
-            "trajectory_anchor_strength": args.trajectory_anchor_strength,
-            "post_foot_lock": args.post_foot_lock,
-            "foot_lock_strength": args.foot_lock_strength,
-            "foot_lock_traj_keep": args.foot_lock_traj_keep,
-            "foot_lock_height_threshold": args.foot_lock_height_threshold,
-            "foot_lock_speed_threshold": args.foot_lock_speed_threshold,
-            "foot_lock_min_contact_len": args.foot_lock_min_contact_len,
-            "foot_lock_smooth_window": args.foot_lock_smooth_window,
-            "beat_guidance_weight": args.beat_guidance_weight,
-            "keep_trajectory_absolute": args.keep_trajectory_absolute,
-            "uniform_trajectory_timing": args.uniform_trajectory_timing,
-            "linear_trajectory": args.linear_trajectory,
-            "trajectory_control_mode": trajectory_control_mode,
-            "report_warning": (
-                "If trajectory_control_mode starts with postprocess, report raw and final "
-                "metrics separately. Final trajectory error may include post-processing."
-            ),
-        }
+    if args.post_anchor_trajectory or float(args.trajectory_anchor_strength) > 0:
+        motion_final_physical = apply_trajectory_anchor(
+            motion_final_physical,
+            traj_physical,
+            strength=float(args.trajectory_anchor_strength),
+        )
 
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-
-        print(f"✅ target trajectory: {traj_path}")
-        print(f"✅ raw motion: {raw_path}")
-        print(f"✅ meta: {meta_path}")
+    save_eval_assets(
+        out_path=args.out,
+        motion_raw_physical=motion_raw_physical,
+        motion_final_physical=motion_final_physical,
+        traj_physical=traj_physical,
+        args=args,
+        trajectory_control_mode="stage4_stage5_direct",
+    )
 
 
 if __name__ == "__main__":
