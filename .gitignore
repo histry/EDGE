@@ -95,3 +95,26 @@ data/*.bvh
 *.exe
 *.log
 实验日志/
+
+# ChoreoRAG experiment artifacts
+runs/
+output/
+data/dunhuang_choreo_unit_rag/
+data/dunhuang_bvh/processed/
+
+# Large generated files
+*.pt
+*.ckpt
+*.pth
+*.npy
+*.npz
+*.mp4
+*.gif
+*.avi
+*.mov
+*.wav
+*.mp3
+
+# Python cache
+__pycache__/
+*.pyc
