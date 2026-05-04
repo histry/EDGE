@@ -1051,7 +1051,6 @@ class EDGE:
             mode="long" if has_real_audio else "normal",
             fk_out=fk_out,
             render=render,
-            sound_folder=sound_dir,
             target_frames=target_frames,
             use_tto=use_tto
         )
