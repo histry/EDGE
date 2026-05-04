@@ -1297,8 +1297,9 @@ class GaussianDiffusion(nn.Module):
         )
         anti_freeze_term = physical_w * 0.05 * anti_freeze_loss
         # Root-lower coupling is a control-adapter objective, not a late physical regularizer.
-        # Use control_w so Stage-A adapter training receives coupling gradients from epoch 1.
-        sync_term = control_w * float(self.sync_loss_weight) * sync_loss
+        # Use a short warmup so Stage-A receives coupling gradients early.
+        root_lower_w = self._linear_warmup(current_epoch, start=1, end=5)
+        sync_term = root_lower_w * float(self.sync_loss_weight) * sync_loss
 
         biomech_term = biomech_w * 0.02 * biomech_loss
         root_turn_term = physical_w * 0.01 * root_turn_loss
