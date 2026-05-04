@@ -434,7 +434,7 @@ class EDGE:
                 message
                 + "\n由于启用了 --strict_audio_checkpoint，训练已停止。"
             )
-    def _apply_stage_freezing(self, model, train_stage):
+    def _apply_stage_freezing(self, model, train_stage, adapter_train_decoder=False):
         """
         Training stages:
         - full:
