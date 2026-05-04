@@ -743,11 +743,25 @@ class EDGE:
             raise RuntimeError(f"在 {data_path} 目录下没有找到足够长的训练切片！")
             
         num_cpus = multiprocessing.cpu_count()
+        train_workers = min(int(num_cpus * 0.75), 16)
+        val_workers = 2
+
+        if getattr(opt, "train_num_workers", -1) >= 0:
+            train_workers = int(opt.train_num_workers)
+        if getattr(opt, "val_num_workers", -1) >= 0:
+            val_workers = int(opt.val_num_workers)
+
+        if self.accelerator.is_main_process:
+            print(
+                f"🧪 DataLoader workers: train={train_workers}, val={val_workers}; "
+                f"max_train_batches={getattr(opt, 'max_train_batches', 0)}"
+            )
+
         train_data_loader = DataLoader(
             train_dataset,
             batch_size=opt.batch_size,
             shuffle=True,
-            num_workers=min(int(num_cpus * 0.75), 16),
+            num_workers=train_workers,
             pin_memory=True,
             drop_last=True,
         )
@@ -755,7 +769,7 @@ class EDGE:
             test_dataset,
             batch_size=opt.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=val_workers,
             pin_memory=True,
             drop_last=False,
         )
@@ -777,7 +791,13 @@ class EDGE:
         for epoch in range(1, opt.epochs + 1):
             train_loss = 0.0
             self.train()
-            for batch in tqdm(train_data_loader, leave=False):
+            for batch_idx, batch in enumerate(tqdm(train_data_loader, leave=False)):
+                max_train_batches = int(getattr(opt, "max_train_batches", 0) or 0)
+                if max_train_batches > 0 and batch_idx >= max_train_batches:
+                    if self.accelerator.is_main_process:
+                        print(f"🧪 max_train_batches reached: {max_train_batches}; ending epoch early.")
+                    break
+
                 x, cond, name, wav = batch
                 
                 x = x.to(self.accelerator.device)

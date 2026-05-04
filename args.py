@@ -326,6 +326,25 @@ def parse_train_opt():
         default=10,
         help="number of validation batches to evaluate at each save interval",
     )
+
+    parser.add_argument(
+        "--max_train_batches",
+        type=int,
+        default=0,
+        help="Debug/smoke-test only: stop each epoch after this many training batches. 0 means full epoch.",
+    )
+    parser.add_argument(
+        "--train_num_workers",
+        type=int,
+        default=-1,
+        help="Override training DataLoader workers. -1 keeps default; 0 is best for smoke tests.",
+    )
+    parser.add_argument(
+        "--val_num_workers",
+        type=int,
+        default=-1,
+        help="Override validation DataLoader workers. -1 keeps default; 0 is best for smoke tests.",
+    )
     parser.add_argument(
         "--enable_ood_eval",
         action="store_true",
