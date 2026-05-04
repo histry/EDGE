@@ -823,42 +823,112 @@ class GaussianDiffusion(nn.Module):
         except Exception:
             return model_motion_x0.new_tensor(0.0)
 
-    def _kinematic_sync_loss(self, model_motion_x0):
-        """Root-lower coupling loss, logged as Kinematic Sync Loss."""
+
+    def _kinematic_sync_loss(self, model_motion_x0, target_motion_x0=None, cond=None):
+        """Condition-driven root-lower coupling loss.
+
+        The previous version could remain zero because it used the generated
+        root motion itself as the trigger.  If the model learned to keep root
+        motion smooth/small, the loss disappeared and never forced the lower
+        body to respond.
+
+        This version uses cond["trajectory"] as the driving signal:
+        when the commanded trajectory velocity is high, lower-body rotations
+        and contact phase must show sufficient temporal change.
+        """
         if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
             return model_motion_x0.new_tensor(0.0)
 
         if float(getattr(self, "root_lower_coupling_loss_weight", 0.0)) <= 0.0:
             return model_motion_x0.new_tensor(0.0)
 
-        root_xz = model_motion_x0[:, :, [self.root_x_idx, self.root_z_idx]]
-        root_speed = safe_norm(root_xz[:, 1:] - root_xz[:, :-1], dim=-1)
+        # Use physical space when possible, so thresholds are stable.
+        if self.normalizer is not None:
+            pred = maybe_unnormalize(self.normalizer, model_motion_x0)
+            target = (
+                maybe_unnormalize(self.normalizer, target_motion_x0)
+                if target_motion_x0 is not None
+                else None
+            )
+        else:
+            pred = model_motion_x0
+            target = target_motion_x0
 
+        b, t, _ = pred.shape
+        device = pred.device
+        dtype = pred.dtype
+
+        # 1) Driving speed: prefer commanded trajectory velocity.
+        target_traj = None
+        if isinstance(cond, dict):
+            target_traj = cond.get("trajectory", None)
+
+        if target_traj is not None:
+            target_traj = target_traj.to(device=device, dtype=dtype)
+            if target_traj.shape[1] != t:
+                target_traj = F.interpolate(
+                    target_traj.transpose(1, 2),
+                    size=t,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+            target_traj = target_traj[..., :2]
+
+            # cond["trajectory"] is normally normalized root X/Z.
+            # Convert it back to physical X/Z when normalizer is available.
+            if self.normalizer is not None and hasattr(self.normalizer, "mean") and hasattr(self.normalizer, "std"):
+                mean_x = torch.as_tensor(self.normalizer.mean[self.root_x_idx], device=device, dtype=dtype)
+                mean_z = torch.as_tensor(self.normalizer.mean[self.root_z_idx], device=device, dtype=dtype)
+                std_x = torch.as_tensor(self.normalizer.std[self.root_x_idx], device=device, dtype=dtype)
+                std_z = torch.as_tensor(self.normalizer.std[self.root_z_idx], device=device, dtype=dtype)
+                traj_x = target_traj[..., 0] * std_x + mean_x
+                traj_z = target_traj[..., 1] * std_z + mean_z
+                drive_root = torch.stack([traj_x, traj_z], dim=-1)
+            else:
+                drive_root = target_traj
+
+            drive_speed = safe_norm(drive_root[:, 1:] - drive_root[:, :-1], dim=-1)
+        else:
+            root_xz = pred[:, :, [self.root_x_idx, self.root_z_idx]]
+            drive_speed = safe_norm(root_xz[:, 1:] - root_xz[:, :-1], dim=-1)
+
+        # 2) Predicted lower-body activity.
         lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]
         lower_indices = []
         for joint in lower_joints:
-            lower_indices.extend(range(self.rot_slice.start + 6 * joint, self.rot_slice.start + 6 * (joint + 1)))
+            start = 7 + 6 * joint
+            lower_indices.extend(range(start, start + 6))
+        lower_indices = torch.as_tensor(lower_indices, device=device, dtype=torch.long)
 
-        lower = model_motion_x0[:, :, lower_indices]
-        lower_motion = safe_norm(lower[:, 1:] - lower[:, :-1], dim=-1)
+        pred_lower_delta = pred[:, 1:, lower_indices] - pred[:, :-1, lower_indices]
+        pred_lower_motion = torch.sqrt(pred_lower_delta.pow(2).mean(dim=-1) + 1e-8)
 
-        contacts = model_motion_x0[:, :, self.contact_slice].clamp(0.0, 1.0)
+        # 3) Adaptive lower target: at least root_lower_min_motion, and when
+        # GT target is available, require a fraction of GT lower activity.
+        min_motion = pred.new_tensor(float(getattr(self, "root_lower_min_motion", 0.010)))
+
+        if target is not None:
+            target_lower_delta = target[:, 1:, lower_indices] - target[:, :-1, lower_indices]
+            target_lower_motion = torch.sqrt(target_lower_delta.pow(2).mean(dim=-1) + 1e-8).detach()
+            required_lower = torch.maximum(min_motion, 0.55 * target_lower_motion)
+        else:
+            required_lower = min_motion
+
+        # 4) Contact phase should not stay completely static under fast drive.
+        contacts = pred[:, :, self.contact_slice].clamp(0.0, 1.0)
         contact_change = torch.abs(contacts[:, 1:] - contacts[:, :-1]).mean(dim=-1)
 
-        speed_th = model_motion_x0.new_tensor(float(getattr(self, "root_lower_speed_threshold", 0.012)))
-        min_motion = model_motion_x0.new_tensor(float(getattr(self, "root_lower_min_motion", 0.010)))
+        speed_th = pred.new_tensor(float(getattr(self, "root_lower_speed_threshold", 0.012)))
 
-        fast = F.relu(root_speed - speed_th)
-        if not bool((fast > 0).any().item()):
-            return model_motion_x0.new_tensor(0.0)
+        # Smooth weight instead of a hard binary gate.
+        fast_weight = torch.relu(drive_speed - speed_th) / (speed_th + 1e-8)
+        fast_weight = fast_weight.detach().clamp(0.0, 3.0)
 
-        leg_deficit = F.relu(min_motion - lower_motion)
-        contact_deficit = F.relu(0.03 - contact_change)
+        lower_penalty = fast_weight * torch.relu(required_lower - pred_lower_motion)
+        contact_penalty = fast_weight * torch.relu(pred.new_tensor(0.015) - contact_change)
 
-        denom = fast.detach().mean().clamp_min(1e-6)
-        coupling = ((fast * leg_deficit).mean() + 0.25 * (fast * contact_deficit).mean()) / denom
-        return coupling * float(getattr(self, "root_lower_coupling_loss_weight", 1.0))
-
+        loss = lower_penalty.mean() + 0.15 * contact_penalty.mean()
+        return loss * float(getattr(self, "root_lower_coupling_loss_weight", 1.0))
 
     def _biomech_loss(self, model_motion_x0):
         """
@@ -1119,7 +1189,7 @@ class GaussianDiffusion(nn.Module):
             )
 
             anti_freeze_loss = self._anti_freeze_loss(model_motion_x0)
-            sync_loss = self._kinematic_sync_loss(model_motion_x0)
+            sync_loss = self._kinematic_sync_loss(model_motion_x0, x_start, cond)
             biomech_loss = self._biomech_loss(model_motion_x0)
             root_turn_loss = self._root_turn_loss(model_motion_x0)
             contact_turn_loss = self._contact_turn_loss(model_motion_x0)
