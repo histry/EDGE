@@ -1,9 +1,9 @@
-"""Lightweight prediction-then-editing diagnostics for ChoreoRAG.
+"""Diagnostics for ChoreoRAG reward-collapse experiments.
 
-This does not regenerate motion by itself. It reads generated motion + target
-trajectory + ChoreoRAG plan metadata, diagnoses bad segments, and writes an
-edit recommendation JSON. Use recommendations to re-run generation with higher
-contact/entry/exit/text weights or fewer auto-mid frames.
+Replacement version that keeps the original transition/freezing/ADE checks and
+adds generated expressiveness proxies.  It can be used after every ablation to
+verify whether a higher-expressiveness retrieval actually propagates into the
+final generated motion without unacceptable jerk/contact break.
 """
 from __future__ import annotations
 
@@ -14,11 +14,23 @@ from typing import Dict, List
 
 import numpy as np
 
-
 CONTACT_SLICE = slice(0, 4)
 ROOT_X_IDX = 4
 ROOT_Z_IDX = 6
 ROT_SLICE = slice(7, 151)
+UPPER_JOINTS = [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+LOWER_JOINTS = [1, 2, 4, 5, 7, 8, 10, 11]
+
+
+def _rot_indices(joints):
+    idx = []
+    for j in joints:
+        idx.extend(range(7 + 6 * int(j), 7 + 6 * int(j) + 6))
+    return np.asarray(idx, dtype=np.int64)
+
+
+UPPER_IDX = _rot_indices(UPPER_JOINTS)
+LOWER_IDX = _rot_indices(LOWER_JOINTS)
 
 
 def load_motion(path: str) -> np.ndarray:
@@ -64,6 +76,36 @@ def freezing_score(motion: np.ndarray, threshold: float = 0.015) -> float:
     return float((v < threshold).mean())
 
 
+def motion_activity_stats(motion: np.ndarray) -> Dict[str, float]:
+    if len(motion) < 2:
+        return {
+            "generated_motion_energy": 0.0,
+            "generated_upper_activity": 0.0,
+            "generated_lower_activity": 0.0,
+            "generated_root_speed": 0.0,
+            "generated_spatial_range": 0.0,
+            "generated_turning": 0.0,
+        }
+    diff = motion[1:] - motion[:-1]
+    root = motion[:, [ROOT_X_IDX, ROOT_Z_IDX]]
+    root_vel = root[1:] - root[:-1]
+    if len(root_vel) > 2:
+        v1, v2 = root_vel[:-1], root_vel[1:]
+        n1, n2 = np.linalg.norm(v1, axis=1), np.linalg.norm(v2, axis=1)
+        cos = np.sum(v1 * v2, axis=1) / np.clip(n1 * n2, 1e-8, None)
+        turning = float(np.mean(1.0 - np.clip(cos, -1.0, 1.0)))
+    else:
+        turning = 0.0
+    return {
+        "generated_motion_energy": float(np.sqrt(np.mean(diff[:, ROT_SLICE] ** 2))),
+        "generated_upper_activity": float(np.sqrt(np.mean(diff[:, UPPER_IDX] ** 2))),
+        "generated_lower_activity": float(np.sqrt(np.mean(diff[:, LOWER_IDX] ** 2))),
+        "generated_root_speed": float(np.linalg.norm(root_vel, axis=1).mean()) if len(root_vel) else 0.0,
+        "generated_spatial_range": float(np.linalg.norm(root.max(axis=0) - root.min(axis=0))),
+        "generated_turning": float(max(0.0, turning)),
+    }
+
+
 def path_ade(motion: np.ndarray, target_traj: np.ndarray) -> float:
     traj = np.asarray(target_traj, dtype=np.float32)
     if traj.ndim == 3:
@@ -77,15 +119,29 @@ def path_ade(motion: np.ndarray, target_traj: np.ndarray) -> float:
     return float(np.linalg.norm(root - traj[:, :2], axis=-1).mean())
 
 
-def diagnose(motion_path: str, plan_json: str, target_traj_path: str = "", out: str = "") -> Dict:
-    motion = load_motion(motion_path)
+def _read_plan(plan_json: str) -> Dict:
     with open(plan_json, "r", encoding="utf-8") as f:
         plan = json.load(f)
+    if "keyframes" not in plan and "auto_keyframes" in plan:
+        plan["keyframes"] = plan["auto_keyframes"]
+    return plan
+
+
+def diagnose(motion_path: str, plan_json: str, target_traj_path: str = "", out: str = "") -> Dict:
+    motion = load_motion(motion_path)
+    plan = _read_plan(plan_json)
 
     keyframes = plan.get("keyframes", [])
     rows: List[Dict] = []
+    retrieved_expr = []
+    retrieved_energy = []
     for kf in keyframes:
         frame = int(kf.get("frame", 0))
+        parts = kf.get("score_parts", {}) or {}
+        if "expressiveness_score" in parts:
+            retrieved_expr.append(float(parts.get("expressiveness_score", 0.0)))
+        if "motion_energy_norm" in parts:
+            retrieved_energy.append(float(parts.get("motion_energy_norm", 0.0)))
         jerk = transition_jerk(motion, frame)
         cpb = contact_phase_break(motion, frame)
         action = "keep"
@@ -99,8 +155,11 @@ def diagnose(motion_path: str, plan_json: str, target_traj_path: str = "", out: 
         rows.append({
             "frame": frame,
             "segment_id": int(kf.get("segment_id", -1)),
+            "phase": str(parts.get("phase", "")),
             "source": kf.get("source", ""),
             "score": float(kf.get("score", 0.0)),
+            "retrieved_expressiveness": float(parts.get("expressiveness_score", -1.0)),
+            "retrieved_energy_norm": float(parts.get("motion_energy_norm", -1.0)),
             "transition_jerk": jerk,
             "contact_phase_break": cpb,
             "action": action,
@@ -111,11 +170,15 @@ def diagnose(motion_path: str, plan_json: str, target_traj_path: str = "", out: 
         "motion": motion_path,
         "plan_json": plan_json,
         "freezing_score": freezing_score(motion),
+        "retrieved_expressiveness_mean": float(np.mean(retrieved_expr)) if retrieved_expr else None,
+        "retrieved_energy_mean": float(np.mean(retrieved_energy)) if retrieved_energy else None,
+        **motion_activity_stats(motion),
         "segments": rows,
         "recommendation": {
-            "if_high_jerk": "export EDGE_UNIT_ENTRY_WEIGHT=0.85; export EDGE_UNIT_EXIT_WEIGHT=0.85; reduce --mid_keyframe_strength to 0.15",
-            "if_contact_break": "export EDGE_UNIT_CONTACT_PHASE_WEIGHT=1.20; reduce retrieved_prior_strength if used",
-            "if_freezing_high": "try auto_mid_count=1/2 or increase text/energy weights; no-auto-mid likely too static",
+            "if_high_jerk": "Reduce --mid_keyframe_strength to 0.12-0.15 or enable EDGE_UNIT_SOFT_PRIOR=1 with EDGE_UNIT_PRIOR_STRENGTH=0.04-0.06.",
+            "if_contact_break": "Increase EDGE_UNIT_CONTACT_PHASE_WEIGHT or use phase=pose for ending segments; keep unit prior upper-only.",
+            "if_freezing_high": "Increase EDGE_UNIT_EXPRESSIVENESS_BONUS or EDGE_UNIT_MIN_EXPRESSIVENESS for attack/flow segments.",
+            "if_lower_activity_too_high": "Lower expr_w_root/expr_w_lower when rebuilding DB; prefer upper/spatial/turning expressiveness.",
         },
     }
 
