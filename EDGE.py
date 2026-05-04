@@ -946,7 +946,7 @@ class EDGE:
                                     raw_feat_t = torch.from_numpy(audio_feat_np).float().unsqueeze(0).transpose(1, 2)
 
                                     y, sr = librosa.load(wav_path, sr=None)
-                                    duration = librosa.get_duration(y=y, sr=sr))
+                                    duration = librosa.get_duration(y=y, sr=sr)
                                     
                                     print(f"   🎬 正在按完整时长进行推理，总计帧数: {target_frames} (约 {duration:.1f} 秒)")
                                     aligned_feat = F.interpolate(raw_feat_t, size=target_frames, mode='linear', align_corners=False).transpose(1, 2).squeeze(0)
