@@ -1029,7 +1029,7 @@ class EDGE:
             pure_names = [os.path.splitext(w)[0] for w in wav] 
             import librosa
             try:
-                y, sr = librosa.load(wav[0], sr=None) sr=sr) * 30)
+                y, sr = librosa.load(wav[0], sr=None)
             except Exception as e:
                 print(f"获取时长失败，回退到默认帧数: {e}")
         else:
