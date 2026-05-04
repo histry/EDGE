@@ -946,8 +946,7 @@ class EDGE:
                                     raw_feat_t = torch.from_numpy(audio_feat_np).float().unsqueeze(0).transpose(1, 2)
 
                                     y, sr = librosa.load(wav_path, sr=None)
-                                    duration = librosa.get_duration(y=y, sr=sr)
-                                    target_frames = int(duration * 30)
+                                    duration = librosa.get_duration(y=y, sr=sr))
                                     
                                     print(f"   🎬 正在按完整时长进行推理，总计帧数: {target_frames} (约 {duration:.1f} 秒)")
                                     aligned_feat = F.interpolate(raw_feat_t, size=target_frames, mode='linear', align_corners=False).transpose(1, 2).squeeze(0)
@@ -1023,8 +1022,6 @@ class EDGE:
         
         cond = move_condition_to_device(cond, self.accelerator.device)
         is_dummy_audio = torch.all(cond_for_len == 0).item()
-        
-        target_frames = seq_len 
         has_real_audio = wav is not None and isinstance(wav, (list, tuple)) and len(wav) > 0 and os.path.exists(wav[0])
 
         if has_real_audio:
@@ -1032,8 +1029,7 @@ class EDGE:
             pure_names = [os.path.splitext(w)[0] for w in wav] 
             import librosa
             try:
-                y, sr = librosa.load(wav[0], sr=None)
-                target_frames = int(librosa.get_duration(y=y, sr=sr) * 30)
+                y, sr = librosa.load(wav[0], sr=None) sr=sr) * 30)
             except Exception as e:
                 print(f"获取时长失败，回退到默认帧数: {e}")
         else:
@@ -1051,6 +1047,5 @@ class EDGE:
             mode="long" if has_real_audio else "normal",
             fk_out=fk_out,
             render=render,
-            target_frames=target_frames,
             use_tto=use_tto
         )
