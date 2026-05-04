@@ -19,6 +19,25 @@ except Exception:
     spi = None
 
 from EDGE import EDGE
+
+try:
+    from pace_choreorag_trajectory import (
+        apply_pace_choreorag_to_trajectory,
+        build_pace_progress,
+    )
+except Exception:
+    apply_pace_choreorag_to_trajectory = None
+    build_pace_progress = None
+
+try:
+    from choreorag_unit_prior import (
+        apply_unit_priors_from_specs,
+        infer_unit_specs_from_mid_paths,
+    )
+except Exception:
+    apply_unit_priors_from_specs = None
+    infer_unit_specs_from_mid_paths = None
+
 from data.audio_extraction.wav2vec_librosa_features import extract as hybrid_extract
 
 try:
@@ -423,6 +442,16 @@ def build_control_trajectory(
             use_audio_timing=not uniform_timing,
             onset_index=onset_index,
         )
+
+        if build_pace_progress is not None:
+            try:
+                progress = build_pace_progress(
+                    audio_feature=audio_feature,
+                    num_frames=num_frames,
+                    base_progress=progress,
+                )
+            except Exception as exc:
+                print(f"⚠️ PACE beat-aware progress skipped: {exc}")
         traj_physical = interpolate_trajectory_smooth(
             points=points,
             progress=progress,
@@ -431,6 +460,18 @@ def build_control_trajectory(
 
     if not keep_absolute:
         traj_physical = traj_physical - traj_physical[0:1]
+
+
+    # PACE-ChoreoRAG: root-speed scale cap + optional elastic sparse anchors.
+    # Disabled unless EDGE_TRAJ_AUTO_SCALE=1 or EDGE_TRAJ_ELASTIC_ANCHOR=1.
+    if apply_pace_choreorag_to_trajectory is not None:
+        try:
+            traj_physical = apply_pace_choreorag_to_trajectory(
+                traj_physical=traj_physical,
+                audio_feature=audio_feature,
+            )
+        except Exception as exc:
+            print(f"⚠️ PACE trajectory skipped: {exc}")
 
     traj_norm = normalize_trajectory_for_model(
         traj_physical=traj_physical,
@@ -508,6 +549,22 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
 
     for i, (path, frame) in enumerate(zip(mid_paths, mid_frames), start=1):
         add_pose(path, frame, f"mid{i}", strength=mid_strength)
+    
+    # PACE-ChoreoRAG Phase 4: retrieved 45-frame unit -> weak temporal prior.
+    # Disabled unless EDGE_UNIT_SOFT_PRIOR=1.  It infers sibling files
+    # like xxx_01_f117.npy -> xxx_01_f117_unit.npy.
+    if apply_unit_priors_from_specs is not None and infer_unit_specs_from_mid_paths is not None:
+        try:
+            all_mid_paths = parse_list(args.mid_poses)
+            all_mid_frames = parse_mid_frames(args.mid_pose_frames, len(all_mid_paths), num_frames)
+            unit_specs = infer_unit_specs_from_mid_paths(all_mid_paths, all_mid_frames)
+            value, mask = apply_unit_priors_from_specs(value, mask, unit_specs)
+            if unit_specs:
+                print(f"✅ ChoreoRAG retrieved-unit specs found: {unit_specs}")
+        except Exception as exc:
+            import os as _os
+            if str(_os.environ.get("EDGE_UNIT_SOFT_PRIOR", "0")).lower() in {"1", "true", "yes", "y", "on"}:
+                print(f"⚠️ failed to apply ChoreoRAG retrieved-unit soft prior: {exc}")
 
     return {
         "value": torch.from_numpy(value[None]).to(device=device, dtype=torch.float32),

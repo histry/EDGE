@@ -1,25 +1,38 @@
-"""ChoreoRAG auto middle-keyframe planner for EDGE.
+"""Tension / expressiveness-aware ChoreoRAG auto middle-keyframe planner for EDGE.
 
-Direct replacement for auto_keyframe_planner.py.
+Drop-in replacement for auto_keyframe_planner.py.
 
-Key features:
-- Backward compatible with old frame-level RAG DB.
-- Supports choreo-unit RAG DB built by build_choreo_unit_rag_db.py.
-- Supports DanceChat/TM2D-style time-ranged choreography plan through:
-    EDGE_CHOREO_PLAN_JSON=/path/to/plan.json
-  or heuristic fallback.
-- Does not train EDGE; only changes inference-time auto-mid planning.
+Design goals:
+- Default behavior remains close to the existing ChoreoRAG planner.
+- All new behavior is activated by environment variables.
+- Stage 1: expressiveness-aware retrieval.
+- Stage 2: music tension / phase-aware dynamic weight modulation.
+- Stage 3: homogeneity penalty for long sequences.
+- Stage 4 support: save selected 45-frame unit priors for generate_controlled.py.
 
-Environment variables:
-  EDGE_CHOREO_PLAN_JSON          optional JSON plan path
-  EDGE_CHOREO_STYLE_HINT         default: 敦煌舞，飞天感，上肢舒展，重心稳定
-  EDGE_TEXT_BRIDGE_MODEL         default: BAAI/bge-small-zh-v1.5
-  EDGE_TEXT_BRIDGE_DEVICE        default: cpu
-  EDGE_TEXT_BRIDGE_WEIGHT        default: 0.50
-  EDGE_UNIT_ENTRY_WEIGHT         default: 0.60
-  EDGE_UNIT_EXIT_WEIGHT          default: 0.60
-  EDGE_UNIT_CONTACT_PHASE_WEIGHT default: 0.85
-  EDGE_MOTION_UNIT_MODE          auto|on|off, default auto
+Key environment variables:
+  # Stage 1: expressiveness filtering / reward
+  EDGE_UNIT_MIN_EXPRESSIVENESS=-1       # >=0 filters candidates below this score
+  EDGE_UNIT_EXPRESSIVENESS_BONUS=0.0    # subtract bonus * expressiveness from cost
+  EDGE_UNIT_MIN_ENERGY=-1               # optional hard energy floor
+  EDGE_UNIT_ENERGY_BONUS=0.0            # optional energy bonus
+
+  # Stage 2: phase-aware planner
+  EDGE_TENSION_AWARE_PLANNER=0          # enable attack/flow/pose dynamic weights
+
+  # Stage 3: homogeneity penalty
+  EDGE_UNIT_HOMOGENEITY_WEIGHT=0.0
+  EDGE_UNIT_HOMOGENEITY_MIN_FRAMES=240
+
+  # Existing / compatible vars
+  EDGE_CHOREO_PLAN_JSON=/path/to/plan.json
+  EDGE_CHOREO_STYLE_HINT=敦煌舞，飞天感，上肢舒展，重心稳定
+  EDGE_TEXT_BRIDGE_MODEL=BAAI/bge-small-zh-v1.5
+  EDGE_TEXT_BRIDGE_DEVICE=cpu
+  EDGE_TEXT_BRIDGE_WEIGHT=0.50
+  EDGE_UNIT_ENTRY_WEIGHT=0.60
+  EDGE_UNIT_EXIT_WEIGHT=0.60
+  EDGE_UNIT_CONTACT_PHASE_WEIGHT=0.85
 """
 from __future__ import annotations
 
@@ -39,7 +52,7 @@ try:
     from dataset.quaternion import ax_to_6v
     from dataset.preprocess import vectorize_many, Normalizer
     from vis import SMPLSkeleton
-except Exception:
+except Exception:  # pragma: no cover
     ax_to_6v = None
     vectorize_many = None
     Normalizer = None
@@ -47,7 +60,7 @@ except Exception:
 
 try:
     from model.text_bridge_encoder import TextBridgeEncoder
-except Exception:
+except Exception:  # pragma: no cover
     try:
         from text_bridge_encoder import TextBridgeEncoder  # type: ignore
     except Exception:
@@ -55,7 +68,7 @@ except Exception:
 
 try:
     from music_choreo_planner import load_or_build_choreo_plan
-except Exception:
+except Exception:  # pragma: no cover
     load_or_build_choreo_plan = None
 
 
@@ -96,6 +109,13 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
     except Exception:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return int(default)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -208,6 +228,7 @@ def _field(data, *keys):
 
 
 def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normalized", max_candidates: int = 5000, sample_stride: int = 1):
+    """Load old pose RAG DB or new ChoreoRAG motion-unit DB."""
     path = Path(rag_db)
     candidates: List[Dict[str, object]] = []
 
@@ -235,8 +256,6 @@ def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normali
 
         text_emb = _field(data, "motion_text_embedding", "text_embedding", "motion_embedding", "motion_embeddings")
         mmr_emb = _field(data, "motion_mmr_embedding", "mmr_embedding", "mmr_embeddings")
-        energy = _field(data, "motion_energy")
-        contact_stability = _field(data, "contact_stability")
         motion_text = _field(data, "motion_text")
         contact_entry = _field(data, "contact_entry")
         contact_exit = _field(data, "contact_exit")
@@ -244,8 +263,25 @@ def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normali
         unit_center = _field(data, "unit_center")
         unit_end = _field(data, "unit_end")
 
+        scalar_fields = {
+            "motion_energy": _field(data, "motion_energy"),
+            "motion_energy_norm": _field(data, "motion_energy_norm"),
+            "root_speed": _field(data, "root_speed"),
+            "root_speed_norm": _field(data, "root_speed_norm"),
+            "upper_activity": _field(data, "upper_activity"),
+            "upper_activity_norm": _field(data, "upper_activity_norm"),
+            "lower_activity": _field(data, "lower_activity"),
+            "lower_activity_norm": _field(data, "lower_activity_norm"),
+            "spatial_range": _field(data, "spatial_range"),
+            "spatial_range_norm": _field(data, "spatial_range_norm"),
+            "turning": _field(data, "turning"),
+            "turning_norm": _field(data, "turning_norm"),
+            "contact_stability": _field(data, "contact_stability"),
+            "expressiveness_score": _field(data, "expressiveness_score"),
+        }
+
         for i in range(0, len(poses), max(1, int(sample_stride))):
-            candidates.append({
+            item = {
                 "pose": np.asarray(poses[i], dtype=np.float32),
                 "source": str(source[i]),
                 "source_frame": int(source_frame[i]),
@@ -253,8 +289,6 @@ def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normali
                 "motion_text_embedding": None if text_emb is None else np.asarray(text_emb[i], dtype=np.float32),
                 "motion_embedding": None if text_emb is None else np.asarray(text_emb[i], dtype=np.float32),
                 "motion_mmr_embedding": None if mmr_emb is None else np.asarray(mmr_emb[i], dtype=np.float32),
-                "motion_energy": None if energy is None else float(energy[i]),
-                "contact_stability": None if contact_stability is None else float(contact_stability[i]),
                 "is_motion_unit": bool(is_unit_db),
                 "entry_pose": None if entry is None else np.asarray(entry[i], dtype=np.float32),
                 "exit_pose": None if exitp is None else np.asarray(exitp[i], dtype=np.float32),
@@ -265,7 +299,10 @@ def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normali
                 "unit_start": -1 if unit_start is None else int(unit_start[i]),
                 "unit_center": -1 if unit_center is None else int(unit_center[i]),
                 "unit_end": -1 if unit_end is None else int(unit_end[i]),
-            })
+            }
+            for key, values in scalar_fields.items():
+                item[key] = None if values is None else float(values[i])
+            candidates.append(item)
             if len(candidates) >= max_candidates:
                 break
         return candidates
@@ -296,7 +333,9 @@ def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normali
                     "motion_text_embedding": None,
                     "motion_embedding": None,
                     "motion_energy": None,
+                    "motion_energy_norm": None,
                     "contact_stability": None,
+                    "expressiveness_score": None,
                 })
                 if len(candidates) >= max_candidates:
                     break
@@ -305,18 +344,48 @@ def load_rag_candidates(rag_db: str, normalizer=None, pose_space: str = "normali
     raise ValueError(f"Invalid rag_db: {rag_db}")
 
 
+def _robust_norm(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    if len(values) == 0 or float(values.max() - values.min()) <= 1e-8:
+        return np.zeros_like(values, dtype=np.float32)
+    lo, hi = np.percentile(values, [10, 90])
+    if float(hi - lo) <= 1e-8:
+        lo, hi = float(values.min()), float(values.max())
+    return np.clip((values - float(lo)) / max(float(hi - lo), 1e-8), 0.0, 1.0).astype(np.float32)
+
+
 def annotate_candidate_statistics(candidates):
+    """Attach normalized stats and expressiveness fallback in-place."""
     if not candidates:
         return
-    energies = np.asarray([float(c.get("motion_energy") or 0.0) for c in candidates], dtype=np.float32)
-    if float(energies.max() - energies.min()) > 1e-8:
-        lo, hi = np.percentile(energies, [10, 90])
-        denom = max(float(hi - lo), 1e-8)
-        e_norm = np.clip((energies - float(lo)) / denom, 0.0, 1.0)
-    else:
-        e_norm = np.zeros_like(energies)
-    for c, e in zip(candidates, e_norm):
-        c["motion_energy_norm"] = float(e)
+
+    keys = ["motion_energy", "root_speed", "upper_activity", "lower_activity", "spatial_range", "turning"]
+    for key in keys:
+        norm_key = f"{key}_norm"
+        if all(c.get(norm_key) is not None for c in candidates):
+            continue
+        vals = np.asarray([float(c.get(key) or 0.0) for c in candidates], dtype=np.float32)
+        norm = _robust_norm(vals)
+        for c, v in zip(candidates, norm):
+            c[norm_key] = float(v)
+
+    if all(c.get("expressiveness_score") is not None for c in candidates):
+        return
+
+    for c in candidates:
+        # Same conservative composition as the DB builder.  Root speed is small.
+        expr = (
+            0.30 * float(c.get("motion_energy_norm") or 0.0)
+            + 0.30 * float(c.get("upper_activity_norm") or 0.0)
+            + 0.20 * float(c.get("spatial_range_norm") or 0.0)
+            + 0.15 * float(c.get("turning_norm") or 0.0)
+            + 0.05 * float(c.get("root_speed_norm") or 0.0)
+        )
+        contact = c.get("contact_stability")
+        if contact is not None and float(contact) < 0.45:
+            expr *= 0.75
+        c["expressiveness_score"] = float(np.clip(expr, 0.0, 1.0))
 
 
 def normalize_01(x):
@@ -560,6 +629,8 @@ def get_choreo_plan(audio_feature, num_frames):
             "query_text": f"中等能量，平稳移动，上肢舒展，重心稳定，{style_hint}",
             "motion_prompt": f"中等能量，平稳移动，上肢舒展，重心稳定，{style_hint}",
             "energy_target": 0.55,
+            "tension_target": 0.55,
+            "phase": "flow",
         }],
     }
 
@@ -567,11 +638,69 @@ def get_choreo_plan(audio_feature, num_frames):
 def segment_for_frame(plan, frame):
     segments = list(plan.get("segments", []))
     if not segments:
-        return {"id": -1, "start": 0, "end": 10**9, "query_text": "", "energy_target": 0.55}
+        return {"id": -1, "start": 0, "end": 10**9, "query_text": "", "energy_target": 0.55, "tension_target": 0.55, "phase": "flow"}
     for seg in segments:
         if int(seg.get("start", 0)) <= frame <= int(seg.get("end", 10**9)):
             return seg
     return min(segments, key=lambda s: abs(int(s.get("center", (int(s.get("start", 0)) + int(s.get("end", 0))) // 2)) - frame))
+
+
+def _candidate_expr(cand: Dict[str, object]) -> float:
+    return float(np.clip(float(cand.get("expressiveness_score") or 0.0), 0.0, 1.0))
+
+
+def _candidate_energy(cand: Dict[str, object]) -> float:
+    return float(np.clip(float(cand.get("motion_energy_norm") or 0.0), 0.0, 1.0))
+
+
+def _phase_modulation(segment, weights: Dict[str, float]) -> Dict[str, float]:
+    out = dict(weights)
+    if not _env_bool("EDGE_TENSION_AWARE_PLANNER", False):
+        return out
+
+    segment = segment or {}
+    phase = str(segment.get("phase", "flow")).lower()
+    tension = float(np.clip(float(segment.get("tension_target", segment.get("energy_target", 0.55))), 0.0, 1.0))
+
+    if phase == "attack":
+        out["energy_target"] = max(out["energy_target"], float(segment.get("energy_target", 0.75)), 0.72)
+        out["min_expr"] = max(out["min_expr"], float(segment.get("min_expressiveness", 0.50)), 0.48 + 0.20 * tension)
+        out["min_energy"] = max(out["min_energy"], float(segment.get("min_energy", 0.40)))
+        out["expr_bonus"] += 0.25 + 0.20 * tension
+        out["energy_bonus"] += 0.10 + 0.10 * tension
+        out["w_contact"] *= 0.65
+        out["w_contact_phase"] *= 0.70
+        out["w_entry"] *= 0.75
+        out["w_exit"] *= 0.75
+        out["w_energy"] *= 0.65  # do not over-penalize non-medium-energy units
+    elif phase == "flow":
+        out["min_expr"] = max(out["min_expr"], float(segment.get("min_expressiveness", 0.30)))
+        out["expr_bonus"] += 0.10 + 0.10 * tension
+        out["w_traj"] *= 1.15
+        out["w_diversity"] *= 1.15
+    elif phase == "pose":
+        out["min_expr"] = min(out["min_expr"], float(segment.get("min_expressiveness", -1.0)))
+        out["min_energy"] = min(out["min_energy"], float(segment.get("min_energy", -1.0)))
+        out["expr_bonus"] *= 0.35
+        out["energy_bonus"] *= 0.35
+        out["w_contact"] *= 1.40
+        out["w_contact_phase"] *= 1.35
+        out["w_entry"] *= 1.25
+        out["w_exit"] *= 1.25
+    return out
+
+
+def _homogeneity_cost(expr: float, energy: float, selected_keyframes: List[AutoKeyframe], num_frames: int) -> float:
+    weight = _env_float("EDGE_UNIT_HOMOGENEITY_WEIGHT", 0.0)
+    min_frames = _env_int("EDGE_UNIT_HOMOGENEITY_MIN_FRAMES", 240)
+    if weight <= 0.0 or num_frames < min_frames or not selected_keyframes:
+        return 0.0
+    prev = selected_keyframes[-1]
+    prev_expr = float(prev.score_parts.get("expressiveness_score", prev.score_parts.get("motion_energy_norm", 0.0)))
+    prev_energy = float(prev.score_parts.get("motion_energy_norm", 0.0))
+    expr_sim = 1.0 - min(1.0, abs(float(expr) - prev_expr) / 0.35)
+    energy_sim = 1.0 - min(1.0, abs(float(energy) - prev_energy) / 0.35)
+    return float(weight) * max(0.0, 0.5 * expr_sim + 0.5 * energy_sim)
 
 
 def choose_candidate_for_frame(frame, candidates, anchors, traj_physical, selected_poses, selected_keyframes=None, text_embedding=None, segment=None,
@@ -584,12 +713,43 @@ def choose_candidate_for_frame(frame, candidates, anchors, traj_physical, select
     prev_a, next_a = neighbor_anchors(frame, anchors)
     tangent = target_traj_tangent(traj_physical, frame)
     scored = []
-    rejected = 0
+    rejected_by_source = 0
+    rejected_by_expr = 0
+    rejected_by_energy = 0
+    num_frames = int(anchors[-1][0]) + 1 if anchors else 0
+
+    weights = _phase_modulation(segment, {
+        "w_text": float(w_text),
+        "w_pose": float(w_pose),
+        "w_traj": float(w_traj),
+        "w_diversity": float(w_diversity),
+        "w_energy": float(w_energy),
+        "energy_target": float(energy_target),
+        "w_contact": float(w_contact),
+        "w_contact_diversity": float(w_contact_diversity),
+        "w_end": float(w_end),
+        "w_entry": float(w_entry),
+        "w_exit": float(w_exit),
+        "w_contact_phase": float(w_contact_phase),
+        "min_expr": _env_float("EDGE_UNIT_MIN_EXPRESSIVENESS", -1.0),
+        "expr_bonus": _env_float("EDGE_UNIT_EXPRESSIVENESS_BONUS", 0.0),
+        "min_energy": _env_float("EDGE_UNIT_MIN_ENERGY", -1.0),
+        "energy_bonus": _env_float("EDGE_UNIT_ENERGY_BONUS", 0.0),
+    })
 
     for cand in candidates:
         blocked, _ = is_same_source_region(cand, selected_keyframes, source_gap, disallow_same_source)
         if blocked:
-            rejected += 1
+            rejected_by_source += 1
+            continue
+
+        en = _candidate_energy(cand)
+        expr = _candidate_expr(cand)
+        if weights["min_expr"] >= 0.0 and expr < weights["min_expr"]:
+            rejected_by_expr += 1
+            continue
+        if weights["min_energy"] >= 0.0 and en < weights["min_energy"]:
+            rejected_by_energy += 1
             continue
 
         pose = np.asarray(cand["pose"], dtype=np.float32)
@@ -601,8 +761,7 @@ def choose_candidate_for_frame(frame, candidates, anchors, traj_physical, select
         traj_cost = direction_cost(cand.get("root_vel"), tangent)
         diversity_cost = 0.0 if not selected_poses else 1.0 / (1.0 + min(pose_distance(pose, p) for p in selected_poses))
 
-        en = float(cand.get("motion_energy_norm", 0.0) or 0.0)
-        e_target = float(np.clip(energy_target, 0.0, 1.0))
+        e_target = float(np.clip(weights["energy_target"], 0.0, 1.0))
         energy_cost = float(min(abs(en - e_target) / max(float(energy_band), 1e-6), 2.0))
 
         contact_stability = cand.get("contact_stability")
@@ -617,12 +776,24 @@ def choose_candidate_for_frame(frame, candidates, anchors, traj_physical, select
 
         end_alpha = float(frame) / max(float(anchors[-1][0]), 1.0)
         end_cost = end_alpha * pose_distance(pose, anchors[-1][1])
+        homogeneity = _homogeneity_cost(expr, en, selected_keyframes, num_frames)
 
-        score = (float(w_text) * text_cost + float(w_pose) * pose_cost + float(w_traj) * traj_cost +
-                 float(w_diversity) * diversity_cost + float(w_energy) * energy_cost +
-                 float(w_contact) * contact_cost + float(w_contact_diversity) * contact_div +
-                 float(w_end) * end_cost + float(w_entry) * entry_cost +
-                 float(w_exit) * exit_cost + float(w_contact_phase) * contact_phase)
+        score = (
+            weights["w_text"] * text_cost
+            + weights["w_pose"] * pose_cost
+            + weights["w_traj"] * traj_cost
+            + weights["w_diversity"] * diversity_cost
+            + weights["w_energy"] * energy_cost
+            + weights["w_contact"] * contact_cost
+            + weights["w_contact_diversity"] * contact_div
+            + weights["w_end"] * end_cost
+            + weights["w_entry"] * entry_cost
+            + weights["w_exit"] * exit_cost
+            + weights["w_contact_phase"] * contact_phase
+            + homogeneity
+            - weights["expr_bonus"] * expr
+            - weights["energy_bonus"] * en
+        )
 
         kf = AutoKeyframe(
             frame=int(frame),
@@ -645,104 +816,153 @@ def choose_candidate_for_frame(frame, candidates, anchors, traj_physical, select
                 "diversity_cost": float(diversity_cost),
                 "energy_cost": float(energy_cost),
                 "motion_energy_norm": float(en),
+                "expressiveness_score": float(expr),
+                "expressiveness_bonus": float(weights["expr_bonus"]),
+                "energy_bonus": float(weights["energy_bonus"]),
+                "min_expressiveness": float(weights["min_expr"]),
+                "min_energy": float(weights["min_energy"]),
                 "contact_stability_cost": float(contact_cost),
                 "contact_diversity_cost": float(contact_div),
                 "entry_compat_cost": float(entry_cost),
                 "exit_compat_cost": float(exit_cost),
                 "contact_phase_cost": float(contact_phase),
                 "end_compat_cost": float(end_cost),
-                "is_motion_unit": float(bool(cand.get("is_motion_unit", False))),
-                "rejected_by_source_before_pool": int(rejected),
+                "homogeneity_cost": float(homogeneity),
+                "phase": str(segment.get("phase", "")) if segment else "",
+                "tension_target": float(segment.get("tension_target", -1.0)) if segment else -1.0,
+                "rejected_by_source_before_pool": int(rejected_by_source),
+                "rejected_by_expressiveness_before_pool": int(rejected_by_expr),
+                "rejected_by_energy_before_pool": int(rejected_by_energy),
             },
         )
-        scored.append((score, en, kf))
+        scored.append((float(score), float(expr), float(en), kf))
 
     if not scored:
+        # Avoid hard failure when thresholds are too strict.  Relax new filters,
+        # then source diversity if necessary.  The metadata will reveal this.
+        if weights["min_expr"] >= 0.0 or weights["min_energy"] >= 0.0:
+            old_min_expr = os.environ.get("EDGE_UNIT_MIN_EXPRESSIVENESS")
+            old_min_energy = os.environ.get("EDGE_UNIT_MIN_ENERGY")
+            os.environ["EDGE_UNIT_MIN_EXPRESSIVENESS"] = "-1"
+            os.environ["EDGE_UNIT_MIN_ENERGY"] = "-1"
+            try:
+                kf = choose_candidate_for_frame(
+                    frame, candidates, anchors, traj_physical, selected_poses, selected_keyframes, text_embedding, segment,
+                    w_text, w_pose, w_traj, w_diversity, w_energy, energy_target, energy_band, w_contact,
+                    w_contact_diversity, w_end, w_entry, w_exit, w_contact_phase, source_gap, disallow_same_source,
+                    energy_rerank_top_k, energy_rerank_weight,
+                )
+                kf.score_parts["threshold_relaxed_fallback"] = 1.0
+                return kf
+            finally:
+                if old_min_expr is None:
+                    os.environ.pop("EDGE_UNIT_MIN_EXPRESSIVENESS", None)
+                else:
+                    os.environ["EDGE_UNIT_MIN_EXPRESSIVENESS"] = old_min_expr
+                if old_min_energy is None:
+                    os.environ.pop("EDGE_UNIT_MIN_ENERGY", None)
+                else:
+                    os.environ["EDGE_UNIT_MIN_ENERGY"] = old_min_energy
         if selected_keyframes and (source_gap > 0 or disallow_same_source):
-            return choose_candidate_for_frame(frame, candidates, anchors, traj_physical, selected_poses, [], text_embedding, segment,
-                                             w_text, w_pose, w_traj, w_diversity, w_energy, energy_target, energy_band,
-                                             w_contact, w_contact_diversity, w_end, w_entry, w_exit, w_contact_phase, 0, False,
-                                             energy_rerank_top_k, energy_rerank_weight)
-        raise RuntimeError("No compatible RAG candidate")
+            return choose_candidate_for_frame(
+                frame, candidates, anchors, traj_physical, selected_poses, [], text_embedding, segment,
+                w_text, w_pose, w_traj, w_diversity, w_energy, energy_target, energy_band, w_contact,
+                w_contact_diversity, w_end, w_entry, w_exit, w_contact_phase, 0, False,
+                energy_rerank_top_k, energy_rerank_weight,
+            )
+        raise RuntimeError("No RAG candidate available")
 
     scored.sort(key=lambda x: x[0])
-    if int(energy_rerank_top_k) > 0 and float(energy_rerank_weight) > 0:
-        pool = scored[: min(int(energy_rerank_top_k), len(scored))]
-        def key(item):
-            base, en, _ = item
-            return float(base) + float(energy_rerank_weight) * min(abs(float(en) - float(energy_target)) / max(float(energy_band), 1e-6), 2.0)
-        best = min(pool, key=key)
-        best[2].score = float(key(best))
-        best[2].score_parts["score_after_energy_rerank"] = float(best[2].score)
-        best[2].score_parts["compatible_pool_size"] = int(len(pool))
-        return best[2]
+    top_k = int(energy_rerank_top_k)
+    if top_k > 0 and float(energy_rerank_weight) > 0:
+        pool = scored[: min(top_k, len(scored))]
 
-    scored[0][2].score_parts["score_after_energy_rerank"] = float(scored[0][0])
-    return scored[0][2]
+        def rerank_key(item):
+            base_score, expr_value, energy_value, _kf = item
+            # In expressiveness mode, rerank by high expression rather than medium energy.
+            expr_bonus = max(0.0, _env_float("EDGE_UNIT_EXPRESSIVENESS_BONUS", 0.0))
+            if _env_bool("EDGE_TENSION_AWARE_PLANNER", False):
+                expr_bonus += 0.15
+            e_target = float(np.clip(weights["energy_target"], 0.0, 1.0))
+            e_band = max(float(energy_band), 1e-6)
+            target_cost = float(min(abs(float(energy_value) - e_target) / e_band, 2.0))
+            return float(base_score) + float(energy_rerank_weight) * target_cost - 0.25 * expr_bonus * float(expr_value)
+
+        best_base, best_expr, best_energy, best_kf = min(pool, key=rerank_key)
+        final_score = float(rerank_key((best_base, best_expr, best_energy, best_kf)))
+        best_kf.score = final_score
+        best_kf.score_parts["energy_rerank_top_k"] = int(top_k)
+        best_kf.score_parts["energy_rerank_weight"] = float(energy_rerank_weight)
+        best_kf.score_parts["score_after_energy_rerank"] = final_score
+        best_kf.score_parts["compatible_pool_size"] = int(len(pool))
+        return best_kf
+
+    best_kf = scored[0][3]
+    best_kf.score_parts["energy_rerank_top_k"] = 0
+    best_kf.score_parts["energy_rerank_weight"] = 0.0
+    best_kf.score_parts["score_after_energy_rerank"] = float(best_kf.score)
+    return best_kf
 
 
-def plan_auto_keyframes(start_pose, end_pose, user_mid_poses, user_mid_frames, audio_feature, traj_physical, rag_db,
-                        normalizer=None, num_frames=150, max_auto_keyframes=3, min_gap=18, rag_pose_space="normalized",
-                        max_candidates=5000, sample_stride=3, music_weight=0.6, trajectory_weight=0.4,
-                        mmr_checkpoint="", mmr_device="cpu", mmr_weight=0.0, pose_weight=1.0, diversity_weight=0.25,
-                        energy_weight=0.45, energy_target=0.55, energy_band=0.25, contact_weight=0.85,
-                        contact_diversity_weight=0.60, end_weight=0.30, source_gap=120, disallow_same_source=False,
-                        energy_rerank_top_k=80, energy_rerank_weight=0.25, fps=30, **kwargs):
-    effective_count = adaptive_auto_mid_count(num_frames, max_auto_keyframes, fps=fps)
-    if effective_count <= 0:
-        return AutoKeyframePlan([], [], {"planner_version": "choreo_unit_rag_v5", "effective_auto_mid_count": 0})
-
-    candidates = load_rag_candidates(rag_db, normalizer=normalizer, pose_space=rag_pose_space, max_candidates=max_candidates, sample_stride=sample_stride)
-    annotate_candidate_statistics(candidates)
+def plan_auto_keyframes(start_pose: np.ndarray, end_pose: np.ndarray, user_mid_poses: Sequence[np.ndarray], user_mid_frames: Sequence[int],
+                        audio_feature: np.ndarray, traj_physical: np.ndarray, rag_db: str, normalizer=None, num_frames: int = 150,
+                        max_auto_keyframes: int = 3, min_gap: int = 18, rag_pose_space: str = "normalized", max_candidates: int = 5000,
+                        sample_stride: int = 3, music_weight: float = 0.6, trajectory_weight: float = 0.4, mmr_checkpoint: str = "",
+                        mmr_weight: float = 0.0, pose_weight: float = 1.0, diversity_weight: float = 0.25, energy_weight: float = 0.45,
+                        energy_target: float = 0.55, energy_band: float = 0.25, contact_weight: float = 0.85,
+                        contact_diversity_weight: float = 0.60, end_weight: float = 0.30, source_gap: int = 120,
+                        disallow_same_source: bool = False, energy_rerank_top_k: int = 80, energy_rerank_weight: float = 0.25,
+                        **kwargs) -> AutoKeyframePlan:
+    candidates = load_rag_candidates(
+        rag_db,
+        normalizer=normalizer,
+        pose_space=rag_pose_space,
+        max_candidates=max_candidates,
+        sample_stride=sample_stride,
+    )
     if not candidates:
-        raise RuntimeError(f"No RAG candidates loaded from {rag_db}")
+        raise RuntimeError(f"No valid RAG candidates found in {rag_db}")
+    annotate_candidate_statistics(candidates)
 
-    plan = get_choreo_plan(audio_feature, num_frames)
-    frames = choose_auto_frames(audio_feature, traj_physical, num_frames, effective_count, list(user_mid_frames or []),
-                                min_gap=min_gap, music_weight=music_weight, trajectory_weight=trajectory_weight, fps=fps)
-
-    anchors = [(0, np.asarray(start_pose, dtype=np.float32))]
-    for f, p in zip(user_mid_frames or [], user_mid_poses or []):
+    anchors = [(0, start_pose), (num_frames - 1, end_pose)]
+    for f, p in zip(user_mid_frames, user_mid_poses):
         anchors.append((int(f), np.asarray(p, dtype=np.float32)))
-    anchors.append((int(num_frames - 1), np.asarray(end_pose, dtype=np.float32)))
     anchors = sorted(anchors, key=lambda x: x[0])
 
-    motion_unit_mode = os.environ.get("EDGE_MOTION_UNIT_MODE", "auto").strip().lower()
-    has_units = any(bool(c.get("is_motion_unit", False)) for c in candidates)
-    use_units = (motion_unit_mode == "on") or (motion_unit_mode == "auto" and has_units)
-    if motion_unit_mode == "off":
-        use_units = False
+    frames = choose_auto_frames(
+        audio_feature,
+        traj_physical,
+        num_frames,
+        int(max_auto_keyframes),
+        [f for f, _ in anchors],
+        int(min_gap),
+        music_weight=music_weight,
+        trajectory_weight=trajectory_weight,
+    )
 
-    text_weight = _env_float("EDGE_TEXT_BRIDGE_WEIGHT", 0.50)
-    w_entry = _env_float("EDGE_UNIT_ENTRY_WEIGHT", 0.60) if use_units else 0.0
-    w_exit = _env_float("EDGE_UNIT_EXIT_WEIGHT", 0.60) if use_units else 0.0
-    w_phase = _env_float("EDGE_UNIT_CONTACT_PHASE_WEIGHT", 0.85) if use_units else 0.0
+    plan = get_choreo_plan(audio_feature, num_frames)
+    selected: List[AutoKeyframe] = []
+    selected_poses: List[np.ndarray] = []
 
-    selected, selected_poses = [], []
+    w_text = _env_float("EDGE_TEXT_BRIDGE_WEIGHT", 0.50)
+    w_entry = _env_float("EDGE_UNIT_ENTRY_WEIGHT", 0.60)
+    w_exit = _env_float("EDGE_UNIT_EXIT_WEIGHT", 0.60)
+    w_contact_phase = _env_float("EDGE_UNIT_CONTACT_PHASE_WEIGHT", 0.85)
+
     for frame in frames:
         seg = segment_for_frame(plan, frame)
         query_text = str(seg.get("query_text", seg.get("motion_prompt", "")))
-        text_embedding = encode_text_query(
-            query_text,
-            model_name=os.environ.get("EDGE_TEXT_BRIDGE_MODEL", "BAAI/bge-small-zh-v1.5"),
-            device=os.environ.get("EDGE_TEXT_BRIDGE_DEVICE", "cpu"),
-        ) if text_weight > 0 else None
-        if text_embedding is None:
-            text_weight_eff = 0.0
-        else:
-            text_weight_eff = text_weight
-
-        dyn_anchors = sorted(anchors + [(kf.frame, kf.pose) for kf in selected], key=lambda x: x[0])
+        text_embedding = encode_text_query(query_text)
         kf = choose_candidate_for_frame(
             frame=frame,
             candidates=candidates,
-            anchors=dyn_anchors,
+            anchors=anchors + [(k.frame, k.pose) for k in selected],
             traj_physical=traj_physical,
             selected_poses=selected_poses,
             selected_keyframes=selected,
             text_embedding=text_embedding,
             segment=seg,
-            w_text=text_weight_eff,
+            w_text=w_text,
             w_pose=pose_weight,
             w_traj=trajectory_weight,
             w_diversity=diversity_weight,
@@ -754,7 +974,7 @@ def plan_auto_keyframes(start_pose, end_pose, user_mid_poses, user_mid_frames, a
             w_end=end_weight,
             w_entry=w_entry,
             w_exit=w_exit,
-            w_contact_phase=w_phase,
+            w_contact_phase=w_contact_phase,
             source_gap=source_gap,
             disallow_same_source=disallow_same_source,
             energy_rerank_top_k=energy_rerank_top_k,
@@ -763,124 +983,130 @@ def plan_auto_keyframes(start_pose, end_pose, user_mid_poses, user_mid_frames, a
         selected.append(kf)
         selected_poses.append(kf.pose)
 
-    meta = {
-        "planner_version": "choreo_unit_rag_v5",
-        "rag_db": str(rag_db),
-        "candidate_count": int(len(candidates)),
-        "has_motion_units": bool(has_units),
-        "use_motion_units": bool(use_units),
-        "effective_auto_mid_count": int(effective_count),
-        "frame_candidates": [int(x) for x in frames],
-        "choreo_plan": plan,
-        "weights": {
-            "text": float(text_weight),
-            "entry": float(w_entry),
-            "exit": float(w_exit),
-            "contact_phase": float(w_phase),
-            "pose": float(pose_weight),
-            "energy": float(energy_weight),
-            "contact": float(contact_weight),
+    selected = sorted(selected, key=lambda x: x.frame)
+    return AutoKeyframePlan(
+        keyframes=selected,
+        frame_candidates=frames,
+        meta={
+            "rag_db": str(rag_db),
+            "candidate_count": len(candidates),
+            "max_auto_keyframes_requested": int(max_auto_keyframes),
+            "max_auto_keyframes_effective": len(frames),
+            "min_gap": int(min_gap),
+            "music_weight": float(music_weight),
+            "trajectory_weight": float(trajectory_weight),
+            "rag_pose_space": rag_pose_space,
+            "pose_weight": float(pose_weight),
+            "diversity_weight": float(diversity_weight),
+            "energy_weight": float(energy_weight),
+            "contact_weight": float(contact_weight),
+            "contact_diversity_weight": float(contact_diversity_weight),
+            "end_weight": float(end_weight),
+            "entry_weight": float(w_entry),
+            "exit_weight": float(w_exit),
+            "contact_phase_weight": float(w_contact_phase),
+            "source_gap": int(source_gap),
+            "disallow_same_source": bool(disallow_same_source),
+            "energy_rerank_top_k": int(energy_rerank_top_k),
+            "energy_rerank_weight": float(energy_rerank_weight),
+            "tension_aware": bool(_env_bool("EDGE_TENSION_AWARE_PLANNER", False)),
+            "min_expressiveness": float(_env_float("EDGE_UNIT_MIN_EXPRESSIVENESS", -1.0)),
+            "expressiveness_bonus": float(_env_float("EDGE_UNIT_EXPRESSIVENESS_BONUS", 0.0)),
+            "homogeneity_weight": float(_env_float("EDGE_UNIT_HOMOGENEITY_WEIGHT", 0.0)),
+            "choreo_plan": plan,
         },
+    )
+
+
+def _serializable_keyframe(kf: AutoKeyframe, path: str = "", unit_path: str = "") -> Dict[str, object]:
+    return {
+        "frame": int(kf.frame),
+        "pose_path": str(path),
+        "path": str(path),
+        "unit_path": str(unit_path),
+        "score": float(kf.score),
+        "source": kf.source,
+        "source_frame": int(kf.source_frame),
+        "unit_start": int(kf.unit_start),
+        "unit_center": int(kf.unit_center),
+        "unit_end": int(kf.unit_end),
+        "motion_text": kf.motion_text,
+        "segment_id": int(kf.segment_id),
+        "segment_prompt": kf.segment_prompt,
+        "score_parts": kf.score_parts,
     }
-    return AutoKeyframePlan(keyframes=selected, frame_candidates=frames, meta=meta)
 
 
-def save_auto_keyframes(plan=None, keyframes=None, out_dir=None, output_dir=None, prefix="auto"):
-    keyframes = list(keyframes if keyframes is not None else getattr(plan, "keyframes", []))
-    out_dir = Path(out_dir or output_dir or ".")
-    out_dir.mkdir(parents=True, exist_ok=True)
+def save_auto_keyframes(plan: Optional[AutoKeyframePlan] = None, keyframes: Optional[Sequence[AutoKeyframe]] = None,
+                        out_dir: Optional[str] = None, output_dir: Optional[str] = None, prefix: str = "auto_mid",
+                        out_motion_path: Optional[str] = None, **kwargs):
+    """Save selected auto mid poses.
+
+    This signature is intentionally flexible because generate_controlled.py has
+    used multiple save_auto_keyframes calling conventions across branches.
+    Returns a list of dict records, which current generate_controlled.py already
+    understands for pose path/frame.  unit_path is included for the Phase-4 patch.
+    """
+    if plan is not None and keyframes is None:
+        keyframes = plan.keyframes
+    keyframes = list(keyframes or [])
+
+    if out_dir is None:
+        out_dir = output_dir
+    if out_dir is None and out_motion_path:
+        out_dir = str(Path(out_motion_path).parent)
+        if prefix == "auto_mid":
+            prefix = Path(out_motion_path).stem + "_auto_mid"
+    if out_dir is None:
+        out_dir = "."
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
     saved = []
-    segments = []
-    for i, kf in enumerate(keyframes, start=1):
-        pose_path = out_dir / f"{prefix}_auto_mid_{i:02d}.npy"
+    for idx, kf in enumerate(keyframes, start=1):
+        pose_path = out_path / f"{prefix}_{idx:02d}_f{int(kf.frame):03d}.npy"
         np.save(pose_path, np.asarray(kf.pose, dtype=np.float32))
-        rec = {
-            "path": str(pose_path),
-            "pose_path": str(pose_path),
-            "frame": int(kf.frame),
-            "source": str(kf.source),
-            "source_frame": int(kf.source_frame),
-            "unit_start": int(kf.unit_start),
-            "unit_center": int(kf.unit_center),
-            "unit_end": int(kf.unit_end),
-            "segment_id": int(kf.segment_id),
-            "segment_prompt": str(kf.segment_prompt),
-            "motion_text": str(kf.motion_text),
-            "score": float(kf.score),
-            "score_parts": dict(kf.score_parts),
-        }
+        unit_path = ""
         if kf.unit_motion is not None:
-            prior_path = out_dir / f"{prefix}_unit_prior_{i:02d}.npy"
-            np.save(prior_path, np.asarray(kf.unit_motion, dtype=np.float32))
-            rec["unit_prior_path"] = str(prior_path)
-        saved.append(rec)
-        segments.append(rec)
+            unit_path_obj = out_path / f"{prefix}_{idx:02d}_f{int(kf.frame):03d}_unit.npy"
+            np.save(unit_path_obj, np.asarray(kf.unit_motion, dtype=np.float32))
+            unit_path = str(unit_path_obj)
+        saved.append(_serializable_keyframe(kf, str(pose_path), unit_path))
 
-    meta = {
-        "planner_meta": {} if plan is None else getattr(plan, "meta", {}),
-        "keyframes": segments,
+    meta_path = out_path / f"{prefix}_plan.json"
+    payload = {
+        "keyframes": saved,
+        "auto_keyframes": saved,  # backward-compatible alias
+        "frame_candidates": [] if plan is None else list(plan.frame_candidates),
+        "planner_meta": {} if plan is None else plan.meta,
     }
-    meta_path = out_dir / f"{prefix}_choreorag_plan.json"
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"✅ ChoreoRAG auto mids saved: {meta_path}")
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    for rec in saved:
+        rec["plan_json"] = str(meta_path)
     return saved
 
 
-def append_csv(path, row, fieldnames=None):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if fieldnames is None:
-        fieldnames = list(row.keys())
-    write_header = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+def append_csv(existing: str, values: Sequence[object]) -> str:
+    old = [x.strip() for x in str(existing or "").replace(";", ",").split(",") if x.strip()]
+    return ",".join(old + [str(v) for v in values])
 
 
-def _load_pose(path):
-    arr = np.load(path, allow_pickle=True)
-    if arr.ndim == 0 and isinstance(arr.item(), dict):
-        d = arr.item()
-        arr = d.get("pose", d.get("motion"))
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 2:
-        arr = arr[0]
-    return arr.reshape(151).astype(np.float32)
-
-
-def main():
+def _cli():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rag_db", required=True)
-    parser.add_argument("--start_pose", required=True)
-    parser.add_argument("--end_pose", required=True)
-    parser.add_argument("--audio_feature", required=True)
-    parser.add_argument("--traj", required=True, help="[T,2] .npy")
-    parser.add_argument("--out_dir", default="output/choreorag_test")
-    parser.add_argument("--prefix", default="test")
-    parser.add_argument("--num_frames", type=int, default=150)
-    parser.add_argument("--auto_mid_count", type=int, default=1)
-    parser.add_argument("--rag_pose_space", default="normalized")
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--pose_space", default="normalized", choices=["normalized", "physical"])
+    parser.add_argument("--max_candidates", type=int, default=5000)
     args = parser.parse_args()
-
-    audio = np.load(args.audio_feature).astype(np.float32)
-    traj = np.load(args.traj).astype(np.float32)
-    plan = plan_auto_keyframes(
-        start_pose=_load_pose(args.start_pose),
-        end_pose=_load_pose(args.end_pose),
-        user_mid_poses=[],
-        user_mid_frames=[],
-        audio_feature=audio,
-        traj_physical=traj,
-        rag_db=args.rag_db,
-        num_frames=args.num_frames,
-        max_auto_keyframes=args.auto_mid_count,
-        rag_pose_space=args.rag_pose_space,
-    )
-    save_auto_keyframes(plan=plan, out_dir=args.out_dir, prefix=args.prefix)
+    cands = load_rag_candidates(args.rag_db, None, args.pose_space, args.max_candidates)
+    annotate_candidate_statistics(cands)
+    print(f"loaded candidates: {len(cands)}")
+    if cands:
+        print({k: v for k, v in cands[0].items() if k not in {"pose", "unit_motion", "motion_text_embedding", "motion_embedding"}})
+        print("pose shape:", cands[0]["pose"].shape)
 
 
 if __name__ == "__main__":
-    main()
+    _cli()
