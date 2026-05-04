@@ -105,6 +105,12 @@ class GaussianDiffusion(nn.Module):
         beat_guidance_weight=0.0,
         trajectory_loss_weight=1.0,
         trajectory_velocity_loss_weight=0.25,
+        energy_condition_prob=0.7,
+        energy_condition_drop_prob=0.15,
+        energy_loss_weight=0.25,
+        root_lower_coupling_loss_weight=0.5,
+        root_lower_speed_threshold=0.012,
+        root_lower_min_motion=0.010,
         force_audio_only_drop=False,
         disable_unpaired_audio_condition=True,
         tto_trajectory_loss_weight=4.0,
@@ -157,6 +163,13 @@ class GaussianDiffusion(nn.Module):
 
         self.trajectory_loss_weight = float(trajectory_loss_weight)
         self.trajectory_velocity_loss_weight = float(trajectory_velocity_loss_weight)
+
+        self.energy_condition_prob = float(energy_condition_prob)
+        self.energy_condition_drop_prob = float(energy_condition_drop_prob)
+        self.energy_loss_weight = float(energy_loss_weight)
+        self.root_lower_coupling_loss_weight = float(root_lower_coupling_loss_weight)
+        self.root_lower_speed_threshold = float(root_lower_speed_threshold)
+        self.root_lower_min_motion = float(root_lower_min_motion)
 
         # TTO 参数可以在 generate_controlled.py 中覆盖。
         self.tto_interval = 50
@@ -811,23 +824,41 @@ class GaussianDiffusion(nn.Module):
             return model_motion_x0.new_tensor(0.0)
 
     def _kinematic_sync_loss(self, model_motion_x0):
-        """
-        Weakly align root movement with leg/pose movement.
-        Helps reduce cases where root moves but body does not respond.
-        """
+        """Root-lower coupling loss, logged as Kinematic Sync Loss."""
         if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
             return model_motion_x0.new_tensor(0.0)
 
-        root_delta = model_motion_x0[:, 1:, self.root_slice] - model_motion_x0[:, :-1, self.root_slice]
-        pose_delta = model_motion_x0[:, 1:, self.rot_slice] - model_motion_x0[:, :-1, self.rot_slice]
+        if float(getattr(self, "root_lower_coupling_loss_weight", 0.0)) <= 0.0:
+            return model_motion_x0.new_tensor(0.0)
 
-        root_energy = safe_norm(root_delta, dim=-1)
-        pose_energy = safe_norm(pose_delta, dim=-1)
+        root_xz = model_motion_x0[:, :, [self.root_x_idx, self.root_z_idx]]
+        root_speed = safe_norm(root_xz[:, 1:] - root_xz[:, :-1], dim=-1)
 
-        root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
-        pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]
+        lower_indices = []
+        for joint in lower_joints:
+            lower_indices.extend(range(self.rot_slice.start + 6 * joint, self.rot_slice.start + 6 * (joint + 1)))
 
-        return F.mse_loss(root_energy, pose_energy)
+        lower = model_motion_x0[:, :, lower_indices]
+        lower_motion = safe_norm(lower[:, 1:] - lower[:, :-1], dim=-1)
+
+        contacts = model_motion_x0[:, :, self.contact_slice].clamp(0.0, 1.0)
+        contact_change = torch.abs(contacts[:, 1:] - contacts[:, :-1]).mean(dim=-1)
+
+        speed_th = model_motion_x0.new_tensor(float(getattr(self, "root_lower_speed_threshold", 0.012)))
+        min_motion = model_motion_x0.new_tensor(float(getattr(self, "root_lower_min_motion", 0.010)))
+
+        fast = F.relu(root_speed - speed_th)
+        if not bool((fast > 0).any().item()):
+            return model_motion_x0.new_tensor(0.0)
+
+        leg_deficit = F.relu(min_motion - lower_motion)
+        contact_deficit = F.relu(0.03 - contact_change)
+
+        denom = fast.detach().mean().clamp_min(1e-6)
+        coupling = ((fast * leg_deficit).mean() + 0.25 * (fast * contact_deficit).mean()) / denom
+        return coupling * float(getattr(self, "root_lower_coupling_loss_weight", 1.0))
+
 
     def _biomech_loss(self, model_motion_x0):
         """

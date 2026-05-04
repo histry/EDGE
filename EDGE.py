@@ -118,6 +118,13 @@ class EDGE:
         beat_guidance_weight=0.0,
         trajectory_loss_weight=1.0,
         trajectory_velocity_loss_weight=0.25,
+        energy_condition_prob=0.7,
+        energy_condition_drop_prob=0.15,
+        energy_loss_weight=0.25,
+        root_lower_coupling_loss_weight=0.5,
+        root_lower_speed_threshold=0.012,
+        root_lower_min_motion=0.010,
+        adapter_train_decoder=False,
         hard_keyframe_project=False,
         train_stage="full",
         strict_audio_checkpoint=False,
@@ -186,7 +193,7 @@ class EDGE:
             sparse_attn_window=sparse_attn_window,
         )
 
-        self._apply_stage_freezing(model, train_stage)
+        self._apply_stage_freezing(model, train_stage, adapter_train_decoder=adapter_train_decoder)
         _print_trainable_summary(self, model)
 
         smpl = SMPLSkeleton(self.accelerator.device)
@@ -254,6 +261,12 @@ class EDGE:
             beat_guidance_weight=beat_guidance_weight,
             trajectory_loss_weight=trajectory_loss_weight,
             trajectory_velocity_loss_weight=trajectory_velocity_loss_weight,
+            energy_condition_prob=energy_condition_prob,
+            energy_condition_drop_prob=energy_condition_drop_prob,
+            energy_loss_weight=energy_loss_weight,
+            root_lower_coupling_loss_weight=root_lower_coupling_loss_weight,
+            root_lower_speed_threshold=root_lower_speed_threshold,
+            root_lower_min_motion=root_lower_min_motion,
             hard_keyframe_project=hard_keyframe_project,
         )
         
@@ -479,6 +492,54 @@ class EDGE:
             )
             return
 
+
+        if train_stage == "adapter":
+            # TEA-MotionAdapter:
+            # Freeze the pretrained motion prior and train only lightweight
+            # control branches. This protects physical priors while teaching
+            # trajectory speed -> lower-body stepping coupling.
+            self._set_requires_grad(model, False)
+
+            train_names = [
+                "trajectory_projection",
+                "trajectory_encoder",
+                "traj_modulate",
+                "root_generator",
+                "energy_embed",
+                "null_energy_embed",
+            ]
+
+            for name in train_names:
+                module = getattr(model, name, None)
+                if module is None:
+                    continue
+                if isinstance(module, torch.nn.Parameter):
+                    module.requires_grad = True
+                else:
+                    self._set_requires_grad(module, True)
+
+            stack = getattr(getattr(model, "seqTransDecoder", None), "stack", [])
+            for layer in stack:
+                for adapter_name in [
+                    "traj_adapter_self",
+                    "traj_adapter_cross",
+                    "traj_adapter_ff",
+                ]:
+                    adapter = getattr(layer, adapter_name, None)
+                    if adapter is not None:
+                        self._set_requires_grad(adapter, True)
+
+            if adapter_train_decoder:
+                self._set_requires_grad(model.seqTransDecoder, True)
+                self._set_requires_grad(model.final_layer, True)
+
+            print(
+                "🧩 train_stage=adapter: training trajectory adapters + "
+                "trajectory encoder/root generator + energy embedding; "
+                f"adapter_train_decoder={bool(adapter_train_decoder)}."
+            )
+            return
+
         raise ValueError(f"Unknown train_stage: {train_stage}")
 
     @staticmethod
@@ -498,6 +559,7 @@ class EDGE:
             "Root Turn Loss",
             "Contact Turn Loss",
             "Body Stability Loss",
+            "Root-Lower Coupling Loss",
             "Motion Energy Loss",
         ]
 

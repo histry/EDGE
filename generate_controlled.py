@@ -7,6 +7,7 @@ except Exception as exc:
 import argparse
 import inspect
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -572,7 +573,24 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
     }
 
 
+
+# ===== TEA-MotionAdapter inference energy helper =====
+def maybe_attach_energy_condition(cond: dict, num_frames: int) -> dict:
+    flag = str(os.environ.get("EDGE_ENERGY_COND", "0")).lower() in {"1", "true", "yes", "y", "on"}
+    if not flag:
+        return cond
+    try:
+        level = float(os.environ.get("EDGE_ENERGY_LEVEL", "0.5"))
+    except Exception:
+        level = 0.5
+    level = float(np.clip(level, 0.0, 1.0))
+    cond["energy"] = torch.full((1, 1), level, dtype=torch.float32)
+    print(f"✅ TEA energy condition: level={level:.3f}, cfg_scale={os.environ.get('EDGE_ENERGY_CFG_SCALE', 'default')}")
+    return cond
+
 def sample_motion(model: EDGE, cond: dict, constraint: dict, args, num_frames: int):
+    cond = maybe_attach_energy_condition(cond, num_frames)
+    cond = {k: (v.to(model.accelerator.device) if torch.is_tensor(v) else v) for k, v in cond.items()} if isinstance(cond, dict) else cond
     shape = (1, num_frames, model.repr_dim)
 
     if args.sampler == "ddim":

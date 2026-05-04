@@ -26,6 +26,38 @@ sys.modules['numpy._core.multiarray'] = numpy.core.multiarray
 sys.modules['numpy._core.umath'] = numpy.core.umath
 # ===============================================================
 
+
+# ===== TEA-MotionAdapter helper =====
+def motion_energy_scalar_from_151(motion) -> torch.Tensor:
+    """Return a stable normalized energy scalar in [0,1] for one [T,151] motion."""
+    if not torch.is_tensor(motion):
+        motion = torch.as_tensor(motion, dtype=torch.float32)
+    motion = motion.float()
+    if motion.ndim != 2 or motion.shape[0] < 2:
+        return torch.tensor([0.0], dtype=torch.float32)
+
+    root_xz = motion[:, [4, 6]]
+    lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]
+    upper_joints = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+    def rot_indices(joints):
+        idx = []
+        for j in joints:
+            idx.extend(range(7 + 6 * j, 7 + 6 * (j + 1)))
+        return idx
+
+    root_speed = torch.linalg.norm(root_xz[1:] - root_xz[:-1], dim=-1).mean()
+    lower_idx = rot_indices(lower_joints)
+    upper_idx = rot_indices(upper_joints)
+    lower_energy = torch.sqrt(((motion[1:, lower_idx] - motion[:-1, lower_idx]) ** 2).mean() + 1e-8)
+    upper_energy = torch.sqrt(((motion[1:, upper_idx] - motion[:-1, upper_idx]) ** 2).mean() + 1e-8)
+    contact = motion[:, :4].clamp(0.0, 1.0)
+    contact_change = torch.abs(contact[1:] - contact[:-1]).mean()
+
+    raw = 0.35 * root_speed + 0.30 * lower_energy + 0.25 * upper_energy + 0.10 * contact_change
+    energy = torch.sigmoid(8.0 * (raw - 0.04))
+    return energy.reshape(1).clamp(0.0, 1.0).float()
+
 class AISTPPDataset(Dataset):
     def __init__(
         self,
@@ -137,6 +169,7 @@ class AISTPPDataset(Dataset):
             "audio_paired": torch.tensor(1.0, dtype=torch.float32),
             "onset": onset,
         }
+        cond["energy"] = motion_energy_scalar_from_151(pose)
 
         if self.return_traj:
             # pose is already normalized; root X/Z are dimensions 4 and 6.
@@ -802,5 +835,6 @@ class DunhuangDataset(Dataset):
         if self.return_traj:
             traj = torch.from_numpy(self.trajs[idx])
             cond["trajectory"] = traj
+        cond["energy"] = motion_energy_scalar_from_151(motion)
 
         return motion, cond, f"dunhuang_motion_{idx}", "paired_audio" if audio_is_paired else "unpaired_or_proxy_audio"

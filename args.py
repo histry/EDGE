@@ -140,6 +140,49 @@ def parse_train_opt():
         default=0.25,
         help="Weight for supervised root X/Z trajectory velocity loss.",
     )
+
+    # ===== TEA-MotionAdapter: energy condition + adapter training =====
+    parser.add_argument(
+        "--energy_condition_prob",
+        type=float,
+        default=0.7,
+        help="Probability of providing normalized motion energy as a conditioning scalar during training.",
+    )
+    parser.add_argument(
+        "--energy_condition_drop_prob",
+        type=float,
+        default=0.15,
+        help="Drop probability for energy condition only; enables energy-conditioned CFG.",
+    )
+    parser.add_argument(
+        "--energy_loss_weight",
+        type=float,
+        default=0.25,
+        help="Weight for matching generated and target motion-energy envelopes.",
+    )
+    parser.add_argument(
+        "--root_lower_coupling_loss_weight",
+        type=float,
+        default=0.5,
+        help="Extra multiplier inside kinematic sync loss for root-speed/lower-body coupling.",
+    )
+    parser.add_argument(
+        "--root_lower_speed_threshold",
+        type=float,
+        default=0.012,
+        help="Normalized root XZ speed threshold above which lower-body response is encouraged.",
+    )
+    parser.add_argument(
+        "--root_lower_min_motion",
+        type=float,
+        default=0.010,
+        help="Minimum lower-body rotational motion expected when root XZ speed is high.",
+    )
+    parser.add_argument(
+        "--adapter_train_decoder",
+        action="store_true",
+        help="With --train_stage adapter, also unfreeze the main seqTransDecoder/final layer.",
+    )
     parser.add_argument(
         "--keyframe_loss_weight",
         type=float,
@@ -247,7 +290,7 @@ def parse_train_opt():
         "--train_stage",
         type=str,
         default="full",
-        choices=["full", "stage1", "stage2"],
+        choices=["full", "stage1", "stage2", "adapter"],
         help="stage-wise training shortcut",
     )
     parser.add_argument(
