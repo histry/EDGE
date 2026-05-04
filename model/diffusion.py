@@ -105,6 +105,12 @@ class GaussianDiffusion(nn.Module):
         beat_guidance_weight=0.0,
         trajectory_loss_weight=1.0,
         trajectory_velocity_loss_weight=0.25,
+        energy_condition_prob=0.7,
+        energy_condition_drop_prob=0.15,
+        energy_loss_weight=0.25,
+        root_lower_coupling_loss_weight=0.5,
+        root_lower_speed_threshold=0.012,
+        root_lower_min_motion=0.010,
         force_audio_only_drop=False,
         disable_unpaired_audio_condition=True,
         tto_trajectory_loss_weight=4.0,
@@ -157,6 +163,13 @@ class GaussianDiffusion(nn.Module):
 
         self.trajectory_loss_weight = float(trajectory_loss_weight)
         self.trajectory_velocity_loss_weight = float(trajectory_velocity_loss_weight)
+
+        self.energy_condition_prob = float(energy_condition_prob)
+        self.energy_condition_drop_prob = float(energy_condition_drop_prob)
+        self.energy_loss_weight = float(energy_loss_weight)
+        self.root_lower_coupling_loss_weight = float(root_lower_coupling_loss_weight)
+        self.root_lower_speed_threshold = float(root_lower_speed_threshold)
+        self.root_lower_min_motion = float(root_lower_min_motion)
 
         # TTO 参数可以在 generate_controlled.py 中覆盖。
         self.tto_interval = 50
@@ -810,24 +823,155 @@ class GaussianDiffusion(nn.Module):
         except Exception:
             return model_motion_x0.new_tensor(0.0)
 
-    def _kinematic_sync_loss(self, model_motion_x0):
+
+
+    def _kinematic_sync_loss(self, model_motion_x0, target_motion_x0=None, cond=None):
+        """Contrastive condition-driven root-lower coupling loss.
+
+        v4 design:
+        Absolute trajectory-speed thresholds are unreliable because trajectory
+        conditions may be normalized and heavily scaled.  Instead, this loss
+        uses within-sequence contrast:
+
+        - frames with top trajectory speed are "fast phase"
+        - frames with bottom trajectory speed are "slow phase"
+        - lower-body motion in fast phase should exceed slow phase by a margin
+
+        This directly supervises root-speed -> lower-body response without
+        depending on a global unit scale.
         """
-        Weakly align root movement with leg/pose movement.
-        Helps reduce cases where root moves but body does not respond.
-        """
-        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
+        if model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 4:
             return model_motion_x0.new_tensor(0.0)
 
-        root_delta = model_motion_x0[:, 1:, self.root_slice] - model_motion_x0[:, :-1, self.root_slice]
-        pose_delta = model_motion_x0[:, 1:, self.rot_slice] - model_motion_x0[:, :-1, self.rot_slice]
+        if float(getattr(self, "root_lower_coupling_loss_weight", 0.0)) <= 0.0:
+            return model_motion_x0.new_tensor(0.0)
 
-        root_energy = safe_norm(root_delta, dim=-1)
-        pose_energy = safe_norm(pose_delta, dim=-1)
+        # Use physical space when possible.
+        if self.normalizer is not None:
+            pred = maybe_unnormalize(self.normalizer, model_motion_x0)
+            target = (
+                maybe_unnormalize(self.normalizer, target_motion_x0)
+                if target_motion_x0 is not None
+                else None
+            )
+        else:
+            pred = model_motion_x0
+            target = target_motion_x0
 
-        root_energy = root_energy / root_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
-        pose_energy = pose_energy / pose_energy.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        b, t, _ = pred.shape
+        device = pred.device
+        dtype = pred.dtype
 
-        return F.mse_loss(root_energy, pose_energy)
+        # ------------------------------------------------------------------
+        # 1. Drive signal: commanded trajectory speed if available.
+        # ------------------------------------------------------------------
+        target_traj = None
+        if isinstance(cond, dict):
+            target_traj = cond.get("trajectory", None)
+
+        if target_traj is not None:
+            target_traj = target_traj.to(device=device, dtype=dtype)
+            if target_traj.shape[1] != t:
+                target_traj = F.interpolate(
+                    target_traj.transpose(1, 2),
+                    size=t,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+
+            drive_root = target_traj[..., :2]
+            drive_speed = safe_norm(drive_root[:, 1:] - drive_root[:, :-1], dim=-1)
+        else:
+            root_xz = pred[:, :, [self.root_x_idx, self.root_z_idx]]
+            drive_speed = safe_norm(root_xz[:, 1:] - root_xz[:, :-1], dim=-1)
+
+        # Normalize drive speed within each sample.
+        drive_min = drive_speed.amin(dim=1, keepdim=True)
+        drive_max = drive_speed.amax(dim=1, keepdim=True)
+        drive_span = (drive_max - drive_min).clamp_min(1e-8)
+        drive_norm = (drive_speed - drive_min) / drive_span
+
+        # If a sequence is almost perfectly constant in trajectory speed,
+        # contrastive supervision is not meaningful.
+        valid_seq = (drive_max.squeeze(1) - drive_min.squeeze(1)) > 1e-7
+
+        # ------------------------------------------------------------------
+        # 2. Lower-body motion.
+        # ------------------------------------------------------------------
+        lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]
+        lower_indices = []
+        for joint in lower_joints:
+            start = 7 + 6 * joint
+            lower_indices.extend(range(start, start + 6))
+        lower_indices = torch.as_tensor(lower_indices, device=device, dtype=torch.long)
+
+        pred_lower_delta = pred[:, 1:, lower_indices] - pred[:, :-1, lower_indices]
+        pred_lower_motion = torch.sqrt(pred_lower_delta.pow(2).mean(dim=-1) + 1e-8)
+
+        # Contact phase change is an auxiliary signal, not the main driver.
+        contacts = pred[:, :, self.contact_slice].clamp(0.0, 1.0)
+        contact_change = torch.abs(contacts[:, 1:] - contacts[:, :-1]).mean(dim=-1)
+
+        # ------------------------------------------------------------------
+        # 3. Top/bottom phase masks.
+        # ------------------------------------------------------------------
+        high_th = torch.quantile(drive_norm.detach(), 0.70, dim=1, keepdim=True)
+        low_th = torch.quantile(drive_norm.detach(), 0.30, dim=1, keepdim=True)
+
+        high_mask = (drive_norm >= high_th).to(dtype)
+        low_mask = (drive_norm <= low_th).to(dtype)
+
+        # Avoid empty masks.
+        high_den = high_mask.sum(dim=1).clamp_min(1.0)
+        low_den = low_mask.sum(dim=1).clamp_min(1.0)
+
+        high_lower = (pred_lower_motion * high_mask).sum(dim=1) / high_den
+        low_lower = (pred_lower_motion * low_mask).sum(dim=1) / low_den
+
+        high_contact = (contact_change * high_mask).sum(dim=1) / high_den
+        low_contact = (contact_change * low_mask).sum(dim=1) / low_den
+
+        # root_lower_min_motion now acts as contrast margin.
+        margin = pred.new_tensor(float(getattr(self, "root_lower_min_motion", 0.010)))
+
+        # Encourage lower-body response to be stronger during fast commanded
+        # trajectory phases than slow commanded phases.
+        contrast_loss = torch.relu(low_lower + margin - high_lower)
+
+        # Also encourage some contact phase change in fast phases.
+        contact_margin = pred.new_tensor(0.005)
+        contact_contrast_loss = torch.relu(low_contact + contact_margin - high_contact)
+
+        # Optional absolute activity floor on fast phases.
+        abs_floor = 0.5 * margin
+        activity_floor_loss = torch.relu(abs_floor - high_lower)
+
+        total = contrast_loss + 0.10 * contact_contrast_loss + 0.25 * activity_floor_loss
+        total = total * valid_seq.to(dtype)
+
+        if bool(int(__import__("os").environ.get("EDGE_DEBUG_ROOT_LOWER", "0"))):
+            if not hasattr(self, "_root_lower_debug_printed"):
+                self._root_lower_debug_printed = 0
+            if self._root_lower_debug_printed < 20:
+                with torch.no_grad():
+                    print(
+                        "🧪 root-lower v4 | "
+                        f"drive raw mean/max={drive_speed.mean().item():.6f}/{drive_speed.max().item():.6f} | "
+                        f"drive_norm mean/max={drive_norm.mean().item():.6f}/{drive_norm.max().item():.6f} | "
+                        f"high_lower={high_lower.mean().item():.6f} | "
+                        f"low_lower={low_lower.mean().item():.6f} | "
+                        f"margin={margin.item():.6f} | "
+                        f"contrast={contrast_loss.mean().item():.8f} | "
+                        f"high_contact={high_contact.mean().item():.6f} | "
+                        f"low_contact={low_contact.mean().item():.6f} | "
+                        f"contact_contrast={contact_contrast_loss.mean().item():.8f} | "
+                        f"activity_floor={activity_floor_loss.mean().item():.8f} | "
+                        f"valid={valid_seq.float().mean().item():.3f}",
+                        flush=True,
+                    )
+                self._root_lower_debug_printed += 1
+
+        return total.mean() * float(getattr(self, "root_lower_coupling_loss_weight", 1.0))
 
     def _biomech_loss(self, model_motion_x0):
         """
@@ -1088,7 +1232,7 @@ class GaussianDiffusion(nn.Module):
             )
 
             anti_freeze_loss = self._anti_freeze_loss(model_motion_x0)
-            sync_loss = self._kinematic_sync_loss(model_motion_x0)
+            sync_loss = self._kinematic_sync_loss(model_motion_x0, x_start, cond)
             biomech_loss = self._biomech_loss(model_motion_x0)
             root_turn_loss = self._root_turn_loss(model_motion_x0)
             contact_turn_loss = self._contact_turn_loss(model_motion_x0)
@@ -1152,7 +1296,10 @@ class GaussianDiffusion(nn.Module):
             * foot_loss
         )
         anti_freeze_term = physical_w * 0.05 * anti_freeze_loss
-        sync_term = physical_w * float(self.sync_loss_weight) * sync_loss
+        # Root-lower coupling is a control-adapter objective, not a late physical regularizer.
+        # Use a short warmup so Stage-A receives coupling gradients early.
+        root_lower_w = self._linear_warmup(current_epoch, start=1, end=5)
+        sync_term = root_lower_w * float(self.sync_loss_weight) * sync_loss
 
         biomech_term = biomech_w * 0.02 * biomech_loss
         root_turn_term = physical_w * 0.01 * root_turn_loss

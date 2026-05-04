@@ -33,6 +33,13 @@ def train(opt):
         strict_audio_checkpoint=opt.strict_audio_checkpoint,
         trajectory_loss_weight=opt.trajectory_loss_weight,
         trajectory_velocity_loss_weight=opt.trajectory_velocity_loss_weight,
+        energy_condition_prob=opt.energy_condition_prob,
+        energy_condition_drop_prob=opt.energy_condition_drop_prob,
+        energy_loss_weight=opt.energy_loss_weight,
+        root_lower_coupling_loss_weight=opt.root_lower_coupling_loss_weight,
+        root_lower_speed_threshold=opt.root_lower_speed_threshold,
+        root_lower_min_motion=opt.root_lower_min_motion,
+        adapter_train_decoder=opt.adapter_train_decoder,
     )
     model.train_loop(opt)
 

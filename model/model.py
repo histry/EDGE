@@ -1,4 +1,5 @@
 from typing import Any, Callable, Optional, Union
+import os
 
 import torch
 import torch.nn as nn
@@ -392,6 +393,17 @@ class DanceDecoder(nn.Module):
         self.null_trajectory_embed = nn.Parameter(torch.randn(1, 1, latent_dim))
         self.traj_type_embed = nn.Parameter(torch.randn(1, 1, latent_dim) * 0.02)
 
+        # TEA-MotionAdapter:
+        # Scalar motion-energy condition. It is added to timestep/global
+        # conditioning rather than cross-attention because it is a global
+        # continuous control axis.
+        self.energy_embed = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.null_energy_embed = nn.Parameter(torch.zeros(1, latent_dim))
+
         expanded_input_dim = nfeats * 2 + 1
         self.input_projection = nn.Linear(expanded_input_dim, latent_dim)
 
@@ -506,9 +518,11 @@ class DanceDecoder(nn.Module):
         if isinstance(cond_embed, dict):
             audio_cond = cond_embed.get("audio", None)
             trajectory_cond = cond_embed.get("trajectory", None)
+            energy_cond = cond_embed.get("energy", None)
         else:
             audio_cond = cond_embed
             trajectory_cond = None
+            energy_cond = None
 
         if audio_cond is None:
             audio_cond = torch.zeros(
@@ -545,7 +559,17 @@ class DanceDecoder(nn.Module):
                     align_corners=False,
                 ).transpose(1, 2)
 
-        return audio_cond, trajectory_cond
+        if energy_cond is not None:
+            energy_cond = energy_cond.to(device=device, dtype=dtype)
+            if energy_cond.ndim == 1:
+                energy_cond = energy_cond[:, None]
+            elif energy_cond.ndim == 3:
+                energy_cond = energy_cond[..., :1].mean(dim=1)
+            elif energy_cond.ndim == 2 and energy_cond.shape[-1] != 1:
+                energy_cond = energy_cond[:, :1]
+            energy_cond = energy_cond.clamp(0.0, 1.0)
+
+        return audio_cond, trajectory_cond, energy_cond
 
     def _build_sparse_attn_mask(self, batch_size, seq_len, device, force_mask=None):
         if (not self.use_sparse_attn) or self.sparse_attn_window <= 0:
@@ -586,10 +610,12 @@ class DanceDecoder(nn.Module):
         force_mask=None,
         force_x_clean=None,
     ):
+        """Classifier-free guidance with an optional separate energy axis."""
         b = x.shape[0]
         device = x.device
-
         drop_all = torch.zeros((b,), dtype=torch.bool, device=device)
+        keep_all = torch.ones((b,), dtype=torch.bool, device=device)
+
         unc = self.forward(
             x,
             cond_embed,
@@ -599,9 +625,41 @@ class DanceDecoder(nn.Module):
             force_x_clean=force_x_clean,
             keep_audio_mask=drop_all,
             keep_traj_mask=drop_all,
+            keep_energy_mask=drop_all,
         )
 
-        keep_all = torch.ones((b,), dtype=torch.bool, device=device)
+        try:
+            energy_scale = float(os.environ.get("EDGE_ENERGY_CFG_SCALE", "0"))
+        except Exception:
+            energy_scale = 0.0
+
+        has_energy = isinstance(cond_embed, dict) and cond_embed.get("energy", None) is not None
+
+        if energy_scale > 0.0 and has_energy:
+            base = self.forward(
+                x,
+                cond_embed,
+                times,
+                cond_drop_prob=0.0,
+                force_mask=force_mask,
+                force_x_clean=force_x_clean,
+                keep_audio_mask=keep_all,
+                keep_traj_mask=keep_all,
+                keep_energy_mask=drop_all,
+            )
+            energy_cond = self.forward(
+                x,
+                cond_embed,
+                times,
+                cond_drop_prob=0.0,
+                force_mask=force_mask,
+                force_x_clean=force_x_clean,
+                keep_audio_mask=keep_all,
+                keep_traj_mask=keep_all,
+                keep_energy_mask=keep_all,
+            )
+            return unc + (base - unc) * guidance_weight + (energy_cond - base) * energy_scale
+
         conditioned = self.forward(
             x,
             cond_embed,
@@ -611,6 +669,7 @@ class DanceDecoder(nn.Module):
             force_x_clean=force_x_clean,
             keep_audio_mask=keep_all,
             keep_traj_mask=keep_all,
+            keep_energy_mask=keep_all,
         )
 
         return unc + (conditioned - unc) * guidance_weight
@@ -625,6 +684,7 @@ class DanceDecoder(nn.Module):
         force_x_clean: Optional[Tensor] = None,
         keep_audio_mask: Optional[Tensor] = None,
         keep_traj_mask: Optional[Tensor] = None,
+        keep_energy_mask: Optional[Tensor] = None,
     ):
         batch_size, seq_len, _, device = *x.shape, x.device
 
@@ -656,7 +716,7 @@ class DanceDecoder(nn.Module):
         x = self.input_projection(x_concat)
         x = self.abs_pos_encoding(x)
 
-        audio_cond, trajectory_abs = self._prepare_cond_inputs(
+        audio_cond, trajectory_abs, energy_cond = self._prepare_cond_inputs(
             cond_embed,
             batch_size,
             seq_len,
@@ -672,10 +732,20 @@ class DanceDecoder(nn.Module):
         if keep_traj_mask is None:
             keep_traj_mask = prob_mask_like((batch_size,), keep_prob, device=device)
 
+        if keep_energy_mask is None:
+            energy_drop_prob = cond_drop_prob
+            try:
+                energy_drop_prob = float(os.environ.get("EDGE_ENERGY_DROP_PROB", energy_drop_prob))
+            except Exception:
+                pass
+            energy_keep_prob = 1.0 - max(0.0, min(1.0, energy_drop_prob))
+            keep_energy_mask = prob_mask_like((batch_size,), energy_keep_prob, device=device)
+
         keep_audio_mask_embed = rearrange(keep_audio_mask, "b -> b 1 1")
         keep_audio_mask_hidden = rearrange(keep_audio_mask, "b -> b 1")
         keep_traj_mask_embed = rearrange(keep_traj_mask, "b -> b 1 1")
         keep_traj_mask_root = rearrange(keep_traj_mask, "b -> b 1")
+        keep_energy_mask_hidden = rearrange(keep_energy_mask, "b -> b 1")
 
         cond_tokens = self.cond_projection(audio_cond)
         cond_tokens = self.abs_pos_encoding(cond_tokens)
@@ -696,6 +766,13 @@ class DanceDecoder(nn.Module):
 
         null_cond_hidden = self.null_cond_hidden.to(device=t.device, dtype=t.dtype)
         cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
+
+        if energy_cond is None:
+            energy_hidden = self.null_energy_embed.to(device=t.device, dtype=t.dtype).expand(batch_size, -1)
+        else:
+            energy_hidden = self.energy_embed(energy_cond.to(device=t.device, dtype=t.dtype))
+            null_energy_hidden = self.null_energy_embed.to(device=t.device, dtype=t.dtype).expand_as(energy_hidden)
+            energy_hidden = torch.where(keep_energy_mask_hidden, energy_hidden, null_energy_hidden)
 
         trajectory_tokens = None
         root_path = None
@@ -735,10 +812,10 @@ class DanceDecoder(nn.Module):
             )
             root_path = self.root_generator(trajectory_for_root, trajectory_tokens)
 
-            t = t + cond_hidden
+            t = t + cond_hidden + energy_hidden
             memory = torch.cat((fused_audio_tokens, traj_memory_tokens, t_tokens), dim=-2)
         else:
-            t = t + cond_hidden
+            t = t + cond_hidden + energy_hidden
             memory = torch.cat((cond_tokens, t_tokens), dim=-2)
 
         memory = self.norm_cond(memory)

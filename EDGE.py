@@ -118,6 +118,13 @@ class EDGE:
         beat_guidance_weight=0.0,
         trajectory_loss_weight=1.0,
         trajectory_velocity_loss_weight=0.25,
+        energy_condition_prob=0.7,
+        energy_condition_drop_prob=0.15,
+        energy_loss_weight=0.25,
+        root_lower_coupling_loss_weight=0.5,
+        root_lower_speed_threshold=0.012,
+        root_lower_min_motion=0.010,
+        adapter_train_decoder=False,
         hard_keyframe_project=False,
         train_stage="full",
         strict_audio_checkpoint=False,
@@ -186,7 +193,7 @@ class EDGE:
             sparse_attn_window=sparse_attn_window,
         )
 
-        self._apply_stage_freezing(model, train_stage)
+        self._apply_stage_freezing(model, train_stage, adapter_train_decoder=adapter_train_decoder)
         _print_trainable_summary(self, model)
 
         smpl = SMPLSkeleton(self.accelerator.device)
@@ -254,6 +261,12 @@ class EDGE:
             beat_guidance_weight=beat_guidance_weight,
             trajectory_loss_weight=trajectory_loss_weight,
             trajectory_velocity_loss_weight=trajectory_velocity_loss_weight,
+            energy_condition_prob=energy_condition_prob,
+            energy_condition_drop_prob=energy_condition_drop_prob,
+            energy_loss_weight=energy_loss_weight,
+            root_lower_coupling_loss_weight=root_lower_coupling_loss_weight,
+            root_lower_speed_threshold=root_lower_speed_threshold,
+            root_lower_min_motion=root_lower_min_motion,
             hard_keyframe_project=hard_keyframe_project,
         )
         
@@ -421,7 +434,7 @@ class EDGE:
                 message
                 + "\n由于启用了 --strict_audio_checkpoint，训练已停止。"
             )
-    def _apply_stage_freezing(self, model, train_stage):
+    def _apply_stage_freezing(self, model, train_stage, adapter_train_decoder=False):
         """
         Training stages:
         - full:
@@ -479,6 +492,54 @@ class EDGE:
             )
             return
 
+
+        if train_stage == "adapter":
+            # TEA-MotionAdapter:
+            # Freeze the pretrained motion prior and train only lightweight
+            # control branches. This protects physical priors while teaching
+            # trajectory speed -> lower-body stepping coupling.
+            self._set_requires_grad(model, False)
+
+            train_names = [
+                "trajectory_projection",
+                "trajectory_encoder",
+                "traj_modulate",
+                "root_generator",
+                "energy_embed",
+                "null_energy_embed",
+            ]
+
+            for name in train_names:
+                module = getattr(model, name, None)
+                if module is None:
+                    continue
+                if isinstance(module, torch.nn.Parameter):
+                    module.requires_grad = True
+                else:
+                    self._set_requires_grad(module, True)
+
+            stack = getattr(getattr(model, "seqTransDecoder", None), "stack", [])
+            for layer in stack:
+                for adapter_name in [
+                    "traj_adapter_self",
+                    "traj_adapter_cross",
+                    "traj_adapter_ff",
+                ]:
+                    adapter = getattr(layer, adapter_name, None)
+                    if adapter is not None:
+                        self._set_requires_grad(adapter, True)
+
+            if adapter_train_decoder:
+                self._set_requires_grad(model.seqTransDecoder, True)
+                self._set_requires_grad(model.final_layer, True)
+
+            print(
+                "🧩 train_stage=adapter: training trajectory adapters + "
+                "trajectory encoder/root generator + energy embedding; "
+                f"adapter_train_decoder={bool(adapter_train_decoder)}."
+            )
+            return
+
         raise ValueError(f"Unknown train_stage: {train_stage}")
 
     @staticmethod
@@ -498,6 +559,7 @@ class EDGE:
             "Root Turn Loss",
             "Contact Turn Loss",
             "Body Stability Loss",
+            "Root-Lower Coupling Loss",
             "Motion Energy Loss",
         ]
 
@@ -681,11 +743,25 @@ class EDGE:
             raise RuntimeError(f"在 {data_path} 目录下没有找到足够长的训练切片！")
             
         num_cpus = multiprocessing.cpu_count()
+        train_workers = min(int(num_cpus * 0.75), 16)
+        val_workers = 2
+
+        if getattr(opt, "train_num_workers", -1) >= 0:
+            train_workers = int(opt.train_num_workers)
+        if getattr(opt, "val_num_workers", -1) >= 0:
+            val_workers = int(opt.val_num_workers)
+
+        if self.accelerator.is_main_process:
+            print(
+                f"🧪 DataLoader workers: train={train_workers}, val={val_workers}; "
+                f"max_train_batches={getattr(opt, 'max_train_batches', 0)}"
+            )
+
         train_data_loader = DataLoader(
             train_dataset,
             batch_size=opt.batch_size,
             shuffle=True,
-            num_workers=min(int(num_cpus * 0.75), 16),
+            num_workers=train_workers,
             pin_memory=True,
             drop_last=True,
         )
@@ -693,7 +769,7 @@ class EDGE:
             test_dataset,
             batch_size=opt.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=val_workers,
             pin_memory=True,
             drop_last=False,
         )
@@ -715,7 +791,13 @@ class EDGE:
         for epoch in range(1, opt.epochs + 1):
             train_loss = 0.0
             self.train()
-            for batch in tqdm(train_data_loader, leave=False):
+            for batch_idx, batch in enumerate(tqdm(train_data_loader, leave=False)):
+                max_train_batches = int(getattr(opt, "max_train_batches", 0) or 0)
+                if max_train_batches > 0 and batch_idx >= max_train_batches:
+                    if self.accelerator.is_main_process:
+                        print(f"🧪 max_train_batches reached: {max_train_batches}; ending epoch early.")
+                    break
+
                 x, cond, name, wav = batch
                 
                 x = x.to(self.accelerator.device)
@@ -865,7 +947,6 @@ class EDGE:
 
                                     y, sr = librosa.load(wav_path, sr=None)
                                     duration = librosa.get_duration(y=y, sr=sr)
-                                    target_frames = int(duration * 30)
                                     
                                     print(f"   🎬 正在按完整时长进行推理，总计帧数: {target_frames} (约 {duration:.1f} 秒)")
                                     aligned_feat = F.interpolate(raw_feat_t, size=target_frames, mode='linear', align_corners=False).transpose(1, 2).squeeze(0)
@@ -941,8 +1022,6 @@ class EDGE:
         
         cond = move_condition_to_device(cond, self.accelerator.device)
         is_dummy_audio = torch.all(cond_for_len == 0).item()
-        
-        target_frames = seq_len 
         has_real_audio = wav is not None and isinstance(wav, (list, tuple)) and len(wav) > 0 and os.path.exists(wav[0])
 
         if has_real_audio:
@@ -951,7 +1030,6 @@ class EDGE:
             import librosa
             try:
                 y, sr = librosa.load(wav[0], sr=None)
-                target_frames = int(librosa.get_duration(y=y, sr=sr) * 30)
             except Exception as e:
                 print(f"获取时长失败，回退到默认帧数: {e}")
         else:
@@ -969,7 +1047,5 @@ class EDGE:
             mode="long" if has_real_audio else "normal",
             fk_out=fk_out,
             render=render,
-            sound_folder=sound_dir,
-            target_frames=target_frames,
             use_tto=use_tto
         )
