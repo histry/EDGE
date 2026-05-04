@@ -563,10 +563,20 @@ class DanceDecoder(nn.Module):
             energy_cond = energy_cond.to(device=device, dtype=dtype)
             if energy_cond.ndim == 1:
                 energy_cond = energy_cond[:, None]
+            elif energy_cond.ndim == 2:
+                if energy_cond.shape[-1] != 1:
+                    energy_cond = energy_cond[:, :1]
             elif energy_cond.ndim == 3:
-                energy_cond = energy_cond[..., :1].mean(dim=1)
-            elif energy_cond.ndim == 2 and energy_cond.shape[-1] != 1:
-                energy_cond = energy_cond[:, :1]
+                energy_cond = energy_cond[..., :1]
+                if energy_cond.shape[1] != seq_len:
+                    energy_cond = F.interpolate(
+                        energy_cond.transpose(1, 2),
+                        size=seq_len,
+                        mode="linear",
+                        align_corners=False,
+                    ).transpose(1, 2)
+            else:
+                raise ValueError(f"energy condition must be [B,1] or [B,T,1], got {energy_cond.shape}")
             energy_cond = energy_cond.clamp(0.0, 1.0)
 
         return audio_cond, trajectory_cond, energy_cond
@@ -767,12 +777,24 @@ class DanceDecoder(nn.Module):
         null_cond_hidden = self.null_cond_hidden.to(device=t.device, dtype=t.dtype)
         cond_hidden = torch.where(keep_audio_mask_hidden, cond_hidden, null_cond_hidden)
 
+        energy_tokens = None
         if energy_cond is None:
             energy_hidden = self.null_energy_embed.to(device=t.device, dtype=t.dtype).expand(batch_size, -1)
         else:
-            energy_hidden = self.energy_embed(energy_cond.to(device=t.device, dtype=t.dtype))
+            energy_in = energy_cond.to(device=t.device, dtype=t.dtype)
+            if energy_in.ndim == 3:
+                energy_tokens = self.energy_embed(energy_in)
+                energy_hidden = energy_tokens.mean(dim=1)
+            else:
+                energy_hidden = self.energy_embed(energy_in)
             null_energy_hidden = self.null_energy_embed.to(device=t.device, dtype=t.dtype).expand_as(energy_hidden)
             energy_hidden = torch.where(keep_energy_mask_hidden, energy_hidden, null_energy_hidden)
+            if energy_tokens is not None:
+                energy_tokens = torch.where(
+                    rearrange(keep_energy_mask, "b -> b 1 1"),
+                    energy_tokens,
+                    self.null_energy_embed.to(device=t.device, dtype=t.dtype).view(1, 1, -1).expand_as(energy_tokens),
+                )
 
         trajectory_tokens = None
         root_path = None
@@ -813,10 +835,18 @@ class DanceDecoder(nn.Module):
             root_path = self.root_generator(trajectory_for_root, trajectory_tokens)
 
             t = t + cond_hidden + energy_hidden
-            memory = torch.cat((fused_audio_tokens, traj_memory_tokens, t_tokens), dim=-2)
+            memory_parts = [fused_audio_tokens, traj_memory_tokens]
+            if energy_tokens is not None:
+                memory_parts.append(energy_tokens)
+            memory_parts.append(t_tokens)
+            memory = torch.cat(tuple(memory_parts), dim=-2)
         else:
             t = t + cond_hidden + energy_hidden
-            memory = torch.cat((cond_tokens, t_tokens), dim=-2)
+            memory_parts = [cond_tokens]
+            if energy_tokens is not None:
+                memory_parts.append(energy_tokens)
+            memory_parts.append(t_tokens)
+            memory = torch.cat(tuple(memory_parts), dim=-2)
 
         memory = self.norm_cond(memory)
 

@@ -231,6 +231,76 @@ def _adam_or_momentum_tto(self, x, cond, t, constraint=None):
     return x_opt.detach()
 
 
+# ===== Stage A v6: explicit lower-body velocity matching patch =====
+def _edge_explicit_lower_velocity_loss(diffusion, model_motion_x0, target_motion_x0=None, cond=None):
+    weight = _env_float("EDGE_EXPLICIT_LOWER_VEL_LOSS_WEIGHT", 0.0)
+    if weight <= 0.0:
+        return model_motion_x0.new_tensor(0.0)
+    if model_motion_x0 is None or model_motion_x0.shape[-1] != 151 or model_motion_x0.shape[1] < 2:
+        return model_motion_x0.new_tensor(0.0)
+    try:
+        normalizer = getattr(diffusion, "normalizer", None)
+        physical = maybe_unnormalize(normalizer, model_motion_x0)
+        root = physical[:, :, [diffusion.root_x_idx, diffusion.root_z_idx]]
+        root_speed = torch.linalg.norm(root[:, 1:] - root[:, :-1], dim=-1)
+
+        joints = diffusion._fk_positions(physical)
+        feet = joints[:, :, [7, 8, 10, 11], :]
+        pelvis = physical[:, :, diffusion.root_slice].unsqueeze(2)
+        feet_rel = feet - pelvis
+        lower_rel_speed = torch.linalg.norm(
+            feet_rel[:, 1:, :, [0, 2]] - feet_rel[:, :-1, :, [0, 2]],
+            dim=-1,
+        ).mean(dim=-1)
+
+        threshold = _env_float("EDGE_EXPLICIT_LOWER_ROOT_SPEED_THRESHOLD", 0.006)
+        ratio = _env_float("EDGE_EXPLICIT_LOWER_RELVEL_RATIO", 0.75)
+        min_motion = _env_float("EDGE_EXPLICIT_LOWER_MIN_MOTION", 0.003)
+        gate = root_speed > float(threshold)
+        if not bool(gate.any().item()):
+            return model_motion_x0.new_tensor(0.0)
+        target_lower = min_motion + ratio * root_speed
+        loss = F.relu(target_lower - lower_rel_speed)
+        return loss[gate].mean()
+    except Exception:
+        return model_motion_x0.new_tensor(0.0)
+
+
+def _edge_add_explicit_loss_to_output(out, extra):
+    if extra is None or not torch.is_tensor(extra):
+        return out
+    if torch.is_tensor(out):
+        return out + extra
+    if isinstance(out, tuple) and len(out) > 0:
+        first = out[0] + extra if torch.is_tensor(out[0]) else out[0]
+        return (first,) + tuple(out[1:])
+    if isinstance(out, list) and len(out) > 0:
+        out = list(out)
+        if torch.is_tensor(out[0]):
+            out[0] = out[0] + extra
+        return out
+    return out
+
+
+def _edge_patch_explicit_lower_velocity(GaussianDiffusion):
+    if getattr(GaussianDiffusion, "_edge_explicit_lower_velocity_patch_installed", False):
+        return
+    if not hasattr(GaussianDiffusion, "_kinematic_sync_loss"):
+        return
+    original_kinematic_sync_loss = GaussianDiffusion._kinematic_sync_loss
+    def patched_kinematic_sync_loss(self, *args, **kwargs):
+        out = original_kinematic_sync_loss(self, *args, **kwargs)
+        model_motion_x0 = args[0] if args else kwargs.get("model_motion_x0", None)
+        target_motion_x0 = args[1] if len(args) > 1 else kwargs.get("target_motion_x0", None)
+        cond = args[2] if len(args) > 2 else kwargs.get("cond", None)
+        extra = _edge_explicit_lower_velocity_loss(self, model_motion_x0, target_motion_x0=target_motion_x0, cond=cond)
+        weight = _env_float("EDGE_EXPLICIT_LOWER_VEL_LOSS_WEIGHT", 0.0)
+        return _edge_add_explicit_loss_to_output(out, float(weight) * extra)
+    GaussianDiffusion._kinematic_sync_loss = patched_kinematic_sync_loss
+    GaussianDiffusion._edge_original_kinematic_sync_loss = original_kinematic_sync_loss
+    GaussianDiffusion._edge_explicit_lower_velocity_patch_installed = True
+
+
 def install_native_trajectory_control_patch(verbose=True):
     try:
         from model.diffusion import GaussianDiffusion
@@ -306,6 +376,8 @@ def install_native_trajectory_control_patch(verbose=True):
 
         GaussianDiffusion._apply_tto = patched_apply_tto
         GaussianDiffusion._edge_original_apply_tto = original_apply_tto
+
+    _edge_patch_explicit_lower_velocity(GaussianDiffusion)
 
     GaussianDiffusion._edge_runtime_safety_patch_installed = True
 

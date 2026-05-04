@@ -118,3 +118,6 @@ data/dunhuang_bvh/processed/
 # Python cache
 __pycache__/
 *.pyc
+
+# Local patch backups
+_backup_choreorag_stage_patch_v2/

@@ -1,21 +1,13 @@
 """Soft retrieved-unit prior helpers for PACE-ChoreoRAG.
 
-Drop-in replacement for choreorag_unit_prior.py.
+Replacement for choreorag_unit_prior.py.
 
-Disabled by default.  Activation examples:
-    export EDGE_UNIT_SOFT_PRIOR=1
-    export EDGE_UNIT_PRIOR_FEATURES=upper
-    export EDGE_UNIT_PRIOR_STRENGTH=0.08
-
-Supported feature modes:
-    upper       upper body + optional torso, safest for temporal smoothing
-    loco_safe   weak lower-body rotations only; no contacts/root XZ
-    loco_upper  upper + loco_safe; recommended weak setting 0.025
-    rot_only    all rotations, not recommended except diagnostics
-
-This module never touches contact channels or root X/Z by default.  It writes a
-weak temporal constraint into the existing EDGE keyframe value/mask tensors.
+Additions:
+- Optional DCT/FFT low-pass prior injection controlled by EDGE_UNIT_PRIOR_DCT=1.
+- Feature-decoupled modes: upper, arms, loco_safe, loco_upper, rot_only.
+- Safety: never constrains contacts or root X/Z.
 """
+
 from __future__ import annotations
 
 import json
@@ -71,6 +63,7 @@ def _joint_rot_indices(joints: Iterable[int]) -> List[int]:
 def make_unit_prior_mask(mode: str = "upper", include_root_y: bool = True) -> np.ndarray:
     mode = str(mode or "upper").strip().lower()
     mask = np.zeros((REPR_DIM,), dtype=np.float32)
+
     if include_root_y and _env_bool("EDGE_UNIT_PRIOR_INCLUDE_ROOT_Y", True):
         mask[ROOT_Y_IDX] = 1.0
 
@@ -79,28 +72,20 @@ def make_unit_prior_mask(mode: str = "upper", include_root_y: bool = True) -> np
         if _env_bool("EDGE_UNIT_PRIOR_INCLUDE_TORSO", True):
             joints += TORSO_JOINTS
         mask[_joint_rot_indices(joints)] = 1.0
-
     elif mode == "arms":
         mask[_joint_rot_indices(UPPER_JOINTS)] = 1.0
-
     elif mode in {"loco_safe", "lower_safe"}:
-        # Weak lower-body rotation prior for weight shift / stepping.
-        # It excludes contacts and root X/Z, so it is safer than all-body prior.
         mask[_joint_rot_indices(LOWER_SAFE_JOINTS)] = 1.0
-
     elif mode in {"loco_upper", "upper_loco"}:
         joints = list(UPPER_JOINTS) + list(LOWER_SAFE_JOINTS)
         if _env_bool("EDGE_UNIT_PRIOR_INCLUDE_TORSO", True):
             joints += TORSO_JOINTS
         mask[_joint_rot_indices(joints)] = 1.0
-
     elif mode == "rot_only":
         mask[ROT_START:REPR_DIM] = 1.0
-
     else:
         raise ValueError(f"Unknown EDGE_UNIT_PRIOR_FEATURES={mode!r}")
 
-    # Safety: never constrain contacts or root X/Z through this unit prior.
     mask[CONTACT_SLICE] = 0.0
     mask[ROOT_X_IDX] = 0.0
     mask[ROOT_Z_IDX] = 0.0
@@ -143,6 +128,40 @@ def _crop_unit_center(unit: np.ndarray, max_len: int) -> np.ndarray:
     return unit[s:e].astype(np.float32)
 
 
+def _dct_lowpass_numpy(x: np.ndarray, k: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim != 2 or len(x) <= 2:
+        return x.astype(np.float32)
+    k = int(max(1, min(k, len(x))))
+    try:
+        from scipy.fftpack import dct, idct
+        coeff = dct(x, type=2, norm="ortho", axis=0)
+        coeff[k:, :] = 0.0
+        y = idct(coeff, type=2, norm="ortho", axis=0)
+        return y.astype(np.float32)
+    except Exception:
+        freq = np.fft.rfft(x, axis=0)
+        freq[k:, :] = 0.0
+        y = np.fft.irfft(freq, n=len(x), axis=0)
+        return y.astype(np.float32)
+
+
+def _maybe_frequency_decouple_unit(unit: np.ndarray, prior_mask: np.ndarray) -> np.ndarray:
+    if not _env_bool("EDGE_UNIT_PRIOR_DCT", False):
+        return unit.astype(np.float32)
+
+    k = _env_int("EDGE_UNIT_PRIOR_LOW_FREQ_K", 6)
+    out = unit.astype(np.float32).copy()
+    feat_idx = np.where(prior_mask > 0)[0]
+    if len(feat_idx) == 0:
+        return out
+
+    out[:, feat_idx] = _dct_lowpass_numpy(out[:, feat_idx], k=k)
+    if _env_bool("EDGE_UNIT_PRIOR_VERBOSE", False):
+        print(f"   DCT low-pass prior applied: K={k}, features={len(feat_idx)}")
+    return out.astype(np.float32)
+
+
 def add_unit_prior(
     value: np.ndarray,
     mask: np.ndarray,
@@ -154,10 +173,10 @@ def add_unit_prior(
     decay_gamma: float = 1.0,
     decay_floor: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Blend a weak retrieved-unit temporal prior into keyframe constraints."""
     value = np.asarray(value, dtype=np.float32)
     mask = np.asarray(mask, dtype=np.float32)
     unit = np.asarray(unit_motion, dtype=np.float32)
+
     if unit.ndim != 2 or unit.shape[1] != REPR_DIM:
         raise ValueError(f"unit_motion must be [T,151], got {unit.shape}")
     if value.ndim != 2 or mask.ndim != 2 or value.shape != mask.shape or value.shape[1] != REPR_DIM:
@@ -165,6 +184,8 @@ def add_unit_prior(
 
     unit = _crop_unit_center(unit, max_len)
     prior_mask = make_unit_prior_mask(feature_mode)
+    unit = _maybe_frequency_decouple_unit(unit, prior_mask)
+
     center_frame = int(center_frame)
     half = len(unit) // 2
     T = value.shape[0]
@@ -174,6 +195,7 @@ def add_unit_prior(
 
     combine = os.environ.get("EDGE_UNIT_PRIOR_COMBINE", "max").strip().lower()
     applied_frames = 0
+
     for j in range(len(unit)):
         f = center_frame - half + j
         if f < 0 or f >= T:
@@ -181,6 +203,7 @@ def add_unit_prior(
         local = strength * triangular_weight(j, len(unit), decay_gamma, decay_floor)
         if local <= 0.0:
             continue
+
         new_mask = prior_mask * float(local)
         if combine == "add":
             update = new_mask > 0
@@ -192,6 +215,7 @@ def add_unit_prior(
                 value[f, update] = unit[j, update]
                 mask[f, update] = new_mask[update]
         applied_frames += int(np.any(new_mask > 0))
+
     if _env_bool("EDGE_UNIT_PRIOR_VERBOSE", False):
         print(f"   unit_prior frame={center_frame} len={len(unit)} applied_frames={applied_frames}")
     return value, mask
@@ -225,6 +249,7 @@ def infer_unit_specs_from_mid_paths(mid_paths: Iterable[str], mid_frames: Iterab
 def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Iterable[Dict[str, object]]) -> Tuple[np.ndarray, np.ndarray]:
     if not _env_bool("EDGE_UNIT_SOFT_PRIOR", False):
         return value, mask
+
     strength = _env_float("EDGE_UNIT_PRIOR_STRENGTH", 0.06)
     feature_mode = os.environ.get("EDGE_UNIT_PRIOR_FEATURES", "upper")
     max_len = _env_int("EDGE_UNIT_PRIOR_MAX_LEN", 45)
@@ -252,8 +277,12 @@ def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Ite
             decay_floor=decay_floor,
         )
         applied += 1
+
     if applied:
-        print(f"✅ ChoreoRAG unit soft prior applied: count={applied}, strength={strength}, features={feature_mode}")
+        dct_msg = ""
+        if _env_bool("EDGE_UNIT_PRIOR_DCT", False):
+            dct_msg = f", dct_lowpass_k={_env_int('EDGE_UNIT_PRIOR_LOW_FREQ_K', 6)}"
+        print(f"✅ ChoreoRAG unit soft prior applied: count={applied}, strength={strength}, features={feature_mode}{dct_msg}")
     elif _env_bool("EDGE_UNIT_SOFT_PRIOR", False):
         print(f"⚠️ EDGE_UNIT_SOFT_PRIOR=1 but no valid unit prior was applied; missing={missing}")
     return value, mask

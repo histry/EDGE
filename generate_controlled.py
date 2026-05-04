@@ -15,6 +15,12 @@ import torch
 import torch.nn.functional as F
 
 try:
+    from choreorag_energy_speed import build_energy_curve_from_audio_traj, energy_curve_summary
+except Exception:
+    build_energy_curve_from_audio_traj = None
+    energy_curve_summary = None
+
+try:
     import scipy.interpolate as spi
 except Exception:
     spi = None
@@ -575,10 +581,96 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
 
 
 # ===== TEA-MotionAdapter inference energy helper =====
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default)).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _torch_normalize_01(x: torch.Tensor) -> torch.Tensor:
+    x = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    x = x - x.amin(dim=1, keepdim=True)
+    denom = x.amax(dim=1, keepdim=True).clamp_min(1e-8)
+    return x / denom
+
+
+def _energy_curve_torch_from_cond(cond: dict, num_frames: int) -> torch.Tensor:
+    audio = cond.get("audio", None)
+    traj = cond.get("trajectory", None)
+
+    if audio is None:
+        B = 1 if traj is None else traj.shape[0]
+        device = torch.device("cpu") if traj is None else traj.device
+        return torch.full((B, num_frames, 1), float(os.environ.get("EDGE_ENERGY_LEVEL", "0.55")), device=device)
+
+    audio = audio.float()
+    B, T = audio.shape[0], audio.shape[1]
+    if T != num_frames:
+        audio = F.interpolate(audio.transpose(1, 2), size=num_frames, mode="linear", align_corners=False).transpose(1, 2)
+        T = num_frames
+
+    if audio.shape[-1] > 768:
+        onset = torch.relu(audio[..., 768])
+    elif audio.shape[-1] >= 35:
+        onset = torch.relu(audio[..., 0] + 0.5 * audio[..., -2] + 0.5 * audio[..., -1])
+    else:
+        onset = torch.zeros((B, T), device=audio.device, dtype=audio.dtype)
+        if T > 1:
+            onset[:, 1:] = torch.linalg.norm(audio[:, 1:] - audio[:, :-1], dim=-1)
+            onset[:, 0] = onset[:, 1]
+    onset = _torch_normalize_01(onset)
+
+    if traj is None:
+        speed = torch.zeros_like(onset)
+        curv = torch.zeros_like(onset)
+    else:
+        traj = traj.to(device=audio.device, dtype=audio.dtype)[..., :2]
+        if traj.shape[1] != T:
+            traj = F.interpolate(traj.transpose(1, 2), size=T, mode="linear", align_corners=False).transpose(1, 2)
+
+        speed = torch.zeros((B, T), device=audio.device, dtype=audio.dtype)
+        if T > 1:
+            speed[:, 1:] = torch.linalg.norm(traj[:, 1:] - traj[:, :-1], dim=-1)
+            speed[:, 0] = speed[:, 1]
+        speed = _torch_normalize_01(speed)
+
+        curv = torch.zeros((B, T), device=audio.device, dtype=audio.dtype)
+        if T > 2:
+            v1 = traj[:, 1:-1] - traj[:, :-2]
+            v2 = traj[:, 2:] - traj[:, 1:-1]
+            n1 = torch.linalg.norm(v1, dim=-1)
+            n2 = torch.linalg.norm(v2, dim=-1)
+            cos = (v1 * v2).sum(dim=-1) / (n1 * n2).clamp_min(1e-8)
+            curv[:, 1:-1] = 1.0 - cos.clamp(-1.0, 1.0)
+        curv = _torch_normalize_01(curv)
+
+    w_speed = float(os.environ.get("EDGE_ENERGY_TRAJ_SPEED_WEIGHT", "0.55"))
+    w_audio = float(os.environ.get("EDGE_ENERGY_AUDIO_WEIGHT", "0.30"))
+    w_curv = float(os.environ.get("EDGE_ENERGY_CURVATURE_WEIGHT", "0.15"))
+    total = max(w_speed + w_audio + w_curv, 1e-8)
+
+    base = float(os.environ.get("EDGE_ENERGY_LEVEL", "0.55"))
+    e_min = float(os.environ.get("EDGE_ENERGY_MIN", "0.20"))
+    e_max = float(os.environ.get("EDGE_ENERGY_MAX", "0.85"))
+
+    dynamic = _torch_normalize_01((w_speed * speed + w_audio * onset + w_curv * curv) / total)
+    curve = (0.35 * base + 0.65 * dynamic).clamp(e_min, e_max)
+    return curve.unsqueeze(-1)
+
+
 def maybe_attach_energy_condition(cond: dict, num_frames: int) -> dict:
-    flag = str(os.environ.get("EDGE_ENERGY_COND", "0")).lower() in {"1", "true", "yes", "y", "on"}
-    if not flag:
+    if not _env_flag("EDGE_ENERGY_COND", "0"):
         return cond
+
+    if _env_flag("EDGE_ENERGY_TIME_DEPENDENT", "0"):
+        curve = _energy_curve_torch_from_cond(cond, num_frames)
+        cond["energy"] = curve
+        arr = curve.detach().cpu().numpy()
+        print(
+            "✅ TEA time-dependent energy condition: "
+            f"min={arr.min():.3f}, max={arr.max():.3f}, mean={arr.mean():.3f}, "
+            f"cfg_scale={os.environ.get('EDGE_ENERGY_CFG_SCALE', 'default')}"
+        )
+        return cond
+
     try:
         level = float(os.environ.get("EDGE_ENERGY_LEVEL", "0.5"))
     except Exception:
@@ -587,6 +679,7 @@ def maybe_attach_energy_condition(cond: dict, num_frames: int) -> dict:
     cond["energy"] = torch.full((1, 1), level, dtype=torch.float32)
     print(f"✅ TEA energy condition: level={level:.3f}, cfg_scale={os.environ.get('EDGE_ENERGY_CFG_SCALE', 'default')}")
     return cond
+
 
 def sample_motion(model: EDGE, cond: dict, constraint: dict, args, num_frames: int):
     cond = maybe_attach_energy_condition(cond, num_frames)
