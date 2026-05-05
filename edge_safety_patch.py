@@ -1,21 +1,30 @@
 """Safety patch for EDGE training/reporting risks.
 
-This file does not replace the large EDGE.py implementation.  It patches EDGE
-at import time to make important experiment assumptions explicit:
+Drop-in replacement for edge_safety_patch.py.
+
+This file does not replace EDGE.py. It patches EDGE at import time to make
+important experiment assumptions explicit:
 
 1) requested vs effective MMR loss is recorded and printed;
 2) stage1/stage2 cannot silently freeze randomly initialized audio layers when
    checkpoint audio_dim is mismatched, unless explicitly allowed;
 3) training logs expose the effective MMR state for reporting.
 
+V7 fix:
+- The previous version used brittle hard-coded positional indices to read
+  audio_pairing_mode and mmr_loss_weight.
+- This version uses inspect.signature(original_init).bind(...) so keyword and
+  positional calls are both handled safely.
+
 Install via sitecustomize.py:
     from edge_safety_patch import install_edge_safety_patch
     install_edge_safety_patch()
 """
+
 from __future__ import annotations
 
+import inspect
 import os
-from typing import Any
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -23,14 +32,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return bool(default)
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _get_arg(args, index, kwargs, name, default=None):
-    if name in kwargs:
-        return kwargs[name]
-    if len(args) > index:
-        return args[index]
-    return default
 
 
 def _has_audio_checkpoint_mismatch(adapt_report: dict) -> bool:
@@ -45,7 +46,7 @@ def _has_audio_checkpoint_mismatch(adapt_report: dict) -> bool:
     def is_audio_key(key):
         key = str(key)
         if key.startswith("module."):
-            key = key[len("module."):]
+            key = key[len("module.") :]
         return any(marker in key for marker in audio_markers)
 
     for item in adapt_report.get("skipped_shape", []):
@@ -63,6 +64,7 @@ def _has_audio_checkpoint_mismatch(adapt_report: dict) -> bool:
 def install_edge_safety_patch(verbose: bool = True):
     try:
         import EDGE as edge_module
+
         EDGEClass = edge_module.EDGE
     except Exception as exc:
         if verbose:
@@ -73,28 +75,41 @@ def install_edge_safety_patch(verbose: bool = True):
         return True
 
     original_init = EDGEClass.__init__
+    original_init_signature = inspect.signature(original_init)
 
     def patched_init(self, *args, **kwargs):
-        audio_pairing_mode = _get_arg(args, 17, kwargs, "audio_pairing_mode", "proxy")
-        requested_mmr_loss_weight = float(_get_arg(args, 18, kwargs, "mmr_loss_weight", 0.0) or 0.0)
+        try:
+            bound = original_init_signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            arguments = bound.arguments
+        except TypeError:
+            # Do not make the patch change the original error behavior.
+            raise
+
+        audio_pairing_mode = str(arguments.get("audio_pairing_mode", "none"))
+        requested_mmr_loss_weight = float(arguments.get("mmr_loss_weight", 0.0) or 0.0)
         effective_mmr_loss_weight = (
             requested_mmr_loss_weight
-            if str(audio_pairing_mode) == "paired"
+            if audio_pairing_mode == "paired"
             else 0.0
         )
 
+        # Store before init for early diagnostics and restore after init because
+        # original_init may overwrite instance attributes.
         self.requested_mmr_loss_weight = requested_mmr_loss_weight
         self.effective_mmr_loss_weight = effective_mmr_loss_weight
-        self.audio_pairing_mode_for_reporting = str(audio_pairing_mode)
+        self.audio_pairing_mode_for_reporting = audio_pairing_mode
 
-        original_init(self, *args, **kwargs)
+        original_init(*bound.args, **bound.kwargs)
 
-        # Restore explicit report fields after original __init__.
         self.requested_mmr_loss_weight = requested_mmr_loss_weight
         self.effective_mmr_loss_weight = effective_mmr_loss_weight
-        self.audio_pairing_mode_for_reporting = str(audio_pairing_mode)
+        self.audio_pairing_mode_for_reporting = audio_pairing_mode
 
-        if getattr(self, "accelerator", None) is None or self.accelerator.is_main_process:
+        accelerator = getattr(self, "accelerator", None)
+        is_main = accelerator is None or getattr(accelerator, "is_main_process", True)
+
+        if is_main:
             if requested_mmr_loss_weight > 0 and effective_mmr_loss_weight == 0:
                 print(
                     "📌 Effective MMR Loss: requested="
@@ -105,7 +120,8 @@ def install_edge_safety_patch(verbose: bool = True):
             else:
                 print(
                     "📌 Effective MMR Loss: requested="
-                    f"{requested_mmr_loss_weight}, effective={effective_mmr_loss_weight}, "
+                    f"{requested_mmr_loss_weight}, "
+                    f"effective={effective_mmr_loss_weight}, "
                     f"audio_pairing_mode={audio_pairing_mode}."
                 )
 
