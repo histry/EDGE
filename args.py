@@ -160,6 +160,25 @@ def parse_train_opt():
         default=0.25,
         help="Weight for matching generated and target motion-energy envelopes.",
     )
+
+    # ===== V9 RAG Summary Token =====
+    parser.add_argument(
+        "--enable_rag_summary_token",
+        action="store_true",
+        help="Enable RAG summary token conditioning.",
+    )
+    parser.add_argument(
+        "--rag_summary_dim",
+        type=int,
+        default=7,
+        help="Dimension of RAG summary vector from rag_context_tokens.py.",
+    )
+    parser.add_argument(
+        "--rag_summary_drop_prob",
+        type=float,
+        default=0.15,
+        help="Drop probability for RAG summary condition during training.",
+    )
     parser.add_argument(
         "--root_lower_coupling_loss_weight",
         type=float,

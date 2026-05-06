@@ -404,6 +404,22 @@ class DanceDecoder(nn.Module):
         )
         self.null_energy_embed = nn.Parameter(torch.zeros(1, latent_dim))
 
+        # V9 RAG Summary Token branch.
+        # EDGE passes enable_rag_summary_token / rag_summary_dim through **kwargs
+        # to preserve old constructor compatibility.
+        self.enable_rag_summary_token = bool(kwargs.get("enable_rag_summary_token", False))
+        self.rag_summary_dim = int(kwargs.get("rag_summary_dim", 7))
+        self.rag_summary_drop_prob = float(kwargs.get("rag_summary_drop_prob", 0.15))
+        if self.enable_rag_summary_token:
+            self.rag_summary_projection = nn.Sequential(
+                nn.Linear(self.rag_summary_dim, latent_dim),
+                nn.SiLU(),
+                nn.Linear(latent_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+            )
+            self.null_rag_summary_embed = nn.Parameter(torch.zeros(1, 1, latent_dim))
+            self.rag_type_embed = nn.Parameter(torch.randn(1, 1, latent_dim) * 0.02)
+
         expanded_input_dim = nfeats * 2 + 1
         self.input_projection = nn.Linear(expanded_input_dim, latent_dim)
 
@@ -514,15 +530,60 @@ class DanceDecoder(nn.Module):
                 trajectory_tokens = layer(trajectory_tokens)
         return trajectory_tokens
 
+    def _project_rag_summary_tokens(self, rag_summary_cond, batch_size, seq_len, device, dtype):
+        if not getattr(self, "enable_rag_summary_token", False):
+            return None
+
+        if rag_summary_cond is None:
+            rag_tokens = self.null_rag_summary_embed.to(device=device, dtype=dtype).expand(
+                batch_size, seq_len, -1
+            )
+            return rag_tokens + self.rag_type_embed.to(device=device, dtype=dtype)
+
+        rag_summary_cond = rag_summary_cond.to(device=device, dtype=dtype)
+
+        # Support [B,D], [B,1,D], or [B,T,D].
+        if rag_summary_cond.ndim == 2:
+            rag_summary_cond = rag_summary_cond[:, None, :].expand(-1, seq_len, -1)
+        elif rag_summary_cond.ndim == 3:
+            if rag_summary_cond.shape[1] == 1:
+                rag_summary_cond = rag_summary_cond.expand(-1, seq_len, -1)
+            elif rag_summary_cond.shape[1] != seq_len:
+                rag_summary_cond = F.interpolate(
+                    rag_summary_cond.transpose(1, 2),
+                    size=seq_len,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+        else:
+            raise ValueError(
+                f"rag_summary must be [B,D], [B,1,D], or [B,T,D], got {tuple(rag_summary_cond.shape)}"
+            )
+
+        if rag_summary_cond.shape[-1] != self.rag_summary_dim:
+            raise ValueError(
+                f"Expected rag_summary dim={self.rag_summary_dim}, got {rag_summary_cond.shape[-1]}"
+            )
+
+        rag_tokens = self.rag_summary_projection(rag_summary_cond)
+        rag_tokens = self.abs_pos_encoding(rag_tokens)
+        rag_tokens = rag_tokens + self.rag_type_embed.to(
+            device=rag_tokens.device,
+            dtype=rag_tokens.dtype,
+        )
+        return rag_tokens
+
     def _prepare_cond_inputs(self, cond_embed, batch_size, seq_len, device, dtype):
         if isinstance(cond_embed, dict):
             audio_cond = cond_embed.get("audio", None)
             trajectory_cond = cond_embed.get("trajectory", None)
             energy_cond = cond_embed.get("energy", None)
+            rag_summary_cond = cond_embed.get("rag_summary", None)
         else:
             audio_cond = cond_embed
             trajectory_cond = None
             energy_cond = None
+            rag_summary_cond = None
 
         if audio_cond is None:
             audio_cond = torch.zeros(
@@ -579,7 +640,7 @@ class DanceDecoder(nn.Module):
                 raise ValueError(f"energy condition must be [B,1] or [B,T,1], got {energy_cond.shape}")
             energy_cond = energy_cond.clamp(0.0, 1.0)
 
-        return audio_cond, trajectory_cond, energy_cond
+        return audio_cond, trajectory_cond, energy_cond, rag_summary_cond
 
     def _build_sparse_attn_mask(self, batch_size, seq_len, device, force_mask=None):
         if (not self.use_sparse_attn) or self.sparse_attn_window <= 0:
@@ -695,6 +756,7 @@ class DanceDecoder(nn.Module):
         keep_audio_mask: Optional[Tensor] = None,
         keep_traj_mask: Optional[Tensor] = None,
         keep_energy_mask: Optional[Tensor] = None,
+        keep_rag_mask: Optional[Tensor] = None,
     ):
         batch_size, seq_len, _, device = *x.shape, x.device
 
@@ -726,7 +788,7 @@ class DanceDecoder(nn.Module):
         x = self.input_projection(x_concat)
         x = self.abs_pos_encoding(x)
 
-        audio_cond, trajectory_abs, energy_cond = self._prepare_cond_inputs(
+        audio_cond, trajectory_abs, energy_cond, rag_summary_cond = self._prepare_cond_inputs(
             cond_embed,
             batch_size,
             seq_len,
@@ -755,7 +817,25 @@ class DanceDecoder(nn.Module):
         keep_audio_mask_hidden = rearrange(keep_audio_mask, "b -> b 1")
         keep_traj_mask_embed = rearrange(keep_traj_mask, "b -> b 1 1")
         keep_traj_mask_root = rearrange(keep_traj_mask, "b -> b 1")
+        if keep_rag_mask is None:
+            keep_rag_mask = prob_mask_like((batch_size,), keep_prob, device=device)
+        keep_rag_mask_embed = rearrange(keep_rag_mask, "b -> b 1 1")
+
         keep_energy_mask_hidden = rearrange(keep_energy_mask, "b -> b 1")
+
+        rag_tokens = self._project_rag_summary_tokens(
+            rag_summary_cond,
+            batch_size,
+            seq_len,
+            device,
+            x.dtype,
+        )
+        if rag_tokens is not None:
+            null_rag_tokens = self.null_rag_summary_embed.to(
+                device=rag_tokens.device,
+                dtype=rag_tokens.dtype,
+            ).expand_as(rag_tokens)
+            rag_tokens = torch.where(keep_rag_mask_embed, rag_tokens, null_rag_tokens)
 
         cond_tokens = self.cond_projection(audio_cond)
         cond_tokens = self.abs_pos_encoding(cond_tokens)
@@ -838,6 +918,8 @@ class DanceDecoder(nn.Module):
             memory_parts = [fused_audio_tokens, traj_memory_tokens]
             if energy_tokens is not None:
                 memory_parts.append(energy_tokens)
+            if rag_tokens is not None:
+                memory_parts.append(rag_tokens)
             memory_parts.append(t_tokens)
             memory = torch.cat(tuple(memory_parts), dim=-2)
         else:
@@ -845,6 +927,8 @@ class DanceDecoder(nn.Module):
             memory_parts = [cond_tokens]
             if energy_tokens is not None:
                 memory_parts.append(energy_tokens)
+            if rag_tokens is not None:
+                memory_parts.append(rag_tokens)
             memory_parts.append(t_tokens)
             memory = torch.cat(tuple(memory_parts), dim=-2)
 

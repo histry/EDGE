@@ -40,6 +40,9 @@ def train(opt):
         root_lower_speed_threshold=opt.root_lower_speed_threshold,
         root_lower_min_motion=opt.root_lower_min_motion,
         adapter_train_decoder=opt.adapter_train_decoder,
+        enable_rag_summary_token=getattr(opt, "enable_rag_summary_token", False),
+        rag_summary_dim=getattr(opt, "rag_summary_dim", 7),
+        rag_summary_drop_prob=getattr(opt, "rag_summary_drop_prob", 0.15),
     )
     model.train_loop(opt)
 
