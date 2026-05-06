@@ -19,6 +19,7 @@ from model.diffusion import GaussianDiffusion
 from model.model import DanceDecoder
 from model.mmr_model import CrossModalMMR
 from vis import SMPLSkeleton
+from rag_context_tokens import make_rag_summary_batch_from_motion
 
 def _print_trainable_summary(self, model):
     if not self.accelerator.is_main_process:
@@ -128,6 +129,9 @@ class EDGE:
         hard_keyframe_project=False,
         train_stage="full",
         strict_audio_checkpoint=False,
+        enable_rag_summary_token=False,
+        rag_summary_dim=7,
+        rag_summary_drop_prob=0.15,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
@@ -141,6 +145,14 @@ class EDGE:
         self.repr_dim = repr_dim = 151
         self.audio_dim = audio_dim
         self.audio_pairing_mode = audio_pairing_mode
+        self.enable_rag_summary_token = bool(enable_rag_summary_token)
+        self.rag_summary_dim = int(rag_summary_dim)
+        self.rag_summary_drop_prob = float(rag_summary_drop_prob)
+        if self.enable_rag_summary_token and self.accelerator.is_main_process:
+            print(
+                f"🧩 RAG Summary Token enabled: dim={self.rag_summary_dim}, "
+                f"drop_prob={self.rag_summary_drop_prob}"
+            )
 
         if audio_pairing_mode != "paired" and mmr_loss_weight > 0:
             print(
@@ -191,6 +203,9 @@ class EDGE:
             use_gradient_checkpointing=gradient_checkpointing,
             use_sparse_attn=use_sparse_attn,
             sparse_attn_window=sparse_attn_window,
+            enable_rag_summary_token=enable_rag_summary_token,
+            rag_summary_dim=rag_summary_dim,
+            rag_summary_drop_prob=rag_summary_drop_prob,
         )
 
         self._apply_stage_freezing(model, train_stage, adapter_train_decoder=adapter_train_decoder)
@@ -350,11 +365,78 @@ class EDGE:
                 for line in summarize_adapt_report(adapt_report):
                     print(f"⚠️ {line}")
 
+    def _maybe_attach_rag_summary(self, x, cond, training=True):
+        """Attach cond['rag_summary']=[B,T,D] during training/validation."""
+        if not getattr(self, "enable_rag_summary_token", False):
+            return cond
+        if not isinstance(cond, dict):
+            cond = {"audio": cond}
+        if "rag_summary" in cond and torch.is_tensor(cond["rag_summary"]):
+            return cond
+        try:
+            cond["rag_summary"] = make_rag_summary_batch_from_motion(
+                x,
+                dim=getattr(self, "rag_summary_dim", 7),
+                drop_prob=getattr(self, "rag_summary_drop_prob", 0.0),
+                training=training,
+            )
+        except Exception as exc:
+            if self.accelerator.is_main_process:
+                print(f"⚠️ Failed to attach rag_summary; using zeros. reason={exc}")
+            seq_len = x.shape[1] if x.ndim == 3 and x.shape[-1] == self.repr_dim else x.shape[-1]
+            cond["rag_summary"] = torch.zeros(
+                (x.shape[0], seq_len, getattr(self, "rag_summary_dim", 7)),
+                device=x.device,
+                dtype=x.dtype,
+            )
+        return cond
+
     @staticmethod
     def _set_requires_grad(module, enabled):
-        for parameter in module.parameters():
-            parameter.requires_grad = enabled
-    
+        """Set requires_grad, while never freezing V9 RAG Summary Token modules.
+
+        This guard is intentionally placed at the lowest freeze utility so it
+        survives all train_stage policies. It fixes the case where stage2
+        freezes a parent module and accidentally leaves rag_summary_projection
+        at 0% trainable.
+        """
+        if module is None:
+            return
+
+        # Handle bare parameters.
+        if isinstance(module, torch.nn.Parameter):
+            module.requires_grad = enabled
+            return
+
+        # Normal recursive freeze/unfreeze.
+        if hasattr(module, "parameters"):
+            for param in module.parameters():
+                param.requires_grad = enabled
+
+        # V9-RST never-freeze guard.
+        # If a parent module contains the RAG Summary Token branch, keep it trainable
+        # even when the parent is being frozen by stage2.
+        if not enabled:
+            _rst_names = ["rag_summary_projection", "null_rag_summary_embed", "rag_type_embed"]
+            _rst_roots = []
+            if hasattr(module, "modules"):
+                _rst_roots.append(module)
+            _wrapped = getattr(module, "module", None)
+            if _wrapped is not None and hasattr(_wrapped, "modules"):
+                _rst_roots.append(_wrapped)
+
+            for _root in _rst_roots:
+                for _mod in _root.modules():
+                    for _name in _rst_names:
+                        _obj = getattr(_mod, _name, None)
+                        if _obj is None:
+                            continue
+                        if isinstance(_obj, torch.nn.Parameter):
+                            _obj.requires_grad = True
+                        elif hasattr(_obj, "parameters"):
+                            for _p in _obj.parameters():
+                                _p.requires_grad = True
+
     @staticmethod
     def _check_audio_checkpoint_compatibility(
         adapt_report,
@@ -465,6 +547,15 @@ class EDGE:
                 self._set_requires_grad(model.trajectory_projection, True)
             if hasattr(model, "traj_modulate"):
                 self._set_requires_grad(model.traj_modulate, True)
+            for _rag_name in ["rag_summary_projection", "null_rag_summary_embed", "rag_type_embed"]:
+                _rag_module = getattr(model, _rag_name, None)
+                if _rag_module is None:
+                    continue
+                if isinstance(_rag_module, torch.nn.Parameter):
+                    _rag_module.requires_grad = True
+                else:
+                    self._set_requires_grad(_rag_module, True)
+
 
             print(
                 "🧩 train_stage=stage1: frozen audio condition encoder; "
@@ -507,6 +598,9 @@ class EDGE:
                 "root_generator",
                 "energy_embed",
                 "null_energy_embed",
+                "rag_summary_projection",
+                "null_rag_summary_embed",
+                "rag_type_embed",
             ]
 
             for name in train_names:
@@ -579,6 +673,7 @@ class EDGE:
                 x, cond, _, _ = batch
                 x = x.to(self.accelerator.device)
                 cond = move_condition_to_device(cond, self.accelerator.device)
+                cond = self._maybe_attach_rag_summary(x, cond, training=False)
 
                 # Make validation more reproducible across epochs/runs.
                 # This does not remove stochastic diffusion training, but fixes validation-time masks/timesteps.
@@ -727,6 +822,9 @@ class EDGE:
             print(f"  trajectory_condition_enabled={use_traj_cond}")
             print(f"  keyframe_condition_prob={getattr(opt, 'keyframe_condition_prob', 0.0)}")
             print(f"  keyframe_loss_weight={getattr(opt, 'keyframe_loss_weight', 0.0)}")
+            print(f"  rag_summary_token_enabled={getattr(opt, 'enable_rag_summary_token', False)}")
+            print(f"  rag_summary_dim={getattr(opt, 'rag_summary_dim', 7)}")
+            print(f"  rag_summary_drop_prob={getattr(opt, 'rag_summary_drop_prob', 0.15)}")
 
             if getattr(opt, "audio_pairing_mode", "proxy") != "paired" and getattr(opt, "mmr_loss_weight", 0.0) > 0:
                 print(
@@ -802,6 +900,7 @@ class EDGE:
                 
                 x = x.to(self.accelerator.device)
                 cond = move_condition_to_device(cond, self.accelerator.device)
+                cond = self._maybe_attach_rag_summary(x, cond, training=True)
                 
                 with self.accelerator.accumulate(self.model):
                     loss, losses = self.diffusion(x, cond, current_epoch=epoch)

@@ -1,8 +1,4 @@
-"""Repository-wide runtime patches.
-
-Python imports sitecustomize automatically when this repository root is on
-PYTHONPATH / current working directory.  Keep this file tiny and robust.
-"""
+"""Repository-wide runtime patches."""
 
 try:
     from trajectory_native_control import install_native_trajectory_control_patch
@@ -15,3 +11,9 @@ try:
     install_edge_safety_patch(verbose=True)
 except Exception as exc:
     print(f"⚠️ EDGE safety patch not installed: {exc}")
+
+try:
+    from v9_rag_inference_patch import install_v9_rag_inference_patch
+    install_v9_rag_inference_patch(verbose=True)
+except Exception as exc:
+    print(f"⚠️ V9 RAG inference patch not installed: {exc}")
