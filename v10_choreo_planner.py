@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""
-V10 Choreo Planning utilities for EDGE.
+"""V10 Choreo Planning utilities for EDGE.
+
+This replacement keeps the original V10 behavior but fixes three issues:
+
+1. Step4 auto_multiunit with count=3 no longer depends on a two-frame default.
+2. Unit selection now includes start/end transition compatibility when the
+   wrapper passes --start_pose / --end_pose.
+3. Plans expose unit_paths so V9 RAG Summary Token can be attached at inference.
 
 Environment-controlled planning:
 - EDGE_V10_MODE=dual_auto_mid | manual_multiunit | upperdance_rag | auto_multiunit
-- EDGE_V10_MID_FRAMES=50,100
+- EDGE_V10_MID_FRAMES=50,100 or 40,75,110
 - EDGE_V10_AUTO_MID_COUNT=2 or 3
 - EDGE_V10_RAG_DB=/path/to/rag.npz
 - EDGE_V10_MANUAL_MID_POSES=/path/mid1.npy,/path/mid2.npy
-
-Important compatibility:
-- This version writes both V10-native fields:
-    items, mid_poses, mid_pose_frames, unit_paths
-  and legacy diagnostic fields:
-    keyframes
-- planner_edit_loop.py expects plan["keyframes"], so every V10 plan now
-  directly reports transition_jerk/contact_phase_break without manual conversion.
 """
 
 from __future__ import annotations
@@ -33,9 +31,10 @@ ROOT_XZ_IDX = [4, 6]
 ROT_START = 7
 N_JOINTS = 24
 ROT_DIM = 6
+ROT_SLICE = slice(7, 151)
 
-# Coarse SMPL-like joint groups.  The exact semantic mapping is imperfect, but
-# this is consistent with the existing EDGE 151D representation and diagnostic usage.
+# Coarse SMPL-like joint groups. The exact semantic mapping is imperfect, but
+# this is consistent with the existing EDGE 151D representation.
 UPPER_JOINTS = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 LOWER_JOINTS = [1, 2, 4, 5, 7, 8, 10, 11]
 
@@ -111,6 +110,33 @@ def as_unit_t151(arr: np.ndarray) -> np.ndarray:
     raise ValueError(f"Expected one dim to be 151, got {arr.shape}")
 
 
+def load_151_pose(path: str) -> Optional[np.ndarray]:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+
+    arr = np.load(str(p), allow_pickle=True)
+    if arr.ndim == 0 and isinstance(arr.item(), dict):
+        d = arr.item()
+        if "motion" in d:
+            arr = d["motion"]
+        elif "pose" in d:
+            arr = d["pose"]
+
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        if arr.shape[-1] == 151:
+            return arr[0].astype(np.float32)
+        if arr.shape[0] == 151:
+            return arr[:, 0].astype(np.float32)
+    arr = arr.reshape(-1)
+    if arr.shape[0] != 151:
+        raise ValueError(f"Expected 151D pose: {path}, got {arr.shape}")
+    return arr.astype(np.float32)
+
+
 def rot_view(unit: np.ndarray) -> np.ndarray:
     unit = as_unit_t151(unit)
     rot = unit[:, ROT_START : ROT_START + N_JOINTS * ROT_DIM]
@@ -126,6 +152,21 @@ def mean_abs_velocity(x: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(np.diff(x, axis=0), axis=-1)))
 
 
+def pose_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+    if a is None or b is None:
+        return 0.0
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    if a.shape[0] != 151 or b.shape[0] != 151:
+        return 0.0
+
+    # Rotations dominate transition jerk; root X/Z is externally controlled.
+    rot = float(np.sqrt(np.mean((a[ROT_SLICE] - b[ROT_SLICE]) ** 2)))
+    root_y = float(abs(a[5] - b[5]))
+    contact = float(np.mean(np.abs(a[CONTACT_SLICE] - b[CONTACT_SLICE])))
+    return rot + 0.20 * root_y + 0.10 * contact
+
+
 @dataclass
 class UnitScore:
     index: int
@@ -138,6 +179,9 @@ class UnitScore:
     pose_diversity: float
     contact_change: float
     source_key: str
+    entry_cost: float = 0.0
+    exit_cost: float = 0.0
+    transition_score: float = 0.0
 
 
 def score_unit(unit: np.ndarray, index: int = -1, source_key: str = "") -> UnitScore:
@@ -154,9 +198,7 @@ def score_unit(unit: np.ndarray, index: int = -1, source_key: str = "") -> UnitS
 
     if len(rot) > 1:
         center = rot.mean(axis=0, keepdims=True)
-        pose_diversity = float(
-            np.mean(np.linalg.norm((rot - center).reshape(rot.shape[0], -1), axis=-1))
-        )
+        pose_diversity = float(np.mean(np.linalg.norm((rot - center).reshape(rot.shape[0], -1), axis=-1)))
     else:
         pose_diversity = 0.0
 
@@ -170,13 +212,12 @@ def score_unit(unit: np.ndarray, index: int = -1, source_key: str = "") -> UnitS
     contact = unit[:, CONTACT_SLICE]
     contact_change = float(np.mean(np.abs(np.diff(contact, axis=0)))) if len(unit) > 1 else 0.0
 
-    # Upper-body-dominant dance score.
     score = (
         env_float("EDGE_V10_SCORE_UPPER_W", 0.45) * upper_activity
-        + env_float("EDGE_V10_SCORE_TURN_W", 0.20) * turning
+        + env_float("EDGE_V10_SCORE_TURN_W", 0.15) * turning
         + env_float("EDGE_V10_SCORE_DIVERSITY_W", 0.20) * pose_diversity
-        - env_float("EDGE_V10_SCORE_CONTACT_W", 0.05) * contact_change
-        - env_float("EDGE_V10_SCORE_ROOT_PENALTY_W", 0.15) * root_speed
+        - env_float("EDGE_V10_SCORE_CONTACT_W", 0.08) * contact_change
+        - env_float("EDGE_V10_SCORE_ROOT_PENALTY_W", 0.12) * root_speed
         - env_float("EDGE_V10_SCORE_LOWER_PENALTY_W", 0.05) * max(0.0, lower_activity - upper_activity)
     )
 
@@ -252,59 +293,98 @@ def load_units_from_npz(
     return units, meta
 
 
+def _with_transition_score(
+    base: UnitScore,
+    unit: np.ndarray,
+    prev_pose: Optional[np.ndarray],
+    end_pose: Optional[np.ndarray],
+    is_last: bool,
+) -> UnitScore:
+    entry_cost = pose_distance(prev_pose, unit[0] if len(unit) else None)
+    exit_cost = pose_distance(unit[-1] if len(unit) else None, end_pose)
+    entry_w = env_float("EDGE_V10_ENTRY_COMPAT_W", 0.35)
+    exit_w = env_float("EDGE_V10_EXIT_COMPAT_W", 0.30 if is_last else 0.10)
+
+    s = UnitScore(**asdict(base))
+    s.entry_cost = float(entry_cost)
+    s.exit_cost = float(exit_cost)
+    s.transition_score = float(base.score - entry_w * entry_cost - exit_w * exit_cost)
+    return s
+
+
 def choose_diverse_units(
     units: Sequence[np.ndarray],
     meta: Sequence[Dict[str, Any]],
     count: int,
+    start_pose: Optional[np.ndarray] = None,
+    end_pose: Optional[np.ndarray] = None,
 ) -> Tuple[List[int], List[UnitScore]]:
-    scored = []
     min_upper = env_float("EDGE_V10_MIN_UPPER_ACTIVITY", 0.0)
     max_root = env_float("EDGE_V10_MAX_ROOT_SPEED", 999.0)
+    candidate_cap = env_int("EDGE_V10_CANDIDATE_CAP", 600)
 
+    base_scores = []
     for i, unit in enumerate(units):
         s = score_unit(unit, index=i, source_key=str(meta[i].get("source_key", "")))
         if s.upper_activity >= min_upper and s.root_speed <= max_root:
-            scored.append(s)
+            base_scores.append(s)
 
-    if not scored:
-        scored = [
+    if not base_scores:
+        base_scores = [
             score_unit(unit, index=i, source_key=str(meta[i].get("source_key", "")))
             for i, unit in enumerate(units)
         ]
 
-    scored = sorted(scored, key=lambda x: x.score, reverse=True)
+    base_scores = sorted(base_scores, key=lambda x: x.score, reverse=True)[:max(candidate_cap, count * 10)]
 
     selected: List[UnitScore] = []
     selected_indices: List[int] = []
-    min_score_gap = env_float("EDGE_V10_MIN_SCORE_GAP", 0.0)
+    used_sources: set[str] = set()
+    prev_pose = start_pose
 
-    for s in scored:
-        too_similar = False
-        for prev in selected:
-            if (
-                abs(s.upper_activity - prev.upper_activity) < min_score_gap
-                and abs(s.turning - prev.turning) < min_score_gap
-            ):
-                too_similar = True
-                break
+    for slot in range(count):
+        scored_slot: List[UnitScore] = []
+        is_last = slot == count - 1
+        for base in base_scores:
+            if base.index in selected_indices:
+                continue
 
-        if too_similar and len(scored) > count:
-            continue
+            source_penalty = 0.0
+            if base.source_key in used_sources:
+                source_penalty = env_float("EDGE_V10_SAME_SOURCE_PENALTY", 0.03)
 
-        selected.append(s)
-        selected_indices.append(s.index)
+            s = _with_transition_score(
+                base=base,
+                unit=units[base.index],
+                prev_pose=prev_pose,
+                end_pose=end_pose,
+                is_last=is_last,
+            )
+            s.transition_score -= source_penalty
+            scored_slot.append(s)
 
-        if len(selected) >= count:
+        if not scored_slot:
             break
+
+        scored_slot = sorted(scored_slot, key=lambda x: x.transition_score, reverse=True)
+        best = scored_slot[0]
+
+        selected.append(best)
+        selected_indices.append(best.index)
+        used_sources.add(best.source_key)
+        prev_pose = units[best.index][-1] if len(units[best.index]) else prev_pose
 
     return selected_indices[:count], selected[:count]
 
 
 def _score_parts_from_score(score: UnitScore) -> Dict[str, float | str]:
     return {
-        "phase": "v10_upperdance",
+        "phase": "v10_upperdance_transition_aware",
         "expressiveness_score": float(score.upper_activity),
         "motion_energy_norm": float(score.score),
+        "transition_score": float(score.transition_score),
+        "entry_cost": float(score.entry_cost),
+        "exit_cost": float(score.exit_cost),
         "upper_activity": float(score.upper_activity),
         "lower_activity": float(score.lower_activity),
         "root_speed": float(score.root_speed),
@@ -320,12 +400,15 @@ def _keyframe_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
     score = item.get("score", {}) or {}
     if isinstance(score, UnitScore):
         score_parts = _score_parts_from_score(score)
-        score_value = float(score.score)
+        score_value = float(score.transition_score)
     elif isinstance(score, dict):
         score_parts = {
-            "phase": item.get("phase", "v10_upperdance"),
+            "phase": item.get("phase", "v10_upperdance_transition_aware"),
             "expressiveness_score": float(score.get("upper_activity", score.get("expressiveness_score", 0.0))),
             "motion_energy_norm": float(score.get("score", score.get("motion_energy_norm", 0.0))),
+            "transition_score": float(score.get("transition_score", score.get("score", 0.0))),
+            "entry_cost": float(score.get("entry_cost", 0.0)),
+            "exit_cost": float(score.get("exit_cost", 0.0)),
             "upper_activity": float(score.get("upper_activity", 0.0)),
             "lower_activity": float(score.get("lower_activity", 0.0)),
             "root_speed": float(score.get("root_speed", 0.0)),
@@ -335,7 +418,7 @@ def _keyframe_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
             "contact_change": float(score.get("contact_change", 0.0)),
             "source_key": str(score.get("source_key", item.get("source_key", ""))),
         }
-        score_value = float(score.get("score", 0.0))
+        score_value = float(score_parts["transition_score"])
     else:
         score_parts = {"phase": item.get("phase", "v10_manual")}
         score_value = 0.0
@@ -374,7 +457,6 @@ def save_unit_mid_assets(
     for k, (unit, score, frame) in enumerate(zip(units, scores, frames), start=1):
         unit = as_unit_t151(unit)
 
-        # Use the center pose of the retrieved unit as the explicit mid pose.
         mid_idx = int(round((len(unit) - 1) / 2))
         pose = unit[mid_idx].astype(np.float32)
 
@@ -392,7 +474,7 @@ def save_unit_mid_assets(
             {
                 "rank": k,
                 "frame": int(frame),
-                "phase": "v10_upperdance",
+                "phase": "v10_upperdance_transition_aware",
                 "pose_path": str(pose_path),
                 "unit_path": str(unit_path),
                 "source_key": score.source_key,
@@ -401,7 +483,7 @@ def save_unit_mid_assets(
         )
 
     plan: Dict[str, Any] = {
-        "mode": "upperdance_rag",
+        "mode": "upperdance_transition_aware_rag",
         "mid_poses": mid_paths,
         "mid_pose_frames": [int(f) for f in frames],
         "unit_paths": unit_paths,
@@ -424,12 +506,24 @@ def plan_upperdance_from_rag_db(
     num_frames: int = 150,
     count: int = 2,
     frames: Optional[Sequence[int]] = None,
+    start_pose_path: str = "",
+    end_pose_path: str = "",
 ) -> Dict[str, Any]:
     units, meta = load_units_from_npz(
         rag_db,
         max_units=env_int("EDGE_V10_MAX_RAG_UNITS", 20000),
     )
-    selected_indices, selected_scores = choose_diverse_units(units, meta, count=count)
+
+    start_pose = load_151_pose(start_pose_path)
+    end_pose = load_151_pose(end_pose_path)
+
+    selected_indices, selected_scores = choose_diverse_units(
+        units,
+        meta,
+        count=count,
+        start_pose=start_pose,
+        end_pose=end_pose,
+    )
     selected_units = [units[i] for i in selected_indices]
 
     if frames is None:
@@ -440,9 +534,12 @@ def plan_upperdance_from_rag_db(
 
     plan = save_unit_mid_assets(selected_units, selected_scores, frames, out_prefix)
     plan["rag_db"] = str(rag_db)
-    plan["mode"] = "upperdance_rag"
+    plan["mode"] = "upperdance_transition_aware_rag"
+    plan["start_pose_path"] = str(start_pose_path or "")
+    plan["end_pose_path"] = str(end_pose_path or "")
+    plan["transition_aware"] = True
+    plan["v9_rag_summary_unit_paths"] = list(plan.get("unit_paths", []))
 
-    # Rewrite with final mode/rag_db included.
     plan_path = Path(plan["plan_path"])
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(plan, f, ensure_ascii=False, indent=2)
@@ -480,6 +577,9 @@ def plan_manual_from_env(
             "source_key": "manual",
             "score": {
                 "score": 0.0,
+                "transition_score": 0.0,
+                "entry_cost": 0.0,
+                "exit_cost": 0.0,
                 "upper_activity": 0.0,
                 "lower_activity": 0.0,
                 "root_speed": 0.0,
