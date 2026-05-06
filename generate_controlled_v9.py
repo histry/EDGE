@@ -9,9 +9,6 @@ Why this wrapper is needed:
   the V9 checkpoint's rag_summary_projection weights are ignored at load time.
 - This wrapper installs the V9 RAG inference patch first, then executes
   generate_controlled.py as __main__.
-
-Usage:
-    python generate_controlled_v9.py [same args as generate_controlled.py]
 """
 
 from __future__ import annotations
@@ -25,17 +22,15 @@ from pathlib import Path
 def main() -> int:
     repo_root = Path(__file__).resolve().parent
     os.chdir(repo_root)
-
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    # Default-on for V10 wrapper runs.  Plain generate_controlled.py is unchanged.
     os.environ.setdefault("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "1")
     os.environ.setdefault("EDGE_RAG_SUMMARY_DIM", "7")
     os.environ.setdefault("EDGE_RAG_SUMMARY_BLEND_RADIUS", "18")
+    os.environ.setdefault("EDGE_RAG_SUMMARY_MODE", "mean")
 
     from v9_rag_inference_patch import install_v9_rag_inference_patch
-
     install_v9_rag_inference_patch(verbose=True)
 
     target = repo_root / "generate_controlled.py"

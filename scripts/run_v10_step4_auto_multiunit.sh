@@ -20,28 +20,24 @@ export EDGE_UNIT_PRIOR_LOW_FREQ_K="${EDGE_UNIT_PRIOR_LOW_FREQ_K:-4}"
 export EDGE_UNIT_PRIOR_FEATURES="${EDGE_UNIT_PRIOR_FEATURES:-upper}"
 export EDGE_UNIT_PRIOR_STRENGTH="${EDGE_UNIT_PRIOR_STRENGTH:-0.012}"
 export EDGE_UNIT_PRIOR_MAX_LEN="${EDGE_UNIT_PRIOR_MAX_LEN:-45}"
-export EDGE_TEXT_BRIDGE_MODEL="${EDGE_TEXT_BRIDGE_MODEL:-BAAI/bge-small-zh-v1.5}"
-export EDGE_TEXT_BRIDGE_DEVICE="${EDGE_TEXT_BRIDGE_DEVICE:-cuda}"
-export EDGE_TEXT_BRIDGE_WEIGHT="${EDGE_TEXT_BRIDGE_WEIGHT:-0.60}"
-export EDGE_TENSION_AWARE_PLANNER="${EDGE_TENSION_AWARE_PLANNER:-1}"
-
-# V9 RAG Summary Token inference bridge.
 export EDGE_ENABLE_RAG_SUMMARY_TOKEN="${EDGE_ENABLE_RAG_SUMMARY_TOKEN:-1}"
 export EDGE_RAG_SUMMARY_DIM="${EDGE_RAG_SUMMARY_DIM:-7}"
 export EDGE_RAG_SUMMARY_BLEND_RADIUS="${EDGE_RAG_SUMMARY_BLEND_RADIUS:-18}"
-
+export EDGE_RAG_SUMMARY_MODE="${EDGE_RAG_SUMMARY_MODE:-mean}"
 mkdir -p output/v10_eval
+
 export EDGE_V10_MODE=auto_multiunit
-export EDGE_V10_AUTO_MID_COUNT="${EDGE_V10_AUTO_MID_COUNT:-3}"
-
-# Fixed: auto_multiunit count=3 needs three frames. The previous default "50,100"
-# caused parse_frames(count=3) to fail.
 export EDGE_V10_MID_FRAMES="${EDGE_V10_MID_FRAMES:-40,75,110}"
-
-# Gentle by default. Increase only after transition jerk is under control.
+export EDGE_V10_SEARCH_METHOD="${EDGE_V10_SEARCH_METHOD:-beam}"
+export EDGE_V10_TOP_K="${EDGE_V10_TOP_K:-64}"
+export EDGE_V10_BEAM_WIDTH="${EDGE_V10_BEAM_WIDTH:-8}"
+export EDGE_V10_TRANS_POSE_W="${EDGE_V10_TRANS_POSE_W:-0.35}"
+export EDGE_V10_TRANS_CONTACT_W="${EDGE_V10_TRANS_CONTACT_W:-0.10}"
+export EDGE_V10_TRANS_ROOT_W="${EDGE_V10_TRANS_ROOT_W:-0.05}"
 export EDGE_V10_MID_STRENGTH="${EDGE_V10_MID_STRENGTH:-0.035}"
 export EDGE_V10_KEYFRAME_WIDTH="${EDGE_V10_KEYFRAME_WIDTH:-0}"
 export EDGE_V10_OUT_PREFIX="output/v10_eval/v10_step4_auto_multiunit_wu2"
+export OUT_PATH="output/v10_eval/v10_step4_auto_multiunit_wu2.npy"
 
 python generate_v10_choreo.py \
   --checkpoint "$CHECKPOINT" \
@@ -55,4 +51,4 @@ python generate_v10_choreo.py \
   --mid_keyframe_strength "$EDGE_V10_MID_STRENGTH" \
   --infer_keyframe_width "$EDGE_V10_KEYFRAME_WIDTH" \
   --no_tto \
-  --out output/v10_eval/v10_step4_auto_multiunit_wu2.npy
+  --out "$OUT_PATH"

@@ -1,12 +1,4 @@
-"""Repository-wide runtime patches.
-
-Python imports sitecustomize automatically when this repository root is on
-PYTHONPATH / current working directory. Keep this file tiny and robust.
-
-generate_controlled_v9.py is the reliable V9/V10 entrypoint because it installs
-the V9 patch before generate_controlled.py imports EDGE.  This file still tries
-to install the same patch for interactive/local runs.
-"""
+"""Repository-wide runtime patches."""
 
 try:
     from trajectory_native_control import install_native_trajectory_control_patch
