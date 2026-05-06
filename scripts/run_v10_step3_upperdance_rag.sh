@@ -20,11 +20,19 @@ export EDGE_UNIT_PRIOR_LOW_FREQ_K="${EDGE_UNIT_PRIOR_LOW_FREQ_K:-4}"
 export EDGE_UNIT_PRIOR_FEATURES="${EDGE_UNIT_PRIOR_FEATURES:-upper}"
 export EDGE_UNIT_PRIOR_STRENGTH="${EDGE_UNIT_PRIOR_STRENGTH:-0.012}"
 export EDGE_UNIT_PRIOR_MAX_LEN="${EDGE_UNIT_PRIOR_MAX_LEN:-45}"
+
+# V9 RAG Summary Token inference bridge.
 export EDGE_ENABLE_RAG_SUMMARY_TOKEN="${EDGE_ENABLE_RAG_SUMMARY_TOKEN:-1}"
 export EDGE_RAG_SUMMARY_DIM="${EDGE_RAG_SUMMARY_DIM:-7}"
 export EDGE_RAG_SUMMARY_BLEND_RADIUS="${EDGE_RAG_SUMMARY_BLEND_RADIUS:-18}"
 export EDGE_RAG_SUMMARY_MODE="${EDGE_RAG_SUMMARY_MODE:-mean}"
+
 mkdir -p output/v10_eval
+
+# Step 3 is auto mode.  Clear Step2 manual controls so exported shell vars do not leak.
+unset EDGE_V10_MANUAL_UNITS
+unset EDGE_V10_MANUAL_MID_POSES
+unset EDGE_V10_MANUAL_MID_FRAMES
 
 export EDGE_V10_MODE=upperdance_rag
 export EDGE_V10_MID_FRAMES="${EDGE_V10_MID_FRAMES:-50,100}"
@@ -37,8 +45,8 @@ export EDGE_V10_SCORE_DIVERSITY_W="${EDGE_V10_SCORE_DIVERSITY_W:-0.20}"
 export EDGE_V10_SCORE_ROOT_PENALTY_W="${EDGE_V10_SCORE_ROOT_PENALTY_W:-0.10}"
 export EDGE_V10_MID_STRENGTH="${EDGE_V10_MID_STRENGTH:-0.035}"
 export EDGE_V10_KEYFRAME_WIDTH="${EDGE_V10_KEYFRAME_WIDTH:-0}"
-export EDGE_V10_OUT_PREFIX="output/v10_eval/v10_step3_upperdance_wu2"
-export OUT_PATH="output/v10_eval/v10_step3_upperdance_wu2.npy"
+export EDGE_V10_OUT_PREFIX="${EDGE_V10_OUT_PREFIX:-output/v10_eval/v10_step3_upperdance_wu2}"
+export OUT_PATH="${OUT_PATH:-${EDGE_V10_OUT_PREFIX}.npy}"
 
 python generate_v10_choreo.py \
   --checkpoint "$CHECKPOINT" \

@@ -20,12 +20,23 @@ export EDGE_UNIT_PRIOR_LOW_FREQ_K="${EDGE_UNIT_PRIOR_LOW_FREQ_K:-4}"
 export EDGE_UNIT_PRIOR_FEATURES="${EDGE_UNIT_PRIOR_FEATURES:-upper}"
 export EDGE_UNIT_PRIOR_STRENGTH="${EDGE_UNIT_PRIOR_STRENGTH:-0.012}"
 export EDGE_UNIT_PRIOR_MAX_LEN="${EDGE_UNIT_PRIOR_MAX_LEN:-45}"
+
+# V9 RAG Summary Token inference bridge.
 export EDGE_ENABLE_RAG_SUMMARY_TOKEN="${EDGE_ENABLE_RAG_SUMMARY_TOKEN:-1}"
 export EDGE_RAG_SUMMARY_DIM="${EDGE_RAG_SUMMARY_DIM:-7}"
 export EDGE_RAG_SUMMARY_BLEND_RADIUS="${EDGE_RAG_SUMMARY_BLEND_RADIUS:-18}"
 export EDGE_RAG_SUMMARY_MODE="${EDGE_RAG_SUMMARY_MODE:-mean}"
+
 mkdir -p output/v10_eval
 
+# Step 2: manual upper-bound test.
+# Preferred:
+#   export EDGE_V10_MANUAL_UNITS="1042,56"
+#   export EDGE_V10_MANUAL_UNITS="unit_1042,unit_0056"
+#   export EDGE_V10_MANUAL_UNITS="motions:1042,motions:56"
+#
+# Legacy fallback, not recommended for fair Manual-vs-Auto ablation:
+#   export EDGE_V10_MANUAL_MID_POSES="/path/mid1.npy,/path/mid2.npy"
 export EDGE_V10_MODE=manual_multiunit
 export EDGE_V10_MID_FRAMES="${EDGE_V10_MID_FRAMES:-${EDGE_V10_MANUAL_MID_FRAMES:-50,100}}"
 export EDGE_V10_SEARCH_METHOD="${EDGE_V10_SEARCH_METHOD:-manual}"
@@ -33,8 +44,9 @@ export EDGE_V10_TOP_K="${EDGE_V10_TOP_K:-64}"
 export EDGE_V10_BEAM_WIDTH="${EDGE_V10_BEAM_WIDTH:-8}"
 export EDGE_V10_MID_STRENGTH="${EDGE_V10_MID_STRENGTH:-0.035}"
 export EDGE_V10_KEYFRAME_WIDTH="${EDGE_V10_KEYFRAME_WIDTH:-0}"
-export EDGE_V10_OUT_PREFIX="output/v10_eval/v10_step2_manual_wu2"
-export OUT_PATH="output/v10_eval/v10_step2_manual_wu2.npy"
+export EDGE_V10_OUT_PREFIX="${EDGE_V10_OUT_PREFIX:-output/v10_eval/v10_step2_manual_wu2}"
+export OUT_PATH="${OUT_PATH:-${EDGE_V10_OUT_PREFIX}.npy}"
+
 if [ -z "${EDGE_V10_MANUAL_UNITS:-}" ] && [ -z "${EDGE_V10_MANUAL_MID_POSES:-}" ]; then
   echo "ERROR: set EDGE_V10_MANUAL_UNITS=\"1042,56\" or EDGE_V10_MANUAL_MID_POSES=/path/mid1.npy,/path/mid2.npy"
   exit 2
