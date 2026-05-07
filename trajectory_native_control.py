@@ -2,21 +2,22 @@
 
 Drop-in replacement for trajectory_native_control.py.
 
-This runtime patch keeps the main model implementation in model/model.py and
-patches GaussianDiffusion at import time for:
+Fix v2:
+- Fixes `_linear_warmup() got multiple values for argument 'start'`.
+- Cause: some repos define `_linear_warmup` like a static helper:
+      _linear_warmup(current_epoch, start=..., end=...)
+  while the previous runtime patch always called:
+      original_linear_warmup(self, *args, **kwargs)
+  This makes `current_epoch` become `self`, positional epoch become `start`,
+  and keyword `start=...` becomes a duplicate.
+- This version uses inspect.signature and a TypeError fallback to call the
+  original warmup either with or without `self`.
 
+This patch also keeps:
 1) warmup current_epoch fallback when validation does not pass current_epoch;
 2) Adam/Momentum TTO with local torch.enable_grad();
 3) explicit root-lower velocity matching loss for trajectory-controlled
    generation/training.
-
-Main V7 fix:
-- The previous explicit lower-body velocity loss called an undefined
-  maybe_unnormalize(), then swallowed the exception and returned 0.
-- This file defines _maybe_unnormalize_safe() locally and keeps the operation
-  differentiable for torch tensors.
-- The explicit loss now returns a raw loss. EDGE_EXPLICIT_LOWER_VEL_LOSS_WEIGHT
-  is applied exactly once in the patch wrapper.
 
 Environment knobs:
     EDGE_WARMUP_MISSING_EPOCH_POLICY=last|zero|one
@@ -38,6 +39,7 @@ Environment knobs:
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Optional
 
@@ -78,9 +80,6 @@ def _maybe_unnormalize_safe(normalizer, x: torch.Tensor) -> torch.Tensor:
 
     Important:
     - Do NOT detach/cpu torch tensors here. This loss must backpropagate.
-    - Current dataset.preprocess.Normalizer stores mean/std as numpy arrays and
-      its torch branch is differentiable. We implement the same logic locally to
-      avoid relying on a missing import.
     - On failure, return x so the loss is still computed in normalized space.
     """
     if normalizer is None:
@@ -155,6 +154,41 @@ def _replace_none_current_epoch(self, args, kwargs):
     if args[0] is None:
         args[0] = _fallback_epoch(self)
     return tuple(args), kwargs
+
+
+def _call_original_warmup(original, self, args, kwargs):
+    """Call original _linear_warmup robustly.
+
+    EDGE variants differ:
+    - instance method: original(self, current_epoch, start=..., end=...)
+    - static-style helper: original(current_epoch, start=..., end=...)
+
+    The old patch always passed self, which crashed with:
+        TypeError: _linear_warmup() got multiple values for argument 'start'
+    """
+    expects_self = True
+    try:
+        params = list(inspect.signature(original).parameters.values())
+        if params:
+            first = params[0].name
+            expects_self = first in {"self", "cls"}
+        else:
+            expects_self = False
+    except Exception:
+        expects_self = True
+
+    try:
+        if expects_self:
+            return original(self, *args, **kwargs)
+        return original(*args, **kwargs)
+    except TypeError as exc:
+        message = str(exc)
+        if "multiple values for argument" in message or "positional argument" in message:
+            # Fallback to the opposite calling convention.
+            if expects_self:
+                return original(*args, **kwargs)
+            return original(self, *args, **kwargs)
+        raise
 
 
 def _trajectory_target(cond, x_start):
@@ -298,10 +332,6 @@ def _edge_explicit_lower_velocity_loss(diffusion, model_motion_x0, target_motion
 
     Returns an unweighted scalar loss. The environment weight is applied exactly
     once in patched_kinematic_sync_loss().
-
-    The loss encourages visible lower-body relative motion when root X/Z speed
-    is above a threshold. This targets the failure mode: pelvis/root follows the
-    commanded trajectory while legs remain visually under-active.
     """
     enabled_weight = _env_float("EDGE_EXPLICIT_LOWER_VEL_LOSS_WEIGHT", 0.0)
     if enabled_weight <= 0.0:
@@ -439,13 +469,14 @@ def install_native_trajectory_control_patch(verbose=True):
         GaussianDiffusion.p_losses = patched_p_losses
         GaussianDiffusion._edge_original_p_losses = original_p_losses
 
-    # Fix warmup when current_epoch is None.
+    # Fix warmup when current_epoch is None, and support both static-style and
+    # instance-method _linear_warmup implementations.
     if hasattr(GaussianDiffusion, "_linear_warmup"):
         original_linear_warmup = GaussianDiffusion._linear_warmup
 
         def patched_linear_warmup(self, *args, **kwargs):
             args, kwargs = _replace_none_current_epoch(self, args, kwargs)
-            return original_linear_warmup(self, *args, **kwargs)
+            return _call_original_warmup(original_linear_warmup, self, args, kwargs)
 
         GaussianDiffusion._linear_warmup = patched_linear_warmup
         GaussianDiffusion._edge_original_linear_warmup = original_linear_warmup
@@ -497,8 +528,9 @@ def install_native_trajectory_control_patch(verbose=True):
 
     if verbose:
         print(
-            "✅ Installed EDGE runtime safety patch: "
-            "warmup-current_epoch fallback + Adam/Momentum TTO + explicit lower velocity."
+            "✅ Installed EDGE runtime safety patch v2: "
+            "warmup-current_epoch fallback + static/instance warmup guard + "
+            "Adam/Momentum TTO + explicit lower velocity."
         )
     return True
 

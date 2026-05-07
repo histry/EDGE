@@ -1,13 +1,58 @@
-try:
-    from trajectory_native_control import install_native_trajectory_control_patch
-    install_native_trajectory_control_patch(verbose=True)
-except Exception as exc:
-    print(f"⚠️ native trajectory patch not installed: {exc}")
+# V10-safe runtime patches MUST be installed before importing EDGE / DanceDecoder.
+# This fixes V10 inference where rag_summary_projection and text_context_* keys
+# were previously ignored during checkpoint loading.
+
+import os
+
+def _env_default(name: str, value: str):
+    os.environ.setdefault(name, value)
+
+
+# ===== V9/V10 inference feature flags =====
+_env_default("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "1")
+_env_default("EDGE_ENABLE_TEXT_CONTEXT_RAG", "1")
+_env_default("EDGE_TEXT_CONTEXT_DIM", "512")
+_env_default("EDGE_TEXT_CONTEXT_MAX_POSE_TOKENS", "64")
+_env_default("EDGE_RAG_CONTEXT_MAX_LEN", "45")
+_env_default("EDGE_TEXT_CONTEXT_DROP_PROB", "0.0")
+_env_default("EDGE_TRAJECTORY_REP", "relative_abs_vel")
+_env_default("EDGE_TEXT_CONTEXT_DEBUG", "0")
+
+
+def _install_runtime_patches():
+    patch_specs = [
+        ("trajectory_native_control", "install_native_trajectory_control_patch"),
+        ("edge_safety_patch", "install_edge_safety_patch"),
+        ("v9_rag_inference_patch", "install_v9_rag_inference_patch"),
+        ("edge_full_landing_patch", "install_full_landing_patch"),
+        ("text_context_rag_model_patch", "install_text_context_rag_model_patch"),
+        ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
+        ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
+    ]
+
+    # render patch is useful when this script later renders / saves visual assets.
+    try:
+        patch_specs.append(("render_contact_fix_patch", "install_render_contact_fix_patch"))
+    except Exception:
+        pass
+
+    for module_name, fn_name in patch_specs:
+        try:
+            module = __import__(module_name, fromlist=[fn_name])
+            install_fn = getattr(module, fn_name)
+            try:
+                install_fn(verbose=True)
+            except TypeError:
+                install_fn()
+        except Exception as exc:
+            print(f"⚠️ {module_name}.{fn_name} not installed: {exc}")
+
+
+_install_runtime_patches()
 
 import argparse
 import inspect
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +70,7 @@ try:
 except Exception:
     spi = None
 
+# IMPORTANT: EDGE must be imported only after all patches above are installed.
 from EDGE import EDGE
 
 try:

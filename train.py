@@ -1,5 +1,46 @@
+# Runtime patches MUST be installed before importing EDGE / DanceDecoder.
+# Drop-in replacement for train.py.
+
+def _install_runtime_patches():
+    patch_specs = [
+        ("trajectory_native_control", "install_native_trajectory_control_patch"),
+        ("edge_safety_patch", "install_edge_safety_patch"),
+        ("v9_rag_inference_patch", "install_v9_rag_inference_patch"),
+        ("edge_full_landing_patch", "install_full_landing_patch"),
+        ("text_context_rag_model_patch", "install_text_context_rag_model_patch"),
+        ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
+        ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
+    ]
+
+    for module_name, fn_name in patch_specs:
+        try:
+            module = __import__(module_name, fromlist=[fn_name])
+            install_fn = getattr(module, fn_name)
+            try:
+                install_fn(verbose=True)
+            except TypeError:
+                install_fn()
+        except Exception as exc:
+            print(f"⚠️ {module_name}.{fn_name} not installed: {exc}")
+
+
+_install_runtime_patches()
+
 from args import parse_train_opt
 from EDGE import EDGE
+
+# These two fixes can be installed only after EDGE/model.diffusion are importable.
+try:
+    from edge_text_context_training_fix import install_edge_text_context_training_fix
+    install_edge_text_context_training_fix(EDGE, verbose=True)
+except Exception as exc:
+    print(f"⚠️ edge_text_context_training_fix not installed: {exc}")
+
+try:
+    from render_contact_fix_patch import install_render_contact_fix_patch
+    install_render_contact_fix_patch(verbose=True)
+except Exception as exc:
+    print(f"⚠️ render_contact_fix_patch not installed: {exc}")
 
 
 def train(opt):
