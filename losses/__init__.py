@@ -1,1 +1,1 @@
-from .mmr_loss import symmetric_infonce_loss, retrieval_metrics
+"""Loss helpers for EDGE next-generation physical objectives."""

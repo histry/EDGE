@@ -29,7 +29,8 @@ _install_runtime_patches()
 from args import parse_train_opt
 from EDGE import EDGE
 
-# These two fixes can be installed only after EDGE/model.diffusion are importable.
+# These fixes can be installed after EDGE/model.diffusion are importable but
+# before EDGE(...) constructs DanceDecoder/GaussianDiffusion instances.
 try:
     from edge_text_context_training_fix import install_edge_text_context_training_fix
     install_edge_text_context_training_fix(EDGE, verbose=True)
@@ -41,6 +42,16 @@ try:
     install_render_contact_fix_patch(verbose=True)
 except Exception as exc:
     print(f"⚠️ render_contact_fix_patch not installed: {exc}")
+
+# Next-generation experimental patches:
+# - EDGE_DIFF_CONTACT_LOSS=1
+# - EDGE_BEAT_GUIDANCE=1
+# - EDGE_V11_CROSS_ATTN_RAG=1
+try:
+    from edge_nextgen_runtime_patch import install_nextgen_runtime_patches
+    install_nextgen_runtime_patches(verbose=True)
+except Exception as exc:
+    print(f"⚠️ EDGE nextgen runtime patches not installed: {exc}")
 
 
 def train(opt):
