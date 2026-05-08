@@ -1,27 +1,26 @@
-"""Soft retrieved-unit prior helpers for ChoreoRAG with formal experiment contracts.
+"""Formal-safe soft retrieved-unit prior helpers for ChoreoRAG.
 
 Drop-in replacement for ``choreorag_unit_prior.py``.
 
-This keeps the public API used by ``generate_controlled.py``:
+Why this version exists
+-----------------------
+``generate_controlled.py`` historically catches ``Exception`` around unit-prior
+application and only prints a warning.  That is unsafe for formal experiments:
+``EDGE_UNIT_PRIOR_REQUIRED=1`` must stop generation if no unit prior is actually
+applied.  This module therefore raises ``FormalUnitPriorContractError`` (a
+``BaseException`` subclass) for required/formal contract failures so legacy
+``except Exception`` blocks cannot silently downgrade the failure to a warning.
+
+Public API preserved
+--------------------
     infer_unit_specs_from_mid_paths
     apply_unit_priors_from_specs
+    get_last_unit_prior_report
+    specs_to_json
+    specs_from_json
 
-New formal safeguards
----------------------
-1. ``EDGE_UNIT_PRIOR_REQUIRED=1``: if ``EDGE_UNIT_SOFT_PRIOR=1`` but no unit
-   prior is actually applied, raise RuntimeError instead of silently continuing.
-2. Explicit unit paths can be supplied via:
-      EDGE_UNIT_PRIOR_UNIT_PATHS=/a.npy,/b.npy
-      EDGE_UNIT_PRIOR_MID_FRAMES=40,75
-   This is preferred over fragile sibling ``*_unit.npy`` inference.
-3. A JSON report is written when ``EDGE_UNIT_PRIOR_REPORT_JSON`` is set.  The
-   report records applied count, unit paths, frames, feature mask safety, DCT
-   parameters, and temporal window information.
-4. Safety invariant remains hard-coded: unit prior never constrains contacts or
-   root X/Z.
-
-Recommended formal settings
----------------------------
+Formal settings
+---------------
     EDGE_RUN_MODE=formal
     EDGE_UNIT_SOFT_PRIOR=1
     EDGE_UNIT_PRIOR_REQUIRED=1
@@ -52,10 +51,34 @@ TORSO_JOINTS = [3, 6, 9]
 UPPER_JOINTS = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 LOWER_SAFE_JOINTS = [1, 2, 4, 5, 7, 8, 10, 11]
 
-_LAST_UNIT_PRIOR_REPORT: Dict[str, object] = {}
-
 _TRUE = {"1", "true", "yes", "y", "on"}
 _FALSE = {"0", "false", "no", "n", "off"}
+_LAST_UNIT_PRIOR_REPORT: Dict[str, object] = {}
+
+
+class FormalUnitPriorContractError(BaseException):
+    """Hard failure for formal/required unit-prior contract violations.
+
+    This intentionally derives from BaseException, not Exception, so older
+    wrappers that contain broad ``except Exception`` blocks cannot swallow the
+    failure and continue a formally invalid run.
+    """
+
+
+def _env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, default)).strip()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    return bool(default)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -72,26 +95,42 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    text = str(value).strip().lower()
-    if text in _TRUE:
-        return True
-    if text in _FALSE:
-        return False
-    return bool(default)
+def _formal() -> bool:
+    return _env_str("EDGE_RUN_MODE", "").lower() == "formal"
 
 
-def _env_str(name: str, default: str) -> str:
-    return str(os.environ.get(name, default)).strip()
+def _required() -> bool:
+    return _env_bool("EDGE_UNIT_PRIOR_REQUIRED", _formal())
 
 
 def _split_csv(text: str) -> List[str]:
     if not text:
         return []
     return [x.strip() for x in str(text).replace(";", ",").split(",") if x.strip()]
+
+
+def _write_report_if_requested(report: Dict[str, object]) -> None:
+    path = _env_str("EDGE_UNIT_PRIOR_REPORT_JSON", "")
+    if not path:
+        return
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"✅ ChoreoRAG unit prior report saved: {p}")
+    except Exception as exc:
+        print(f"⚠️ failed to write ChoreoRAG unit prior report: {exc}")
+
+
+def _contract_fail(message: str, report: Dict[str, object] | None = None) -> None:
+    if report is not None:
+        report["error"] = message
+        global _LAST_UNIT_PRIOR_REPORT
+        _LAST_UNIT_PRIOR_REPORT = report
+        _write_report_if_requested(report)
+    if _required() or _formal():
+        raise FormalUnitPriorContractError("CRITICAL: " + message)
+    raise RuntimeError(message)
 
 
 def _joint_rot_indices(joints: Iterable[int]) -> List[int]:
@@ -103,11 +142,10 @@ def _joint_rot_indices(joints: Iterable[int]) -> List[int]:
 
 
 def make_unit_prior_mask(mode: str = "upper", include_root_y: bool = True) -> np.ndarray:
-    """Return [151] feature mask for retrieved-unit prior.
+    """Return a [151] mask for retrieved-unit prior.
 
-    Contacts and root X/Z are always zeroed at the end.  This invariant is
-    intentionally not configurable, so the temporal prior cannot fake trajectory
-    following or foot contact labels.
+    Contacts and root X/Z are hard-disabled.  This is not configurable because
+    the unit prior must not fake contact labels or trajectory following.
     """
     mode = str(mode or "upper").strip().lower().replace(" ", "").replace("-", "_")
     mask = np.zeros((REPR_DIM,), dtype=np.float32)
@@ -120,25 +158,20 @@ def make_unit_prior_mask(mode: str = "upper", include_root_y: bool = True) -> np
         mask[_joint_rot_indices(joints)] = 1.0
         if include_root_y:
             mask[ROOT_Y_IDX] = 1.0
-
     elif mode in {"upper+torso", "upper_torso", "torso+upper", "upperbody", "upper_body"}:
         mask[_joint_rot_indices(list(TORSO_JOINTS) + list(UPPER_JOINTS))] = 1.0
         if include_root_y:
             mask[ROOT_Y_IDX] = 1.0
-
     elif mode == "arms":
         mask[_joint_rot_indices(UPPER_JOINTS)] = 1.0
-
     elif mode == "torso":
         mask[_joint_rot_indices(TORSO_JOINTS)] = 1.0
         if include_root_y:
             mask[ROOT_Y_IDX] = 1.0
-
     elif mode in {"loco_safe", "lower_safe", "lower"}:
         mask[_joint_rot_indices(LOWER_SAFE_JOINTS)] = 1.0
         if include_root_y:
             mask[ROOT_Y_IDX] = 1.0
-
     elif mode in {"loco_upper", "upper_loco", "upper+lower_safe", "upper_lower_safe"}:
         joints = list(UPPER_JOINTS) + list(LOWER_SAFE_JOINTS)
         if _env_bool("EDGE_UNIT_PRIOR_INCLUDE_TORSO", True):
@@ -146,25 +179,36 @@ def make_unit_prior_mask(mode: str = "upper", include_root_y: bool = True) -> np
         mask[_joint_rot_indices(joints)] = 1.0
         if include_root_y:
             mask[ROOT_Y_IDX] = 1.0
-
     elif mode in {"all_no_root", "allnoroot", "all_no_xz", "body_no_rootxz"}:
         mask[ROT_START:REPR_DIM] = 1.0
         if include_root_y:
             mask[ROOT_Y_IDX] = 1.0
-
     elif mode == "rot_only":
         mask[ROT_START:REPR_DIM] = 1.0
-
     else:
         raise ValueError(
-            f"Unknown EDGE_UNIT_PRIOR_FEATURES={mode!r}. "
-            "Use upper, upper+torso, arms, torso, lower_safe, upper+lower_safe, all_no_root, rot_only."
+            f"Unknown EDGE_UNIT_PRIOR_FEATURES={mode!r}. Use upper, upper+torso, "
+            "arms, torso, lower_safe, upper+lower_safe, all_no_root, rot_only."
         )
 
     mask[CONTACT_SLICE] = 0.0
     mask[ROOT_X_IDX] = 0.0
     mask[ROOT_Z_IDX] = 0.0
     return mask.astype(np.float32)
+
+
+def _mask_safety_report(prior_mask: np.ndarray) -> Dict[str, object]:
+    nonzero = np.where(prior_mask > 0)[0].astype(int).tolist()
+    return {
+        "selected_feature_count": int(len(nonzero)),
+        "selected_feature_indices_head": nonzero[:32],
+        "mask_contact_sum": float(prior_mask[CONTACT_SLICE].sum()),
+        "mask_root_x_sum": float(prior_mask[ROOT_X_IDX]),
+        "mask_root_y_sum": float(prior_mask[ROOT_Y_IDX]),
+        "mask_root_z_sum": float(prior_mask[ROOT_Z_IDX]),
+        "safe_no_contact": bool(float(prior_mask[CONTACT_SLICE].sum()) == 0.0),
+        "safe_no_root_xz": bool(float(prior_mask[ROOT_X_IDX] + prior_mask[ROOT_Z_IDX]) == 0.0),
+    }
 
 
 def _as_unit_t151(arr: np.ndarray, path: str = "") -> np.ndarray:
@@ -229,19 +273,56 @@ def _select_temporal_window(unit: np.ndarray) -> np.ndarray:
 
 
 def _dct_lowpass_numpy(x: np.ndarray, k: int) -> np.ndarray:
+    """Low-pass temporal unit prior with optional soft spectral decay.
+
+    Historical behavior used a hard cutoff (all coefficients after k set to
+    zero).  That is still available with EDGE_UNIT_PRIOR_DCT_DECAY=hard, but
+    formal V10 runs should usually prefer soft_exp so medium/high-frequency
+    expressive details are attenuated instead of fully removed.
+
+    Environment:
+        EDGE_UNIT_PRIOR_DCT_DECAY=soft_exp|hard
+        EDGE_UNIT_PRIOR_DCT_DECAY_STRENGTH=3.0
+    """
     x = np.asarray(x, dtype=np.float32)
     if x.ndim != 2 or len(x) <= 2:
         return x.astype(np.float32)
+
     k = int(max(1, min(k, len(x))))
+    decay_mode = _env_str("EDGE_UNIT_PRIOR_DCT_DECAY", "hard").strip().lower()
+    decay_strength = _env_float("EDGE_UNIT_PRIOR_DCT_DECAY_STRENGTH", 3.0)
+
+    def _apply_tail_decay(coeff: np.ndarray) -> np.ndarray:
+        if k >= coeff.shape[0]:
+            return coeff
+        if decay_mode in {"soft", "soft_exp", "exp", "exponential"}:
+            n_tail = coeff.shape[0] - k
+            # Starts at 1.0 at the cutoff and decays smoothly, preserving some
+            # mid/high-frequency expressiveness while suppressing abrupt jumps.
+            decay = np.exp(-np.linspace(0.0, max(decay_strength, 0.0), n_tail)).astype(np.float32)
+            coeff[k:, :] *= decay[:, None]
+        else:
+            coeff[k:, :] = 0.0
+        return coeff
+
     try:
         from scipy.fftpack import dct, idct
 
         coeff = dct(x, type=2, norm="ortho", axis=0)
-        coeff[k:, :] = 0.0
+        coeff = _apply_tail_decay(coeff)
         return idct(coeff, type=2, norm="ortho", axis=0).astype(np.float32)
     except Exception:
         freq = np.fft.rfft(x, axis=0)
-        freq[k:, :] = 0.0
+        # For rFFT, k is still interpreted as the number of low-frequency bins
+        # to preserve before decay/cutoff.
+        kk = int(max(1, min(k, freq.shape[0])))
+        if kk < freq.shape[0]:
+            if decay_mode in {"soft", "soft_exp", "exp", "exponential"}:
+                n_tail = freq.shape[0] - kk
+                decay = np.exp(-np.linspace(0.0, max(decay_strength, 0.0), n_tail)).astype(np.float32)
+                freq[kk:, :] *= decay[:, None]
+            else:
+                freq[kk:, :] = 0.0
         return np.fft.irfft(freq, n=len(x), axis=0).astype(np.float32)
 
 
@@ -256,20 +337,6 @@ def _maybe_frequency_decouple_unit(unit: np.ndarray, prior_mask: np.ndarray) -> 
     if _env_bool("EDGE_UNIT_PRIOR_VERBOSE", False):
         print(f"   DCT low-pass unit prior: K={k}, selected_features={len(feat_idx)}")
     return out.astype(np.float32)
-
-
-def _mask_safety_report(prior_mask: np.ndarray) -> Dict[str, object]:
-    nonzero = np.where(prior_mask > 0)[0].astype(int).tolist()
-    return {
-        "selected_feature_count": int(len(nonzero)),
-        "selected_feature_indices_head": nonzero[:32],
-        "mask_contact_sum": float(prior_mask[CONTACT_SLICE].sum()),
-        "mask_root_x_sum": float(prior_mask[ROOT_X_IDX]),
-        "mask_root_y_sum": float(prior_mask[ROOT_Y_IDX]),
-        "mask_root_z_sum": float(prior_mask[ROOT_Z_IDX]),
-        "safe_no_contact": bool(float(prior_mask[CONTACT_SLICE].sum()) == 0.0),
-        "safe_no_root_xz": bool(float(prior_mask[ROOT_X_IDX] + prior_mask[ROOT_Z_IDX]) == 0.0),
-    }
 
 
 def add_unit_prior(
@@ -310,6 +377,8 @@ def add_unit_prior(
         "window": _env_int("EDGE_UNIT_PRIOR_WINDOW", _env_int("EDGE_UNIT_PRIOR_MAX_LEN", 45)),
         "dct_lowpass": _env_bool("EDGE_UNIT_PRIOR_DCT", False),
         "dct_lowpass_k": _env_int("EDGE_UNIT_PRIOR_LOW_FREQ_K", 4),
+        "dct_decay": _env_str("EDGE_UNIT_PRIOR_DCT_DECAY", "hard"),
+        "dct_decay_strength": _env_float("EDGE_UNIT_PRIOR_DCT_DECAY_STRENGTH", 3.0),
         "combine": combine,
         **_mask_safety_report(prior_mask),
         "actual_frames": [],
@@ -351,10 +420,13 @@ def _explicit_unit_specs_from_env() -> List[Dict[str, object]]:
         return []
     raw_frames = _split_csv(os.environ.get("EDGE_UNIT_PRIOR_MID_FRAMES", ""))
     if raw_frames and len(raw_frames) != len(paths):
-        raise RuntimeError(
+        msg = (
             "EDGE_UNIT_PRIOR_UNIT_PATHS and EDGE_UNIT_PRIOR_MID_FRAMES length mismatch: "
             f"{len(paths)} paths vs {len(raw_frames)} frames"
         )
+        if _required() or _formal():
+            raise FormalUnitPriorContractError("CRITICAL: " + msg)
+        raise RuntimeError(msg)
     specs = []
     for i, path in enumerate(paths):
         frame = int(float(raw_frames[i])) if raw_frames else -1
@@ -376,7 +448,6 @@ def infer_unit_specs_from_mid_paths(mid_paths: Iterable[str], mid_frames: Iterab
     """Infer unit specs, preferring explicit env paths over sibling inference."""
     explicit = _explicit_unit_specs_from_env()
     if explicit:
-        # Fill missing frames from provided mid_frames if needed.
         frames = list(mid_frames or [])
         for i, spec in enumerate(explicit):
             if int(spec.get("frame", -1)) < 0 and i < len(frames):
@@ -398,33 +469,15 @@ def infer_unit_specs_from_mid_paths(mid_paths: Iterable[str], mid_frames: Iterab
     return specs
 
 
-def _write_report_if_requested(report: Dict[str, object]) -> None:
-    path = _env_str("EDGE_UNIT_PRIOR_REPORT_JSON", "")
-    if not path:
-        return
-    try:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"✅ ChoreoRAG unit prior report saved: {p}")
-    except Exception as exc:
-        print(f"⚠️ failed to write ChoreoRAG unit prior report: {exc}")
-
-
 def get_last_unit_prior_report() -> Dict[str, object]:
     return dict(_LAST_UNIT_PRIOR_REPORT)
 
 
-def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Iterable[Dict[str, object]]) -> Tuple[np.ndarray, np.ndarray]:
-    global _LAST_UNIT_PRIOR_REPORT
-
-    enabled = _env_bool("EDGE_UNIT_SOFT_PRIOR", False)
-    required = _env_bool("EDGE_UNIT_PRIOR_REQUIRED", _env_str("EDGE_RUN_MODE", "").lower() == "formal")
-    specs_list = list(specs or [])
-
-    report: Dict[str, object] = {
+def _new_report(enabled: bool, specs_list: List[Dict[str, object]]) -> Dict[str, object]:
+    return {
         "enabled": bool(enabled),
-        "required": bool(required),
+        "required": bool(_required()),
+        "formal": bool(_formal()),
         "num_specs": int(len(specs_list)),
         "num_applied": 0,
         "num_missing": 0,
@@ -438,7 +491,18 @@ def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Ite
         "window": _env_int("EDGE_UNIT_PRIOR_WINDOW", _env_int("EDGE_UNIT_PRIOR_MAX_LEN", 45)),
         "dct_lowpass": _env_bool("EDGE_UNIT_PRIOR_DCT", False),
         "dct_lowpass_k": _env_int("EDGE_UNIT_PRIOR_LOW_FREQ_K", 4),
+        "dct_decay": _env_str("EDGE_UNIT_PRIOR_DCT_DECAY", "hard"),
+        "dct_decay_strength": _env_float("EDGE_UNIT_PRIOR_DCT_DECAY_STRENGTH", 3.0),
     }
+
+
+def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Iterable[Dict[str, object]]) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply unit priors and enforce formal required contract."""
+    global _LAST_UNIT_PRIOR_REPORT
+
+    enabled = _env_bool("EDGE_UNIT_SOFT_PRIOR", False)
+    specs_list = list(specs or [])
+    report = _new_report(enabled=enabled, specs_list=specs_list)
 
     if not enabled:
         _LAST_UNIT_PRIOR_REPORT = report
@@ -460,18 +524,36 @@ def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Ite
             missing += 1
             report["missing_specs"].append({"unit_path": unit_path, "frame": frame, "reason": "missing_file_or_frame"})
             continue
-        unit = _load_unit(unit_path)
-        value, mask, unit_report = add_unit_prior(
-            value=value,
-            mask=mask,
-            unit_motion=unit,
-            center_frame=int(frame),
-            strength=strength,
-            feature_mode=feature_mode,
-            max_len=max_len,
-            decay_gamma=decay_gamma,
-            decay_floor=decay_floor,
-        )
+        try:
+            unit = _load_unit(unit_path)
+            value, mask, unit_report = add_unit_prior(
+                value=value,
+                mask=mask,
+                unit_motion=unit,
+                center_frame=int(frame),
+                strength=strength,
+                feature_mode=feature_mode,
+                max_len=max_len,
+                decay_gamma=decay_gamma,
+                decay_floor=decay_floor,
+            )
+        except BaseException:
+            raise
+        except Exception as exc:
+            # In formal/required mode, malformed unit files are contract failures.
+            report["missing_specs"].append({
+                "unit_path": unit_path,
+                "frame": frame,
+                "reason": f"load_or_apply_error:{type(exc).__name__}:{exc}",
+            })
+            if _required() or _formal():
+                _contract_fail(
+                    f"Failed to load/apply required unit prior from {unit_path}: {exc}",
+                    report=report,
+                )
+            missing += 1
+            continue
+
         unit_report["unit_path"] = unit_path
         unit_report["frame"] = int(frame)
         unit_report["spec_source"] = spec.get("source", "unknown")
@@ -486,7 +568,6 @@ def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Ite
         set(int(f) for u in report["per_unit"] for f in u.get("actual_frames", []))
     )
 
-    # Aggregate safety from the configured prior mask, independent of existing endpoint/contact masks.
     prior_mask = make_unit_prior_mask(feature_mode)
     report.update({f"aggregate_{k}": v for k, v in _mask_safety_report(prior_mask).items()})
 
@@ -499,15 +580,12 @@ def apply_unit_priors_from_specs(value: np.ndarray, mask: np.ndarray, specs: Ite
         )
     else:
         msg = f"EDGE_UNIT_SOFT_PRIOR=1 but no valid unit prior was applied; specs={len(specs_list)}, missing={missing}"
-        if required:
-            report["error"] = msg
-            _LAST_UNIT_PRIOR_REPORT = report
-            _write_report_if_requested(report)
-            raise RuntimeError("CRITICAL: " + msg)
+        if _required() or _formal():
+            _contract_fail(msg, report=report)
         print("⚠️ " + msg)
 
     if not bool(report.get("aggregate_safe_no_contact", False)) or not bool(report.get("aggregate_safe_no_root_xz", False)):
-        raise RuntimeError(f"CRITICAL: Unit prior mask safety invariant violated: {report}")
+        _contract_fail(f"Unit prior mask safety invariant violated: {report}", report=report)
 
     _LAST_UNIT_PRIOR_REPORT = report
     _write_report_if_requested(report)

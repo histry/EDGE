@@ -1,33 +1,15 @@
 """Experiment-safety guard for EDGE V9/V10 inference and training.
 
-Drop this file in the EDGE repository root.
+Drop-in replacement for ``edge_experiment_guard.py``.
 
-Main goals
-----------
-1. Avoid V10/Text-Context flags silently contaminating V9 or old-checkpoint baselines.
-2. Install runtime patches in a centralized, inspectable way.
-3. Convert important runtime assumptions into explicit hard checks for formal experiments.
-4. Provide lightweight Text/Pose Context RAG checkpoint and gradient diagnostics.
-
-Recommended usage
------------------
-Inference wrappers should call, before importing EDGE/DanceDecoder:
-
-    checkpoint = infer_checkpoint_path_from_argv(sys.argv[1:])
-    configure_inference_feature_flags(checkpoint, profile="auto")
-    install_runtime_patches(strict=env_bool("EDGE_STRICT_RUNTIME_PATCHES", False))
-    assert_inference_contract(checkpoint, profile=os.environ.get("EDGE_EXPERIMENT_PROFILE", "auto"))
-
-Profiles
---------
-- v9_baseline / baseline / pure_v9:
-    Disable Text/Pose Context RAG unless the user explicitly sets
-    EDGE_ENABLE_TEXT_CONTEXT_RAG.
-- v10 / text_context:
-    Enable Text/Pose Context RAG only when checkpoint contains text_context_*
-    weights, unless the user explicitly sets EDGE_ENABLE_TEXT_CONTEXT_RAG=1.
-- auto:
-    Infer from checkpoint keys. This is the safest default.
+V3 additions
+------------
+1. Keeps the V9/V10 feature-flag and runtime-patch guard behavior.
+2. Makes TextContextGradMonitor usable as a context manager so hooks are removed
+   even when an ablation/training run raises an exception.
+3. Uses ``.item()`` when collecting parameter/gradient norms, avoiding lingering
+   tensor objects in long-running batch scripts.
+4. Optionally empties CUDA cache when the monitor exits/closes.
 """
 
 from __future__ import annotations
@@ -72,13 +54,7 @@ DEFAULT_REQUIRED_BY_PROFILE: Dict[str, Tuple[str, ...]] = {
     "baseline": ("native_trajectory", "safety", "v9_rag", "full_landing"),
     "pure_v9": ("native_trajectory", "safety", "v9_rag", "full_landing"),
     "v9": ("native_trajectory", "safety", "v9_rag", "full_landing"),
-    "v10": (
-        "native_trajectory",
-        "safety",
-        "v9_rag",
-        "full_landing",
-        "text_bridge",
-    ),
+    "v10": ("native_trajectory", "safety", "v9_rag", "full_landing", "text_bridge"),
     "text_context": (
         "native_trajectory",
         "safety",
@@ -128,7 +104,6 @@ def _set_default(name: str, value: str) -> None:
 
 
 def infer_checkpoint_path_from_argv(argv: Sequence[str]) -> str:
-    """Infer checkpoint path from --checkpoint, CHECKPOINT, or EDGE_CHECKPOINT."""
     argv = list(argv)
     for i, item in enumerate(argv):
         if item == "--checkpoint" and i + 1 < len(argv):
@@ -151,11 +126,6 @@ def _extract_state_dict(checkpoint_obj) -> Optional[dict]:
 
 
 def load_checkpoint_keys(checkpoint_path: str) -> Tuple[List[str], str]:
-    """Return checkpoint state-dict keys and a short status string.
-
-    This loads the checkpoint on CPU. For formal experiments this is worth the
-    small overhead because it prevents silent baseline pollution.
-    """
     if not checkpoint_path:
         return [], "no_checkpoint_path"
     path = Path(checkpoint_path)
@@ -172,7 +142,7 @@ def load_checkpoint_keys(checkpoint_path: str) -> Tuple[List[str], str]:
         if not isinstance(state, dict):
             return [], "no_state_dict"
         return [str(k).replace("module.", "") for k in state.keys()], "ok"
-    except Exception as exc:  # pragma: no cover - intentionally fail-soft here
+    except Exception as exc:
         return [], f"load_error:{type(exc).__name__}:{exc}"
 
 
@@ -204,12 +174,18 @@ def normalize_profile(profile: Optional[str] = None) -> str:
     return aliases.get(profile, profile)
 
 
-def configure_inference_feature_flags(
-    checkpoint_path: str,
-    profile: str = "auto",
-    verbose: bool = True,
-) -> Dict[str, object]:
-    """Set safe inference env flags before EDGE/DanceDecoder is imported."""
+def _maybe_write_json_summary(summary: dict, path: str) -> None:
+    if not path:
+        return
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"⚠️ Failed to write EDGE guard summary JSON: {exc}")
+
+
+def configure_inference_feature_flags(checkpoint_path: str, profile: str = "auto", verbose: bool = True) -> Dict[str, object]:
     profile = normalize_profile(profile)
     os.environ.setdefault("EDGE_EXPERIMENT_PROFILE", profile)
 
@@ -220,21 +196,17 @@ def configure_inference_feature_flags(
     explicit_text = env_was_set("EDGE_ENABLE_TEXT_CONTEXT_RAG")
     explicit_rag = env_was_set("EDGE_ENABLE_RAG_SUMMARY_TOKEN")
 
-    # Text/Pose Context RAG should never be enabled by default for clean V9 baselines.
     if not explicit_text:
         if profile in {"v9_baseline", "baseline", "pure_v9", "v9"}:
             os.environ["EDGE_ENABLE_TEXT_CONTEXT_RAG"] = "0"
         elif profile in {"v10", "text_context"}:
             os.environ["EDGE_ENABLE_TEXT_CONTEXT_RAG"] = "1" if has_text_context else "0"
-        else:  # auto
+        else:
             os.environ["EDGE_ENABLE_TEXT_CONTEXT_RAG"] = "1" if has_text_context else "0"
 
-    # V9 RAG Summary Token should be enabled only when the checkpoint actually has it,
-    # or when explicitly requested by the user.
     if not explicit_rag:
         os.environ["EDGE_ENABLE_RAG_SUMMARY_TOKEN"] = "1" if has_rag_summary else "0"
 
-    # Keep shape-related defaults conservative. They do not activate branches by themselves.
     _set_default("EDGE_RAG_SUMMARY_DIM", "7")
     _set_default("EDGE_RAG_SUMMARY_BLEND_RADIUS", "18")
     _set_default("EDGE_RAG_SUMMARY_MODE", "mean")
@@ -243,8 +215,6 @@ def configure_inference_feature_flags(
     _set_default("EDGE_RAG_CONTEXT_MAX_LEN", "45")
     _set_default("EDGE_TEXT_CONTEXT_DROP_PROB", "0.0")
 
-    # For V10/planner runs, relative_abs_vel is the intended trajectory representation.
-    # For clean V9 baselines, do not silently change trajectory representation.
     if not env_was_set("EDGE_TRAJECTORY_REP"):
         if profile in {"v10", "text_context"} or env_bool("EDGE_ENABLE_TEXT_CONTEXT_RAG", False):
             os.environ["EDGE_TRAJECTORY_REP"] = "relative_abs_vel"
@@ -271,24 +241,12 @@ def configure_inference_feature_flags(
     return summary
 
 
-def _maybe_write_json_summary(summary: dict, path: str) -> None:
-    if not path:
-        return
-    try:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as exc:
-        print(f"⚠️ Failed to write EDGE guard summary JSON: {exc}")
-
-
 def install_runtime_patches(
     strict: bool = False,
     required: Optional[Sequence[str]] = None,
     profile: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, str]:
-    """Install known runtime patches and optionally fail hard on missing ones."""
     profile = normalize_profile(profile)
     if required is None:
         required = DEFAULT_REQUIRED_BY_PROFILE.get(profile, DEFAULT_REQUIRED_BY_PROFILE["auto"])
@@ -297,7 +255,6 @@ def install_runtime_patches(
 
     results: Dict[str, str] = {}
     for patch_name, (module_name, fn_name) in PATCH_SPECS.items():
-        # Optional patches are attempted, but strictness applies only to `required`.
         try:
             module = __import__(module_name, fromlist=[fn_name])
             fn = getattr(module, fn_name)
@@ -327,12 +284,7 @@ def install_runtime_patches(
     return results
 
 
-def assert_inference_contract(
-    checkpoint_path: str,
-    profile: str = "auto",
-    strict: Optional[bool] = None,
-) -> None:
-    """Hard-check that enabled branches and checkpoint contents are consistent."""
+def assert_inference_contract(checkpoint_path: str, profile: str = "auto", strict: Optional[bool] = None) -> None:
     profile = normalize_profile(profile)
     if strict is None:
         strict = env_bool("EDGE_STRICT_RUNTIME_PATCHES", False) or env_bool("EDGE_STRICT_EXPERIMENT_GUARD", False)
@@ -364,7 +316,6 @@ def assert_inference_contract(
             "This may be intentional for new training, but is suspicious for inference."
         )
 
-    # Class-level patch checks are available after install_runtime_patches imports modules.
     if text_enabled:
         try:
             from model.model import DanceDecoder, DecoderLayerStack
@@ -385,15 +336,12 @@ def assert_inference_contract(
 
     if errors:
         message = "\n".join(f"- {msg}" for msg in errors)
-        if strict or True:
-            raise RuntimeError(f"EDGE inference contract failed:\n{message}")
-        print(f"⚠️ EDGE inference contract issues:\n{message}")
+        raise RuntimeError(f"EDGE inference contract failed:\n{message}")
 
     print("✅ EDGE inference contract check passed.")
 
 
 def assert_model_is_clean_baseline(model, name: str = "model") -> None:
-    """Use after model creation for formal V9/baseline runs."""
     wrapped = getattr(model, "module", model)
     enabled = bool(getattr(wrapped, "enable_text_context_rag", False))
     if enabled:
@@ -404,8 +352,22 @@ def assert_model_is_clean_baseline(model, name: str = "model") -> None:
     print(f"✅ {name} clean-baseline check passed: no Text/Pose Context RAG branch.")
 
 
+def _param_scalar_norm(param) -> float:
+    try:
+        return float(param.detach().float().norm().item())
+    except Exception:
+        try:
+            return float(param.detach().norm().item())
+        except Exception:
+            return 0.0
+
+
 def text_context_parameter_report(model) -> Dict[str, float]:
-    """Return parameter norms/trainability for text_context_* modules."""
+    """Return parameter norms/trainability for text_context_* modules.
+
+    Uses .item() to materialize Python scalars and avoid retaining tensor
+    references in long-running ablation scripts.
+    """
     wrapped = getattr(model, "module", model)
     report: Dict[str, float] = {}
     for name, obj in vars(wrapped).items():
@@ -420,17 +382,14 @@ def text_context_parameter_report(model) -> Dict[str, float]:
         trainable = sum(int(p.numel()) for p in params if getattr(p, "requires_grad", False))
         norm = 0.0
         for p in params:
-            try:
-                norm += float(p.detach().float().norm().cpu())
-            except Exception:
-                pass
+            norm += _param_scalar_norm(p)
         report[f"{name}.total"] = float(total)
         report[f"{name}.trainable"] = float(trainable)
         report[f"{name}.norm_sum"] = float(norm)
     gate = getattr(wrapped, "text_context_gate", None)
     if gate is not None:
         try:
-            report["text_context_gate.value"] = float(gate.detach().float().cpu().reshape(-1)[0])
+            report["text_context_gate.value"] = float(gate.detach().float().reshape(-1)[0].item())
         except Exception:
             pass
     return report
@@ -449,8 +408,28 @@ def write_text_context_report(model, path: str) -> None:
         print(f"⚠️ Failed to write Text/Pose Context report: {exc}")
 
 
+def _maybe_empty_cuda_cache() -> None:
+    if not env_bool("EDGE_EMPTY_CUDA_CACHE_ON_MONITOR_CLOSE", True):
+        return
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class TextContextGradMonitor:
-    """Small hook-based monitor for text_context_* gradient evidence."""
+    """Hook-based monitor for text_context_* gradient evidence.
+
+    Use as a context manager in training/ablation scripts:
+
+        with TextContextGradMonitor(model) as mon:
+            ... training step ...
+            mon.write(path)
+
+    Hooks are removed in __exit__ even if an exception occurs.
+    """
 
     def __init__(self, model, print_every: int = 200):
         self.print_every = max(1, int(print_every))
@@ -466,10 +445,18 @@ class TextContextGradMonitor:
             self.handles.append(param.register_hook(self._make_hook(name)))
         print(f"🧪 TextContextGradMonitor registered hooks: {len(self.handles)}")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        _maybe_empty_cuda_cache()
+        return False
+
     def _make_hook(self, name: str):
         def hook(grad):
             try:
-                value = float(grad.detach().float().norm().cpu())
+                value = float(grad.detach().float().norm().item())
             except Exception:
                 value = 0.0
             self.last[name] = value
@@ -477,7 +464,6 @@ class TextContextGradMonitor:
             if value > 0 and (self.count <= 5 or self.count % self.print_every == 0):
                 print(f"🧪 text_context grad evidence: {name} grad_norm={value:.6e}")
             return grad
-
         return hook
 
     def close(self) -> None:
@@ -496,10 +482,16 @@ class TextContextGradMonitor:
             p.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "time": time.time(),
-                "hook_calls": self.count,
-                "last_grad_norms": self.last,
+                "hook_calls": int(self.count),
+                "last_grad_norms": {str(k): float(v) for k, v in self.last.items()},
             }
             p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"✅ Wrote Text/Pose Context grad monitor report: {p}")
         except Exception as exc:
             print(f"⚠️ Failed to write Text/Pose Context grad monitor report: {exc}")
+
+    def __del__(self):  # best-effort safety for notebooks / interrupted scripts
+        try:
+            self.close()
+        except Exception:
+            pass

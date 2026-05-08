@@ -1,4 +1,15 @@
+import os
 import torch
+
+
+_TRUE = {"1", "true", "yes", "y", "on"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in _TRUE
 
 
 def _strip_module_prefix(state_dict):
@@ -45,6 +56,27 @@ def _is_spectral_norm_buffer(key):
     )
 
 
+def _clone_reference_value(value):
+    """Clone freshly initialized reference tensors without duplicating them on GPU.
+
+    The old implementation used value.detach().clone(), which clones GPU tensors
+    on GPU when the model has already been moved to cuda. During V10 inference
+    this can duplicate a large part of the model state and trigger OOM before
+    checkpoint loading finishes.
+
+    CPU tensors are accepted by torch.nn.Module.load_state_dict; PyTorch copies
+    them into the target parameter/buffer device during loading. Keeping these
+    fallback initialized values on CPU dramatically lowers peak GPU memory.
+    """
+    if not torch.is_tensor(value):
+        return value
+
+    detach = value.detach()
+    if _env_bool("EDGE_CHECKPOINT_COMPAT_CPU_MERGE", True):
+        return detach.cpu().clone()
+    return detach.clone()
+
+
 def adapt_checkpoint_state_dict(checkpoint_state_dict, model, log_prefix="checkpoint"):
     """Return a strict-loadable state_dict, adapting old Linear weights to spectral_norm keys.
 
@@ -52,13 +84,19 @@ def adapt_checkpoint_state_dict(checkpoint_state_dict, model, log_prefix="checkp
     ``*.parametrizations.weight.original`` plus ``_u/_v`` buffers. Older checkpoints only
     have ``*.weight``. This helper maps the original weights and keeps any new buffers from
     the freshly initialized model so strict loading can still be used.
+
+    V10 hotfix:
+    - Fallback initialized reference tensors are cloned on CPU by default via
+      EDGE_CHECKPOINT_COMPAT_CPU_MERGE=1.
+    - This avoids a second GPU copy of model.state_dict() during checkpoint
+      adaptation, reducing peak GPU memory at inference startup.
     """
     if checkpoint_state_dict is None:
         raise ValueError("checkpoint_state_dict is None")
 
     reference = model.state_dict()
     source, prefix_action = _align_prefix_to_reference(dict(checkpoint_state_dict), reference)
-    merged = {key: value.detach().clone() if torch.is_tensor(value) else value for key, value in reference.items()}
+    merged = {key: _clone_reference_value(value) for key, value in reference.items()}
 
     loaded = []
     remapped = []
@@ -80,6 +118,9 @@ def adapt_checkpoint_state_dict(checkpoint_state_dict, model, log_prefix="checkp
             if tuple(value.shape) != tuple(reference[target_key].shape):
                 skipped_shape.append((key, tuple(value.shape), tuple(reference[target_key].shape)))
                 continue
+
+        # Keep checkpoint tensors as provided. They are usually loaded on CPU
+        # already; load_state_dict will copy them to the model device.
         merged[target_key] = value
         loaded.append(target_key)
 
@@ -98,6 +139,7 @@ def adapt_checkpoint_state_dict(checkpoint_state_dict, model, log_prefix="checkp
         "unexpected": unexpected,
         "kept_spectral_buffers": kept_spectral_buffers,
         "kept_other": kept_other,
+        "cpu_merge": bool(_env_bool("EDGE_CHECKPOINT_COMPAT_CPU_MERGE", True)),
     }
     return merged, report
 
@@ -107,6 +149,8 @@ def summarize_adapt_report(report, max_items=8):
     prefix = report.get("log_prefix", "checkpoint")
     if report.get("prefix_action") != "unchanged":
         lines.append(f"{prefix}: prefix_action={report['prefix_action']}")
+    if report.get("cpu_merge"):
+        lines.append(f"{prefix}: checkpoint compatibility merge uses CPU fallback tensors")
     if report.get("remapped_count", 0):
         lines.append(f"{prefix}: remapped spectral_norm weights={report['remapped_count']}")
     if report.get("kept_spectral_buffers"):

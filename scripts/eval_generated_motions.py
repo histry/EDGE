@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 """Formal raw-vs-final evaluator for EDGE/ChoreoRAG motions.
 
-New file.  Put it under ``scripts/eval_generated_motions.py``.
+Drop-in replacement for ``scripts/eval_generated_motions.py``.
 
-This evaluator intentionally refuses to evaluate only a post-anchor/final motion
-in formal mode.  It always reports:
+Formal mode intentionally refuses to evaluate only a post-anchor/final motion.
+It reports:
     metrics_raw
     metrics_final
     delta_final_minus_raw
 
-The goal is to prevent post-anchor ADE=0 from being reported as native model
-trajectory ability.
-
-Example
--------
-python scripts/eval_generated_motions.py \
-  --raw_motion output/demo_raw.npy \
-  --final_motion output/demo.npy \
-  --target_traj output/demo_target_traj.npy \
-  --out output/demo_eval.json \
-  --formal
+Important metric naming
+-----------------------
+``foot_slide_proxy_rate`` is a contact-root-speed proxy computed from the 151D
+representation.  It is not true FK foot sliding.  ``foot_slide_rate`` is kept as
+a backwards-compatible alias but formal reports should cite the proxy name.
 """
 from __future__ import annotations
 
@@ -75,11 +69,16 @@ def load_traj(path: str, target_len: Optional[int] = None) -> np.ndarray:
         raise ValueError(f"Expected [T,2+] target trajectory from {path}, got {traj.shape}")
     traj = traj[:, :2]
     if target_len is not None and len(traj) != target_len:
-        idx = np.linspace(0, len(traj) - 1, target_len)
-        x = np.interp(idx, np.arange(len(traj)), traj[:, 0])
-        z = np.interp(idx, np.arange(len(traj)), traj[:, 1])
-        traj = np.stack([x, z], axis=-1).astype(np.float32)
+        traj = resample_traj_array(traj, target_len)
     return traj.astype(np.float32)
+
+
+def resample_traj_array(traj: np.ndarray, target_len: int) -> np.ndarray:
+    traj = np.asarray(traj, dtype=np.float32)
+    idx = np.linspace(0, len(traj) - 1, target_len)
+    x = np.interp(idx, np.arange(len(traj)), traj[:, 0])
+    z = np.interp(idx, np.arange(len(traj)), traj[:, 1])
+    return np.stack([x, z], axis=-1).astype(np.float32)
 
 
 def _safe_float(x) -> float:
@@ -94,7 +93,7 @@ def trajectory_metrics(motion: np.ndarray, target_traj: Optional[np.ndarray]) ->
         return {}
     traj = np.asarray(target_traj, dtype=np.float32)
     if len(traj) != len(motion):
-        traj = load_traj_from_array(traj, len(motion))
+        traj = resample_traj_array(traj, len(motion))
     root = motion[:, ROOT_XZ_IDX]
     err = np.linalg.norm(root - traj[:, :2], axis=-1)
     root_path = float(np.linalg.norm(root[1:] - root[:-1], axis=-1).sum()) if len(root) > 1 else 0.0
@@ -107,14 +106,6 @@ def trajectory_metrics(motion: np.ndarray, target_traj: Optional[np.ndarray]) ->
         "trajectory_path_len_target_m": _safe_float(traj_path),
         "trajectory_path_len_ratio": _safe_float(root_path / max(traj_path, 1e-8)),
     }
-
-
-def load_traj_from_array(traj: np.ndarray, target_len: int) -> np.ndarray:
-    traj = np.asarray(traj, dtype=np.float32)
-    idx = np.linspace(0, len(traj) - 1, target_len)
-    x = np.interp(idx, np.arange(len(traj)), traj[:, 0])
-    z = np.interp(idx, np.arange(len(traj)), traj[:, 1])
-    return np.stack([x, z], axis=-1).astype(np.float32)
 
 
 def motion_activity_stats(motion: np.ndarray) -> Dict[str, float]:
@@ -183,16 +174,14 @@ def contact_metrics(motion: np.ndarray) -> Dict[str, float]:
     }
 
 
-def foot_slide_proxy(motion: np.ndarray) -> Dict[str, float]:
-    """Foot-slide proxy for 151D representation without FK.
-
-    True foot slide requires FK foot joint positions.  This proxy flags frames
-    where the motion claims foot contact while root X/Z moves quickly.  It is
-    intentionally named ``foot_slide_rate`` for report compatibility, and the
-    meta field ``foot_slide_metric_type`` records that it is a proxy.
-    """
+def foot_slide_proxy(motion: np.ndarray) -> Dict[str, object]:
+    """Contact-root-speed proxy, not true FK foot slide."""
     if len(motion) < 2:
-        return {"foot_slide_rate": 0.0, "foot_contact_speed_p95_mps": 0.0, "foot_slide_metric_type": "contact_root_speed_proxy"}
+        return {
+            "foot_slide_proxy_rate": 0.0,
+            "foot_contact_root_speed_p95_mps": 0.0,
+            "foot_slide_metric_type": "contact_root_speed_proxy",
+        }
     contacts = (motion[:, CONTACT_SLICE] > 0.5).astype(np.float32)
     root = motion[:, ROOT_XZ_IDX]
     speed = np.zeros((len(motion),), dtype=np.float32)
@@ -202,12 +191,17 @@ def foot_slide_proxy(motion: np.ndarray) -> Dict[str, float]:
     threshold = max(threshold, 1e-6)
     slide = contact_any & (speed > threshold)
     contact_speed = speed[contact_any]
-    return {
-        "foot_slide_rate": _safe_float(slide.mean()),
-        "foot_contact_speed_p95_mps": _safe_float(np.percentile(contact_speed, 95) if len(contact_speed) else 0.0),
+    rate = _safe_float(slide.mean())
+    out = {
+        "foot_slide_proxy_rate": rate,
+        "foot_contact_root_speed_p95_mps": _safe_float(np.percentile(contact_speed, 95) if len(contact_speed) else 0.0),
         "foot_slide_speed_threshold": _safe_float(threshold),
         "foot_slide_metric_type": "contact_root_speed_proxy",
+        # Backward-compatible aliases.  Prefer foot_slide_proxy_rate in reports.
+        "foot_slide_rate": rate,
+        "foot_contact_speed_p95_mps": _safe_float(np.percentile(contact_speed, 95) if len(contact_speed) else 0.0),
     }
+    return out
 
 
 def root_lower_sync(motion: np.ndarray) -> Dict[str, float]:
@@ -219,7 +213,6 @@ def root_lower_sync(motion: np.ndarray) -> Dict[str, float]:
     gate = root_speed > max(1e-6, float(np.percentile(root_speed, 50)))
     if not np.any(gate):
         return {"root_lower_sync": 1.0, "root_lower_sync_deficit": 0.0}
-    # A proxy: when root is moving, lower-body rotation activity should not be near zero.
     lower_active = lower[gate]
     root_active = root_speed[gate]
     target = 0.30 * root_active + 1e-6
@@ -263,15 +256,15 @@ def build_warnings(metrics_raw: Dict[str, object], metrics_final: Dict[str, obje
     warnings: List[str] = []
     final_ade = float(metrics_final.get("trajectory_ade_m", 999.0))
     raw_ade = float(metrics_raw.get("trajectory_ade_m", 999.0))
-    final_slide = float(metrics_final.get("foot_slide_rate", 0.0))
-    raw_slide = float(metrics_raw.get("foot_slide_rate", 0.0))
+    final_slide = float(metrics_final.get("foot_slide_proxy_rate", metrics_final.get("foot_slide_rate", 0.0)))
+    raw_slide = float(metrics_raw.get("foot_slide_proxy_rate", metrics_raw.get("foot_slide_rate", 0.0)))
     final_sync = float(metrics_final.get("root_lower_sync", 0.0))
     raw_sync = float(metrics_raw.get("root_lower_sync", 0.0))
 
     if final_ade <= 1e-6 and raw_ade > 1e-3:
         warnings.append("final ADE is zero while raw ADE is non-zero; this is post-anchor system control, not native trajectory ability.")
     if final_slide > max(raw_slide * 1.5, raw_slide + 0.05):
-        warnings.append("foot_slide_rate increased after final/post-anchor motion; trajectory may be achieved by dragging.")
+        warnings.append("foot_slide_proxy_rate increased after final/post-anchor motion; trajectory may be achieved by dragging.")
     if final_sync + 0.10 < raw_sync:
         warnings.append("root_lower_sync dropped after final/post-anchor motion; lower body may not follow root naturally.")
     return warnings
@@ -316,6 +309,10 @@ def main() -> int:
         "delta_final_minus_raw": delta,
         "warnings": warnings,
         "formal": bool(args.formal),
+        "metric_notes": {
+            "foot_slide_proxy_rate": "contact-root-speed proxy from 151D representation, not true FK foot sliding",
+            "foot_slide_rate": "backward-compatible alias of foot_slide_proxy_rate",
+        },
     }
 
     if args.meta:

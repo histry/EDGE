@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Reliable V9/V10 inference entrypoint with experiment-safety guards.
+"""Guarded V9/V10 inference entrypoint.
 
-Run this file with exactly the same arguments as generate_controlled.py.
+Run with exactly the same CLI arguments as ``generate_controlled.py``.
 
-Key fixes compared with the old wrapper:
-- Text/Pose Context RAG is NOT enabled just because generate_controlled.py has
-  V10-friendly defaults. It is enabled only when the checkpoint contains
-  text_context_* weights, unless the user explicitly sets EDGE_ENABLE_TEXT_CONTEXT_RAG=1.
-- Clean V9 baselines can set EDGE_EXPERIMENT_PROFILE=v9_baseline and will hard
-  fail if Text/Pose Context RAG is accidentally enabled.
-- Required runtime patches can be checked hard with EDGE_STRICT_RUNTIME_PATCHES=1.
+Why use this wrapper instead of calling generate_controlled.py directly?
+-----------------------------------------------------------------------
+``generate_controlled.py`` contains V10-friendly ``os.environ.setdefault``
+defaults.  This wrapper runs ``edge_experiment_guard`` first, so those defaults
+cannot accidentally turn a clean V9/baseline run into a Text/Pose Context RAG
+run.  ``generate_v10_choreo.py`` also calls this wrapper internally.
+
+Recommended clean V9 baseline:
+    EDGE_RUN_MODE=formal \
+    EDGE_EXPERIMENT_PROFILE=v9_baseline \
+    EDGE_STRICT_EXPERIMENT_GUARD=1 \
+    EDGE_STRICT_RUNTIME_PATCHES=1 \
+    python generate_controlled_v9.py ...
 """
 
 from __future__ import annotations
@@ -18,6 +24,15 @@ import os
 import runpy
 import sys
 from pathlib import Path
+
+_TRUE = {"1", "true", "yes", "y", "on"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in _TRUE
 
 
 def _bootstrap(repo_root: Path) -> str:
@@ -37,6 +52,10 @@ def _bootstrap(repo_root: Path) -> str:
     checkpoint = infer_checkpoint_path_from_argv(sys.argv[1:])
     profile = normalize_profile(os.environ.get("EDGE_EXPERIMENT_PROFILE", "auto"))
 
+    # Marker for scripts and logs.  generate_controlled.py itself is not edited
+    # here, but this marker records that the guarded path was used.
+    os.environ["EDGE_GENERATE_CONTROLLED_GUARDED"] = "1"
+
     configure_inference_feature_flags(
         checkpoint_path=checkpoint,
         profile=profile,
@@ -55,6 +74,13 @@ def _bootstrap(repo_root: Path) -> str:
             profile=profile,
             strict=True,
         )
+
+    if profile in {"v9_baseline", "baseline", "pure_v9", "v9"}:
+        if _env_bool("EDGE_ENABLE_TEXT_CONTEXT_RAG", False):
+            raise RuntimeError(
+                "Clean V9/baseline profile still has EDGE_ENABLE_TEXT_CONTEXT_RAG=1 after guard. "
+                "This would contaminate the baseline."
+            )
 
     return checkpoint
 
