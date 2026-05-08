@@ -1,30 +1,39 @@
 """Training-stage fix and evidence monitor for Text/Pose Context RAG.
 
-Drop this file into the EDGE project root.
+Drop-in replacement for ``edge_text_context_training_fix.py``.
 
 Fixes/diagnostics:
 1. Keeps text_context_* modules trainable in train_stage="adapter".
-2. Prints and optionally writes text_context_gate / parameter snapshots.
-3. Registers gradient hooks for text_context_* parameters, so a smoke/full run
-   can prove the branch is not merely instantiated but actually receives grads.
+2. Writes text_context_gate / parameter snapshots.
+3. Registers gradient hooks for text_context_* parameters.
+4. Optional formal hard checks:
+      EDGE_TEXT_CONTEXT_REQUIRE_GRAD=1
+      EDGE_TEXT_CONTEXT_MIN_GRAD_NORM=1e-10
+      EDGE_TEXT_CONTEXT_REQUIRE_GATE=1
+      EDGE_TEXT_CONTEXT_MIN_GATE_ABS=1e-4
 
-Useful env vars:
-    EDGE_TEXT_CONTEXT_REPORT_JSON=logs/text_context_report.json
-    EDGE_TEXT_CONTEXT_GRAD_JSON=logs/text_context_grad.json
-    EDGE_TEXT_CONTEXT_GRAD_PRINT_EVERY=200
+Note
+----
+This file can only check final train-loop evidence because the original EDGE
+train_loop owns epoch boundaries.  For per-epoch dashboards, set JSON paths and
+let your logger or post-hook ingest them.
 """
-
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
+
 import torch
+
+_TRUE = {"1", "true", "yes", "y", "on"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return bool(default)
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(value).strip().lower() in _TRUE
 
 
 def _env_int(name: str, default: int) -> int:
@@ -32,6 +41,17 @@ def _env_int(name: str, default: int) -> int:
         return int(float(os.environ.get(name, default)))
     except Exception:
         return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _formal() -> bool:
+    return str(os.environ.get("EDGE_RUN_MODE", "")).strip().lower() == "formal"
 
 
 def _set_trainable(obj, enabled: bool) -> int:
@@ -93,6 +113,52 @@ def _text_context_param_summary(model) -> str:
     return "; ".join(rows) + f"; total={trainable}/{total}"
 
 
+def _unwrap(edge_obj):
+    model = getattr(edge_obj, "model", None)
+    if model is None:
+        return None
+    accelerator = getattr(edge_obj, "accelerator", None)
+    if accelerator is not None and hasattr(accelerator, "unwrap_model"):
+        try:
+            return accelerator.unwrap_model(model)
+        except Exception:
+            pass
+    return getattr(model, "module", model)
+
+
+def _extract_gate(model) -> float:
+    gate = getattr(model, "text_context_gate", None)
+    if gate is None:
+        return 0.0
+    try:
+        return float(gate.detach().float().cpu().reshape(-1)[0])
+    except Exception:
+        return 0.0
+
+
+def _read_monitor_summary(edge_obj) -> dict:
+    monitor = getattr(edge_obj, "_edge_text_context_grad_monitor", None)
+    if monitor is None:
+        return {"hook_calls": 0, "last_grad_norms": {}, "max_grad_norm": 0.0, "sum_grad_norm": 0.0}
+    last = dict(getattr(monitor, "last", {}) or {})
+    values = [float(v) for v in last.values() if isinstance(v, (int, float))]
+    return {
+        "hook_calls": int(getattr(monitor, "count", 0)),
+        "last_grad_norms": last,
+        "max_grad_norm": float(max(values) if values else 0.0),
+        "sum_grad_norm": float(sum(values) if values else 0.0),
+    }
+
+
+def _write_json(path: str, payload: dict) -> None:
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"✅ Wrote Text/Pose Context evidence JSON: {p}")
+
+
 def _maybe_attach_monitor(edge_obj) -> None:
     try:
         from edge_experiment_guard import TextContextGradMonitor, write_text_context_report
@@ -100,11 +166,9 @@ def _maybe_attach_monitor(edge_obj) -> None:
         print(f"⚠️ Text Context monitor skipped: cannot import edge_experiment_guard: {exc}")
         return
 
-    model = getattr(edge_obj, "model", None)
-    if model is None:
+    unwrapped = _unwrap(edge_obj)
+    if unwrapped is None:
         return
-
-    unwrapped = getattr(getattr(edge_obj, "accelerator", None), "unwrap_model", lambda x: getattr(x, "module", x))(model)
     if not bool(getattr(unwrapped, "enable_text_context_rag", False)):
         return
 
@@ -119,6 +183,45 @@ def _maybe_attach_monitor(edge_obj) -> None:
         )
 
 
+def _final_text_context_contract(edge_obj) -> None:
+    model = _unwrap(edge_obj)
+    if model is None or not bool(getattr(model, "enable_text_context_rag", False)):
+        return
+
+    gate = _extract_gate(model)
+    grad = _read_monitor_summary(edge_obj)
+    payload = {
+        "enabled": True,
+        "text_context_gate": gate,
+        **grad,
+        "require_grad": _env_bool("EDGE_TEXT_CONTEXT_REQUIRE_GRAD", _formal()),
+        "min_grad_norm": _env_float("EDGE_TEXT_CONTEXT_MIN_GRAD_NORM", 1e-10),
+        "require_gate": _env_bool("EDGE_TEXT_CONTEXT_REQUIRE_GATE", False),
+        "min_gate_abs": _env_float("EDGE_TEXT_CONTEXT_MIN_GATE_ABS", 1e-4),
+        "param_summary": _text_context_param_summary(model),
+    }
+
+    evidence_path = os.environ.get("EDGE_TEXT_CONTEXT_EVIDENCE_JSON", "")
+    if _formal() and not evidence_path:
+        evidence_path = os.environ.get("EDGE_TEXT_CONTEXT_GRAD_JSON", "logs/text_context_evidence.json")
+    _write_json(evidence_path, payload)
+
+    if payload["require_grad"]:
+        if int(payload["hook_calls"]) <= 0 or float(payload["max_grad_norm"]) < float(payload["min_grad_norm"]):
+            raise RuntimeError(
+                "Text/Pose Context RAG appears inactive: no sufficient text_context_* gradients. "
+                f"hook_calls={payload['hook_calls']}, max_grad_norm={payload['max_grad_norm']:.3e}, "
+                f"threshold={payload['min_grad_norm']:.3e}."
+            )
+
+    if payload["require_gate"]:
+        if abs(float(gate)) < float(payload["min_gate_abs"]):
+            raise RuntimeError(
+                "Text/Pose Context gate stayed near zero. "
+                f"gate={gate:.3e}, threshold={payload['min_gate_abs']:.3e}."
+            )
+
+
 def install_edge_text_context_training_fix(EDGEClass=None, verbose: bool = True) -> bool:
     if EDGEClass is None:
         try:
@@ -128,7 +231,7 @@ def install_edge_text_context_training_fix(EDGEClass=None, verbose: bool = True)
                 print(f"⚠️ Text Context training fix skipped: cannot import EDGE: {exc}")
             return False
 
-    if getattr(EDGEClass, "_edge_text_context_training_fix_v2_installed", False):
+    if getattr(EDGEClass, "_edge_text_context_training_fix_v3_installed", False):
         return True
 
     original_apply_stage_freezing = EDGEClass._apply_stage_freezing
@@ -142,10 +245,7 @@ def install_edge_text_context_training_fix(EDGEClass=None, verbose: bool = True)
             train_stage,
             adapter_train_decoder=adapter_train_decoder,
         )
-
-        enabled = bool(getattr(model, "enable_text_context_rag", False)) or _env_bool(
-            "EDGE_ENABLE_TEXT_CONTEXT_RAG", False
-        )
+        enabled = bool(getattr(model, "enable_text_context_rag", False)) or _env_bool("EDGE_ENABLE_TEXT_CONTEXT_RAG", False)
         if str(train_stage) == "adapter" and enabled:
             touched = _unfreeze_text_context_modules(model)
             if verbose:
@@ -173,15 +273,21 @@ def install_edge_text_context_training_fix(EDGEClass=None, verbose: bool = True)
             monitor = getattr(self, "_edge_text_context_grad_monitor", None)
             grad_path = os.environ.get("EDGE_TEXT_CONTEXT_GRAD_JSON", "")
             if monitor is not None and grad_path:
-                monitor.write(grad_path)
+                try:
+                    monitor.write(grad_path)
+                except Exception as exc:
+                    print(f"⚠️ Failed to write Text Context grad monitor report: {exc}")
             report_path = os.environ.get("EDGE_TEXT_CONTEXT_REPORT_JSON", "")
             if report_path:
                 try:
                     from edge_experiment_guard import write_text_context_report
-                    unwrapped = getattr(getattr(self, "accelerator", None), "unwrap_model", lambda x: getattr(x, "module", x))(self.model)
-                    write_text_context_report(unwrapped, report_path)
+
+                    unwrapped = _unwrap(self)
+                    if unwrapped is not None:
+                        write_text_context_report(unwrapped, report_path)
                 except Exception as exc:
                     print(f"⚠️ Failed final Text Context report: {exc}")
+            _final_text_context_contract(self)
 
     EDGEClass._apply_stage_freezing = patched_apply_stage_freezing
     EDGEClass.__init__ = patched_init
@@ -191,9 +297,10 @@ def install_edge_text_context_training_fix(EDGEClass=None, verbose: bool = True)
     EDGEClass._edge_original_train_loop_for_text_context_fix = original_train_loop
     EDGEClass._edge_text_context_training_fix_installed = True
     EDGEClass._edge_text_context_training_fix_v2_installed = True
+    EDGEClass._edge_text_context_training_fix_v3_installed = True
 
     if verbose:
-        print("✅ Installed Text/Pose Context RAG training fix v2: adapter unfreeze + grad evidence monitor.")
+        print("✅ Installed Text/Pose Context RAG training fix v3: adapter unfreeze + grad/gate contract.")
     return True
 
 

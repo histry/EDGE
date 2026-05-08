@@ -1,12 +1,46 @@
 #!/usr/bin/env python3
+"""Formal-safe V10 ChoreoRAG wrapper.
+
+Drop-in replacement for ``generate_v10_choreo.py``.
+
+What this wrapper adds on top of the existing V10 wrapper
+---------------------------------------------------------
+1. Installs the existing EDGE experiment guard before importing EDGE / planner.
+2. In formal runs, rejects legacy auto-mid flags instead of silently stripping
+   them.  V10 must own mid-frame planning.
+3. Exports explicit unit prior paths/frames from the V10 plan so
+   ``choreorag_unit_prior.py`` does not need fragile sibling ``*_unit.npy``
+   inference.
+4. Enables formal defaults for temporal prior reports and optional nonlinear
+   jerk penalty patch.
+
+Recommended formal command prefix
+---------------------------------
+    EDGE_RUN_MODE=formal \
+    EDGE_STRICT_EXPERIMENT_GUARD=1 \
+    EDGE_STRICT_RUNTIME_PATCHES=1 \
+    EDGE_UNIT_PRIOR_REQUIRED=1 \
+    python generate_v10_choreo.py ...
+"""
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import List
+
+_TRUE = {"1", "true", "yes", "y", "on"}
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default)).strip().lower() in _TRUE
+
+
+def _formal() -> bool:
+    return str(os.environ.get("EDGE_RUN_MODE", "")).strip().lower() == "formal"
 
 
 def _repo_bootstrap(repo_root: Path) -> None:
@@ -22,9 +56,11 @@ def _repo_bootstrap(repo_root: Path) -> None:
         install_runtime_patches,
     )
 
-    # V10 wrapper should use the V10 contract unless the caller explicitly asks
-    # for another profile.
     os.environ.setdefault("EDGE_EXPERIMENT_PROFILE", "v10")
+    if _formal():
+        os.environ.setdefault("EDGE_STRICT_EXPERIMENT_GUARD", "1")
+        os.environ.setdefault("EDGE_STRICT_RUNTIME_PATCHES", "1")
+
     checkpoint = infer_checkpoint_path_from_argv(sys.argv[1:])
 
     configure_inference_feature_flags(
@@ -47,7 +83,7 @@ def _repo_bootstrap(repo_root: Path) -> None:
 
 
 def _strip_arg(argv: List[str], name: str, takes_value: bool) -> List[str]:
-    out = []
+    out: List[str] = []
     i = 0
     while i < len(argv):
         if argv[i] == name:
@@ -59,6 +95,10 @@ def _strip_arg(argv: List[str], name: str, takes_value: bool) -> List[str]:
         out.append(argv[i])
         i += 1
     return out
+
+
+def _has_arg(argv: List[str], name: str) -> bool:
+    return any(item == name or item.startswith(name + "=") for item in argv)
 
 
 def _get_arg(argv: List[str], name: str, default: str = "") -> str:
@@ -79,71 +119,136 @@ def _default_prefix_from_out(argv: List[str]) -> str:
     return str(Path(out).with_suffix(""))
 
 
-def _prepare_env_defaults() -> None:
-    # Path/reproducibility: allow scripts to run outside one fixed server path.
+def _prepare_env_defaults(out_prefix: str = "") -> None:
     os.environ.setdefault("EDGE_ROOT", str(Path.cwd()))
 
-    # Unit prior defaults. These are inert unless generate_controlled.py finds
-    # corresponding unit specs or EDGE_UNIT_SOFT_PRIOR=1 is used downstream.
+    # Formal V10 should be explicit about temporal prior behavior.
     os.environ.setdefault("EDGE_UNIT_SOFT_PRIOR", "1")
+    os.environ.setdefault("EDGE_UNIT_PRIOR_TEMPORAL", "1")
     os.environ.setdefault("EDGE_UNIT_PRIOR_DCT", "1")
     os.environ.setdefault("EDGE_UNIT_PRIOR_LOW_FREQ_K", "4")
-    os.environ.setdefault("EDGE_UNIT_PRIOR_FEATURES", "upper")
-    os.environ.setdefault("EDGE_UNIT_PRIOR_STRENGTH", "0.012")
+    os.environ.setdefault("EDGE_UNIT_PRIOR_FEATURES", "upper+torso")
+    os.environ.setdefault("EDGE_UNIT_PRIOR_STRENGTH", "0.006" if _formal() else "0.012")
     os.environ.setdefault("EDGE_UNIT_PRIOR_MAX_LEN", "45")
+    if _formal():
+        os.environ.setdefault("EDGE_UNIT_PRIOR_REQUIRED", "1")
+        if out_prefix and not os.environ.get("EDGE_UNIT_PRIOR_REPORT_JSON"):
+            os.environ["EDGE_UNIT_PRIOR_REPORT_JSON"] = out_prefix + "_unit_prior_report.json"
 
     os.environ.setdefault("EDGE_TENSION_AWARE_PLANNER", "1")
 
-    # Full RAG DB scan for formal V10 runs. The old default in v10_choreo_planner.py
-    # was 20000, which can bias retrieval if the DB has ~77k units. This wrapper
-    # overrides it unless the user explicitly sets a smaller cap for smoke tests.
+    # Full RAG DB scan for formal V10 runs.  The old smaller cap can bias a ~77k unit DB.
     os.environ.setdefault("EDGE_V10_MAX_RAG_UNITS", "1000000")
 
-    # V9 summary shape defaults. Activation itself is controlled by
-    # edge_experiment_guard based on checkpoint keys.
+    # Optional nonlinear jerk penalty patch for planner transition cost.
+    os.environ.setdefault("EDGE_V10_JERK_PENALTY", "1" if _formal() else "0")
+    os.environ.setdefault("EDGE_V10_JERK_THRESHOLD", "0.18")
+    os.environ.setdefault("EDGE_V10_JERK_PENALTY_WEIGHT", "0.35")
+    os.environ.setdefault("EDGE_V10_JERK_PENALTY_SCALE", "8.0")
+
     os.environ.setdefault("EDGE_RAG_SUMMARY_DIM", "7")
     os.environ.setdefault("EDGE_RAG_SUMMARY_BLEND_RADIUS", "18")
     os.environ.setdefault("EDGE_RAG_SUMMARY_MODE", "mean")
 
-    # Text Context shape defaults. Activation itself is controlled by guard.
-    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "").strip().lower() in _TRUE:
         os.environ.setdefault("EDGE_TEXT_CONTEXT_DIM", os.environ.get("EDGE_TEXT_BRIDGE_FALLBACK_DIM", "512"))
         os.environ.setdefault("EDGE_TEXT_CONTEXT_MAX_POSE_TOKENS", "64")
         os.environ.setdefault("EDGE_RAG_CONTEXT_MAX_LEN", "45")
 
 
+def _install_optional_planner_patch() -> None:
+    if not _env_flag("EDGE_V10_JERK_PENALTY", "0"):
+        return
+    try:
+        from v10_choreo_planner_formal_patch import install_v10_choreo_planner_formal_patch
+
+        install_v10_choreo_planner_formal_patch(verbose=True)
+    except Exception as exc:
+        if _formal():
+            raise RuntimeError(f"Formal V10 requested planner jerk patch but it failed: {exc}") from exc
+        print(f"⚠️ V10 formal planner patch skipped: {exc}")
+
+
+def _assert_no_legacy_auto_mid(argv: List[str]) -> None:
+    legacy = {
+        "--auto_mid_keyframes": False,
+        "--auto_mid_count": True,
+    }
+    if not _formal():
+        return
+    leaked = [flag for flag in legacy if _has_arg(argv, flag)]
+    if leaked:
+        raise RuntimeError(
+            "Formal V10 runs must not use legacy auto-mid flags because the old planner "
+            f"can silently reduce mid count. Found: {leaked}. Use EDGE_V10_MODE and "
+            "EDGE_V10_MID_FRAMES instead."
+        )
+
+
 def _export_v9_rag_summary_env(plan: dict) -> None:
     unit_paths = [str(p) for p in (plan.get("unit_paths") or []) if p]
     frames = [int(x) for x in (plan.get("mid_pose_frames") or [])]
+
     if not unit_paths:
         os.environ.pop("EDGE_RAG_SUMMARY_UNIT_PATHS", None)
         os.environ.pop("EDGE_RAG_SUMMARY_MID_FRAMES", None)
-        print("ℹ️ V9 RAG summary inference token disabled for this run: no unit_paths in plan.")
+        os.environ.pop("EDGE_RAG_CONTEXT_UNIT_PATHS", None)
+        os.environ.pop("EDGE_UNIT_PRIOR_UNIT_PATHS", None)
+        os.environ.pop("EDGE_UNIT_PRIOR_MID_FRAMES", None)
+        print("ℹ️ V9/V10 RAG context disabled for this run: no unit_paths in plan.")
+        if _formal() and _env_flag("EDGE_UNIT_SOFT_PRIOR", "1"):
+            raise RuntimeError("Formal V10 run expected unit_paths for temporal prior, but V10 plan has none.")
         return
 
-    if os.environ.get("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+    if os.environ.get("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "0").strip().lower() in _TRUE:
         os.environ["EDGE_RAG_SUMMARY_UNIT_PATHS"] = ",".join(unit_paths)
         os.environ["EDGE_RAG_SUMMARY_MID_FRAMES"] = ",".join(str(x) for x in frames)
 
-    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "0").strip().lower() in _TRUE:
         os.environ["EDGE_RAG_CONTEXT_UNIT_PATHS"] = ",".join(unit_paths)
+
+    # Direct channel for Temporal Unit Prior.  This avoids fragile *_unit.npy sibling inference.
+    os.environ["EDGE_UNIT_PRIOR_UNIT_PATHS"] = ",".join(unit_paths)
+    os.environ["EDGE_UNIT_PRIOR_MID_FRAMES"] = ",".join(str(x) for x in frames)
 
     print("✅ V10 planner context env exported:")
     print(f"  unit_paths={len(unit_paths)}")
     print(f"  mid_frames={frames}")
     print(f"  EDGE_ENABLE_RAG_SUMMARY_TOKEN={os.environ.get('EDGE_ENABLE_RAG_SUMMARY_TOKEN', '0')}")
     print(f"  EDGE_ENABLE_TEXT_CONTEXT_RAG={os.environ.get('EDGE_ENABLE_TEXT_CONTEXT_RAG', '0')}")
+    print(f"  EDGE_UNIT_SOFT_PRIOR={os.environ.get('EDGE_UNIT_SOFT_PRIOR', '0')}")
+    print(f"  EDGE_UNIT_PRIOR_REQUIRED={os.environ.get('EDGE_UNIT_PRIOR_REQUIRED', '0')}")
     print(f"  EDGE_V10_MAX_RAG_UNITS={os.environ.get('EDGE_V10_MAX_RAG_UNITS')}")
 
 
-def build_forward_argv(argv: List[str]) -> List[str]:
-    _prepare_env_defaults()
+def _write_wrapper_contract_json(out_prefix: str, plan: dict) -> None:
+    if not (_formal() or os.environ.get("EDGE_V10_WRAPPER_CONTRACT_JSON")):
+        return
+    path = os.environ.get("EDGE_V10_WRAPPER_CONTRACT_JSON", out_prefix + "_wrapper_contract.json")
+    payload = {
+        "run_mode": os.environ.get("EDGE_RUN_MODE", "debug"),
+        "experiment_profile": os.environ.get("EDGE_EXPERIMENT_PROFILE", ""),
+        "mid_pose_frames": plan.get("mid_pose_frames", []),
+        "mid_poses": plan.get("mid_poses", []),
+        "unit_paths": plan.get("unit_paths", []),
+        "env": {k: v for k, v in os.environ.items() if k.startswith("EDGE_")},
+    }
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"✅ V10 wrapper contract saved: {p}")
 
-    # Import after guard/sitecustomize so planner patches and env isolation are active.
+
+def build_forward_argv(argv: List[str]) -> List[str]:
+    _assert_no_legacy_auto_mid(argv)
+
+    out_prefix = os.environ.get("EDGE_V10_OUT_PREFIX", _default_prefix_from_out(argv))
+    _prepare_env_defaults(out_prefix=out_prefix)
+    _install_optional_planner_patch()
+
     from v10_choreo_planner import build_config_from_env, env_int, plan_choreo_from_rag_db
 
     num_frames = env_int("EDGE_V10_NUM_FRAMES", 150)
-    out_prefix = os.environ.get("EDGE_V10_OUT_PREFIX", _default_prefix_from_out(argv))
 
     for flag, takes in [
         ("--auto_mid_keyframes", False),
@@ -173,6 +278,7 @@ def build_forward_argv(argv: List[str]) -> List[str]:
     )
 
     _export_v9_rag_summary_env(plan)
+    _write_wrapper_contract_json(out_prefix, plan)
 
     mid_poses = ",".join(plan["mid_poses"])
     mid_frames = ",".join(str(x) for x in plan["mid_pose_frames"])

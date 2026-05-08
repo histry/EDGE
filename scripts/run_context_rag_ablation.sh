@@ -1,50 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EDGE_ROOT="${EDGE_ROOT:-$(pwd)}"
-cd "$EDGE_ROOT"
-mkdir -p logs output/v10_context_ablation
+# Four-way Text/Pose Context RAG ablation.
+# Put this under scripts/run_context_rag_ablation.sh and run from EDGE repo root.
+#
+# Required env vars:
+#   CHECKPOINT
+#   START_POSE
+#   END_POSE
+#   AUDIO
+#   OUT_DIR
+#   EDGE_V10_RAG_DB or RAG_DB
+#
+# Optional:
+#   TRAJECTORY="0,0;0.5,0.7;-0.3,1.2;0,1.6"
+#   FEATURE_TYPE=hybrid
+#   SAMPLER=ddim
+#   EXTRA_ARGS="..."
 
-: "${CHECKPOINT:?Set CHECKPOINT to a V10/Text-Context checkpoint path}"
-: "${EDGE_V10_RAG_DB:?Set EDGE_V10_RAG_DB to the motion-unit RAG DB .npz path}"
-: "${COMMON_ARGS:?Set COMMON_ARGS to the usual generate_v10_choreo.py args, quoted as one string}"
+: "${CHECKPOINT:?Set CHECKPOINT=/path/to/train-4.pt}"
+: "${START_POSE:?Set START_POSE=/path/to/start.npy}"
+: "${END_POSE:?Set END_POSE=/path/to/end.npy}"
+: "${AUDIO:?Set AUDIO=/path/to/audio.wav}"
+: "${OUT_DIR:?Set OUT_DIR=output/context_ablation}"
 
-export EDGE_STRICT_EXPERIMENT_GUARD=1
-export EDGE_STRICT_RUNTIME_PATCHES=1
-export EDGE_EXPERIMENT_PROFILE=v10
-export EDGE_V10_MAX_RAG_UNITS="${EDGE_V10_MAX_RAG_UNITS:-1000000}"
+TRAJECTORY=${TRAJECTORY:-"0,0;0.5,0.7;-0.3,1.2;0,1.6"}
+FEATURE_TYPE=${FEATURE_TYPE:-hybrid}
+SAMPLER=${SAMPLER:-ddim}
+EXTRA_ARGS=${EXTRA_ARGS:-}
+mkdir -p "$OUT_DIR"
 
-run_one() {
-  local tag="$1"
-  shift
-  echo "===== ${tag} ====="
-  env "$@" \
-    EDGE_V10_OUT_PREFIX="output/v10_context_ablation/${tag}" \
-    OUT_PATH="output/v10_context_ablation/${tag}.npy" \
-    CHECKPOINT="$CHECKPOINT" \
-    python generate_v10_choreo.py $COMMON_ARGS 2>&1 | tee "logs/${tag}.log"
+COMMON_ENV=(
+  EDGE_RUN_MODE=formal
+  EDGE_EXPERIMENT_PROFILE=v10
+  EDGE_STRICT_EXPERIMENT_GUARD=1
+  EDGE_STRICT_RUNTIME_PATCHES=1
+  EDGE_ENABLE_TEXT_CONTEXT_RAG=1
+  EDGE_TEXT_CONTEXT_REQUIRED=1
+  EDGE_UNIT_SOFT_PRIOR=1
+  EDGE_UNIT_PRIOR_REQUIRED=1
+  EDGE_UNIT_PRIOR_TEMPORAL=1
+  EDGE_UNIT_PRIOR_DCT=1
+  EDGE_UNIT_PRIOR_LOW_FREQ_K=4
+  EDGE_UNIT_PRIOR_FEATURES=upper+torso
+  EDGE_UNIT_PRIOR_STRENGTH=0.006
+)
+
+run_case() {
+  local name="$1"
+  local mode="$2"
+  local out_prefix="$OUT_DIR/$name"
+  echo "===== Context RAG ablation: $name / mode=$mode ====="
+  env "${COMMON_ENV[@]}" \
+    EDGE_RAG_CONTEXT_MODE="$mode" \
+    EDGE_V10_OUT_PREFIX="$out_prefix" \
+    EDGE_RAG_CONTEXT_REPORT_JSON="${out_prefix}_context_report.json" \
+    EDGE_UNIT_PRIOR_REPORT_JSON="${out_prefix}_unit_prior_report.json" \
+    python generate_v10_choreo.py \
+      --checkpoint "$CHECKPOINT" \
+      --start_pose "$START_POSE" \
+      --end_pose "$END_POSE" \
+      --audio "$AUDIO" \
+      --feature_type "$FEATURE_TYPE" \
+      --trajectory "$TRAJECTORY" \
+      --sampler "$SAMPLER" \
+      --out "${out_prefix}.npy" \
+      $EXTRA_ARGS
+
+  if [[ -f "${out_prefix}_raw.npy" && -f "${out_prefix}.npy" && -f "${out_prefix}_target_traj.npy" ]]; then
+    python scripts/eval_generated_motions.py \
+      --raw_motion "${out_prefix}_raw.npy" \
+      --final_motion "${out_prefix}.npy" \
+      --target_traj "${out_prefix}_target_traj.npy" \
+      --meta "${out_prefix}_meta.json" \
+      --out "${out_prefix}_eval.json" \
+      --formal || true
+  fi
 }
 
-# 1) no_context: clean RAG summary/unit-prior planner but no Text/Pose Context memory.
-run_one no_context \
-  EDGE_ENABLE_TEXT_CONTEXT_RAG=0
+run_case "no_context" "no_context"
+run_case "context" "normal"
+run_case "shuffled_context" "shuffled"
+run_case "wrong_text" "wrong_text"
 
-# 2) context: real selected retrieved units + text embeddings as decoder memory.
-run_one context \
-  EDGE_ENABLE_TEXT_CONTEXT_RAG=1
-
-# 3) shuffled_context: IO patch should consume explicit context paths if supplied.
-# Set EDGE_RAG_CONTEXT_UNIT_PATHS manually before this script to use a shuffled list.
-if [ -n "${EDGE_SHUFFLED_RAG_CONTEXT_UNIT_PATHS:-}" ]; then
-  run_one shuffled_context \
-    EDGE_ENABLE_TEXT_CONTEXT_RAG=1 \
-    EDGE_RAG_CONTEXT_UNIT_PATHS="$EDGE_SHUFFLED_RAG_CONTEXT_UNIT_PATHS"
-else
-  echo "Skip shuffled_context: set EDGE_SHUFFLED_RAG_CONTEXT_UNIT_PATHS to a comma-separated shuffled unit list."
-fi
-
-# 4) wrong_text: keep motion context but alter text query/filter semantics.
-run_one wrong_text \
-  EDGE_ENABLE_TEXT_CONTEXT_RAG=1 \
-  EDGE_TEXT_QUERY="现代街舞，强节拍，大幅跳跃，非敦煌风格"
-
+python scripts/analyze_context_rag_ablation.py --eval_dir "$OUT_DIR" --out "$OUT_DIR/context_ablation_summary.json" || true

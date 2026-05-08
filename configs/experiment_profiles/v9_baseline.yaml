@@ -1,0 +1,13 @@
+name: v9_baseline
+purpose: Clean V9 baseline without Text/Pose Context RAG contamination.
+env:
+  EDGE_RUN_MODE: "formal"
+  EDGE_EXPERIMENT_PROFILE: "v9_baseline"
+  EDGE_STRICT_EXPERIMENT_GUARD: "1"
+  EDGE_STRICT_RUNTIME_PATCHES: "1"
+  EDGE_ENABLE_TEXT_CONTEXT_RAG: "0"
+  EDGE_UNIT_SOFT_PRIOR: "0"
+forbidden_env:
+  - "EDGE_V10_MANUAL_UNITS"
+  - "EDGE_V10_MANUAL_MID_POSES"
+  - "EDGE_TEXT_BRIDGE_MODE"
