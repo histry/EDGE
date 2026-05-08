@@ -1,35 +1,9 @@
 """Runtime patch for differentiable contact loss in EDGE training.
 
-Why this patch exists
----------------------
-EDGE already has contact-channel regression and a foot sliding loss.  This patch
-turns the foot sliding objective into an explicit differentiable contact loss:
-
-    L = mean C_t * ||v_foot_world||^2
-
-It reuses GaussianDiffusion._fk_positions(), so no separate SMPL-X dependency is
-required.  The patch is intentionally env-gated and replaces
-``GaussianDiffusion._foot_sliding_loss`` only when enabled.
-
-Install before constructing ``EDGE`` / ``GaussianDiffusion``.
-
-Environment
------------
-    EDGE_DIFF_CONTACT_LOSS=1
-    EDGE_DCL_USE_FK_CONTACT_LABELS=0
-    EDGE_DCL_CONTACT_THRESHOLD=0.5
-    EDGE_DCL_HEIGHT_THRESHOLD=0.035
-    EDGE_DCL_SPEED_THRESHOLD=0.08
-    EDGE_DCL_HORIZONTAL_ONLY=1
-    EDGE_DCL_VERBOSE=0
-
-Training weight
----------------
-Use existing EDGE argument:
-    --foot_loss_weight 2.5
-
-or lower for safety:
-    --foot_loss_weight 0.5
+V11.1 logic-gap fix:
+- Adds EDGE_DCL_CONTACT_SOURCE=auto|target_channels|target_fk|pred_fk_height|pred_fk_height_speed|hybrid.
+- In auto mode, overly dense target contact channels fall back to FK/height contact.
+- Keeps using existing --foot_loss_weight, so no train.py loss plumbing changes are needed.
 """
 from __future__ import annotations
 
@@ -55,6 +29,10 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_str(name: str, default: str) -> str:
+    return str(os.environ.get(name, default)).strip()
+
+
 def install_differentiable_contact_loss_patch(verbose: bool = True) -> bool:
     try:
         from model.diffusion import GaussianDiffusion, maybe_unnormalize
@@ -64,7 +42,7 @@ def install_differentiable_contact_loss_patch(verbose: bool = True) -> bool:
             print(f"⚠️ Differentiable contact loss patch skipped: {exc}")
         return False
 
-    if getattr(GaussianDiffusion, "_edge_differentiable_contact_loss_patch_installed", False):
+    if getattr(GaussianDiffusion, "_edge_differentiable_contact_loss_patch_v111_installed", False):
         return True
 
     original_foot_sliding_loss = GaussianDiffusion._foot_sliding_loss
@@ -87,9 +65,10 @@ def install_differentiable_contact_loss_patch(verbose: bool = True) -> bool:
 
             pred_joints = self._fk_positions(pred_physical)
             target_joints = None
-            if target_physical is not None and _env_bool("EDGE_DCL_USE_FK_CONTACT_LABELS", False):
-                # FK target joints are detached inside the loss, but computing them
-                # here keeps the code path explicit and reproducible.
+
+            contact_source = _env_str("EDGE_DCL_CONTACT_SOURCE", "auto").lower()
+            needs_target_fk = contact_source in {"target_fk", "target_fk_height", "target_fk_height_speed", "target_fk_strict"} or _env_bool("EDGE_DCL_USE_FK_CONTACT_LABELS", False)
+            if target_physical is not None and needs_target_fk:
                 with torch.no_grad():
                     target_joints = self._fk_positions(target_physical)
 
@@ -104,6 +83,7 @@ def install_differentiable_contact_loss_patch(verbose: bool = True) -> bool:
                 height_threshold=_env_float("EDGE_DCL_HEIGHT_THRESHOLD", 0.035),
                 speed_threshold=_env_float("EDGE_DCL_SPEED_THRESHOLD", 0.08),
                 horizontal_only=_env_bool("EDGE_DCL_HORIZONTAL_ONLY", True),
+                contact_source=contact_source,
             )
 
             self._edge_last_dcl_debug = debug
@@ -120,11 +100,13 @@ def install_differentiable_contact_loss_patch(verbose: bool = True) -> bool:
 
     GaussianDiffusion._foot_sliding_loss = patched_foot_sliding_loss
     GaussianDiffusion._edge_differentiable_contact_loss_patch_installed = True
+    GaussianDiffusion._edge_differentiable_contact_loss_patch_v111_installed = True
 
     if verbose:
         print(
-            "✅ Installed differentiable contact loss patch: "
+            "✅ Installed differentiable contact loss patch v11.1: "
             f"enabled={_env_bool('EDGE_DIFF_CONTACT_LOSS', False)}, "
+            f"contact_source={_env_str('EDGE_DCL_CONTACT_SOURCE', 'auto')}, "
             "uses existing --foot_loss_weight."
         )
     return True

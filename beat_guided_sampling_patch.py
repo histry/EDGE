@@ -1,31 +1,15 @@
 """Beat / energy guided sampling patch for EDGE diffusion.
 
-This is an inference-time guidance module.  It does not require retraining.
-It patches ``GaussianDiffusion.model_predictions`` and gently edits predicted
-x0 so that local motion energy is higher on music beat/onset frames.
+V11.1 improvements:
+- Supports full-body energy with EDGE_BEAT_GUIDANCE_FEATURES=all.
+- Adds scheduled guidance so early noisy steps are not over-constrained.
+- Adds gradient clipping and per-sample normalization.
 
-The update is performed directly on predicted x0:
-
-    x0' = x0 - alpha * grad_x0 EnergyLoss(x0, beat_mask)
-
-and the corresponding predicted noise is recomputed from x_t and x0'.
-
-Environment
------------
+Recommended inference:
     EDGE_BEAT_GUIDANCE=1
-    EDGE_BEAT_GUIDANCE_WEIGHT=0.02
-    EDGE_BEAT_GUIDANCE_TARGET=1.25
-    EDGE_BEAT_GUIDANCE_OFFBEAT_WEIGHT=0.05
-    EDGE_BEAT_GUIDANCE_FEATURES=upper|rot|all
-    EDGE_BEAT_MASK_QUANTILE=0.88
-    EDGE_BEAT_MASK_PATH=/optional/path.npy
-    EDGE_BEAT_GUIDANCE_VERBOSE=0
-
-Notes
------
-- This is a proxy guidance. It is not a replacement for paired music-motion
-  training.
-- It is intentionally conservative by default. Increase weight gradually.
+    EDGE_BEAT_GUIDANCE_WEIGHT=0.03
+    EDGE_BEAT_GUIDANCE_TARGET=1.35
+    EDGE_BEAT_GUIDANCE_FEATURES=all
 """
 from __future__ import annotations
 
@@ -78,12 +62,7 @@ def _beat_mask_from_audio(audio: torch.Tensor, seq_len: int) -> torch.Tensor:
     if audio.ndim != 3:
         raise ValueError(f"audio must be [B,T,C], got {tuple(audio.shape)}")
     if audio.shape[1] != seq_len:
-        audio = F.interpolate(
-            audio.transpose(1, 2),
-            size=seq_len,
-            mode="linear",
-            align_corners=False,
-        ).transpose(1, 2)
+        audio = F.interpolate(audio.transpose(1, 2), size=seq_len, mode="linear", align_corners=False).transpose(1, 2)
 
     if audio.shape[-1] > 768:
         onset = torch.relu(audio[..., 768])
@@ -97,13 +76,11 @@ def _beat_mask_from_audio(audio: torch.Tensor, seq_len: int) -> torch.Tensor:
     onset = _normalize_01(onset)
     q = _env_float("EDGE_BEAT_MASK_QUANTILE", 0.88)
     thr = torch.quantile(onset.detach(), q, dim=1, keepdim=True)
-    mask = (onset >= thr).float()
-    return mask
+    return (onset >= thr).float()
 
 
 def _beat_mask_from_path(path: str, batch: int, seq_len: int, device, dtype) -> torch.Tensor:
-    arr = np.load(path, allow_pickle=True)
-    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.asarray(np.load(path, allow_pickle=True), dtype=np.float32)
     if arr.ndim == 1:
         arr = arr[None]
     if arr.shape[0] == 1 and batch > 1:
@@ -132,14 +109,14 @@ def build_beat_mask(cond, batch: int, seq_len: int, device, dtype) -> Optional[t
 
 
 def motion_energy(x0: torch.Tensor) -> torch.Tensor:
-    """Return [B,T] local motion energy proxy."""
     features = _env_str("EDGE_BEAT_GUIDANCE_FEATURES", "upper").lower()
     if x0.shape[-1] == 151:
         if features == "upper":
-            idx = _upper_rot_indices(x0.device)
-            feat = x0.index_select(-1, idx)
+            feat = x0.index_select(-1, _upper_rot_indices(x0.device))
         elif features == "all":
             feat = x0
+        elif features in {"root", "root_xz"}:
+            feat = x0[..., [4, 6]]
         else:
             feat = x0[..., ROT_SLICE]
     else:
@@ -152,20 +129,29 @@ def motion_energy(x0: torch.Tensor) -> torch.Tensor:
 
 
 def energy_guidance_loss(x0: torch.Tensor, beat_mask: torch.Tensor) -> torch.Tensor:
-    energy = motion_energy(x0)
-    energy_n = _normalize_01(energy)
+    energy = _normalize_01(motion_energy(x0))
     beat_mask = beat_mask.to(device=x0.device, dtype=x0.dtype)
     if beat_mask.shape[1] != x0.shape[1]:
         beat_mask = F.interpolate(beat_mask[:, None], size=x0.shape[1], mode="linear", align_corners=False)[:, 0]
 
-    target = _env_float("EDGE_BEAT_GUIDANCE_TARGET", 1.25)
+    target = _env_float("EDGE_BEAT_GUIDANCE_TARGET", 1.35)
     offbeat_w = _env_float("EDGE_BEAT_GUIDANCE_OFFBEAT_WEIGHT", 0.05)
-
-    # Maximize energy on beat frames and mildly discourage too much offbeat noise.
-    beat_term = -target * (beat_mask * energy_n).sum() / beat_mask.sum().clamp_min(1.0)
+    beat_term = -target * (beat_mask * energy).sum() / beat_mask.sum().clamp_min(1.0)
     offbeat = 1.0 - beat_mask
-    offbeat_term = offbeat_w * (offbeat * energy_n.pow(2)).sum() / offbeat.sum().clamp_min(1.0)
+    offbeat_term = offbeat_w * (offbeat * energy.pow(2)).sum() / offbeat.sum().clamp_min(1.0)
     return beat_term + offbeat_term
+
+
+def _timestep_schedule_weight(t: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(t):
+        return torch.tensor(1.0)
+    t_float = t.float()
+    denom = t_float.max().clamp_min(1.0)
+    progress = 1.0 - (t_float / denom)
+    start = _env_float("EDGE_BEAT_GUIDANCE_START_PROGRESS", 0.25)
+    end = _env_float("EDGE_BEAT_GUIDANCE_END_PROGRESS", 1.0)
+    w = ((progress - start) / max(end - start, 1e-6)).clamp(0.0, 1.0)
+    return w.view(-1, 1, 1)
 
 
 def install_beat_guided_sampling_patch(verbose: bool = True) -> bool:
@@ -176,7 +162,7 @@ def install_beat_guided_sampling_patch(verbose: bool = True) -> bool:
             print(f"⚠️ Beat-guided sampling patch skipped: {exc}")
         return False
 
-    if getattr(GaussianDiffusion, "_edge_beat_guided_sampling_patch_installed", False):
+    if getattr(GaussianDiffusion, "_edge_beat_guided_sampling_patch_v111_installed", False):
         return True
 
     original_model_predictions = GaussianDiffusion.model_predictions
@@ -185,57 +171,48 @@ def install_beat_guided_sampling_patch(verbose: bool = True) -> bool:
     def patched_model_predictions(self, x, cond, t, *args, **kwargs):
         pred_noise, x_start = original_model_predictions(self, x, cond, t, *args, **kwargs)
 
-        if not _env_bool("EDGE_BEAT_GUIDANCE", False):
-            return pred_noise, x_start
-
-        # Do not guide during training; this patch is inference-time only.
-        if getattr(self, "training", False):
+        if not _env_bool("EDGE_BEAT_GUIDANCE", False) or getattr(self, "training", False):
             return pred_noise, x_start
 
         weight = _env_float("EDGE_BEAT_GUIDANCE_WEIGHT", _env_float("EDGE_BEAT_GUIDANCE_ALPHA", 0.02))
         if weight <= 0:
             return pred_noise, x_start
 
-        beat_mask = build_beat_mask(
-            cond,
-            batch=x_start.shape[0],
-            seq_len=x_start.shape[1],
-            device=x_start.device,
-            dtype=x_start.dtype,
-        )
+        beat_mask = build_beat_mask(cond, x_start.shape[0], x_start.shape[1], x_start.device, x_start.dtype)
         if beat_mask is None or not bool((beat_mask.sum() > 0).detach().cpu().item()):
             return pred_noise, x_start
 
-        # Compute a gradient on x0 only. We do not backprop through the denoiser.
         with torch.enable_grad():
             x0_leaf = x_start.detach().clone().requires_grad_(True)
             loss = energy_guidance_loss(x0_leaf, beat_mask)
             grad = torch.autograd.grad(loss, x0_leaf, retain_graph=False, create_graph=False)[0]
             grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
-            max_norm = _env_float("EDGE_BEAT_GUIDANCE_MAX_GRAD_NORM", 10.0)
+            max_norm = _env_float("EDGE_BEAT_GUIDANCE_MAX_GRAD_NORM", 5.0)
             gnorm = torch.linalg.norm(grad.reshape(grad.shape[0], -1), dim=-1).clamp_min(1e-8)
             scale = torch.clamp(max_norm / gnorm, max=1.0).view(-1, 1, 1)
-            x0_guided = (x0_leaf - weight * grad * scale).detach()
+            sched = _timestep_schedule_weight(t).to(device=x_start.device, dtype=x_start.dtype)
+            x0_guided = (x0_leaf - weight * sched * grad * scale).detach()
 
         if _env_bool("EDGE_BEAT_GUIDANCE_VERBOSE", False):
             print(
                 "🥁 Beat-guided sampling: "
                 f"loss={float(loss.detach().cpu().item()):.6f}, "
-                f"beat_ratio={float(beat_mask.mean().detach().cpu().item()):.4f}, weight={weight}"
+                f"beat_ratio={float(beat_mask.mean().detach().cpu().item()):.4f}, "
+                f"weight={weight}"
             )
 
-        # Recompute noise so downstream DDPM/DDIM math remains consistent.
-        pred_noise_guided = self.predict_noise_from_start(x, t, x0_guided)
-        return pred_noise_guided, x0_guided
+        return self.predict_noise_from_start(x, t, x0_guided), x0_guided
 
     GaussianDiffusion.model_predictions = patched_model_predictions
     GaussianDiffusion._edge_beat_guided_sampling_patch_installed = True
+    GaussianDiffusion._edge_beat_guided_sampling_patch_v111_installed = True
 
     if verbose:
         print(
-            "✅ Installed beat-guided sampling patch: "
+            "✅ Installed beat-guided sampling patch v11.1: "
             f"enabled={_env_bool('EDGE_BEAT_GUIDANCE', False)}, "
-            f"weight={_env_float('EDGE_BEAT_GUIDANCE_WEIGHT', 0.02)}"
+            f"weight={_env_float('EDGE_BEAT_GUIDANCE_WEIGHT', 0.02)}, "
+            f"features={_env_str('EDGE_BEAT_GUIDANCE_FEATURES', 'upper')}"
         )
     return True
 
