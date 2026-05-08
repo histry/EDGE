@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-# ---- EDGE runtime patches: force-load sitecustomize ----
-# Must stay AFTER all from __future__ imports and BEFORE importing v10_choreo_planner.
-try:
-    import sitecustomize  # noqa: F401
-except Exception as exc:
-    print(f"⚠️ sitecustomize import failed in generate_v10_choreo.py: {exc}")
-# --------------------------------------------------------
-
 import os
 import shlex
 import subprocess
@@ -16,7 +8,42 @@ import sys
 from pathlib import Path
 from typing import List
 
-from v10_choreo_planner import build_config_from_env, env_int, plan_choreo_from_rag_db
+
+def _repo_bootstrap(repo_root: Path) -> None:
+    os.chdir(repo_root)
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from edge_experiment_guard import (
+        assert_inference_contract,
+        configure_inference_feature_flags,
+        env_bool,
+        infer_checkpoint_path_from_argv,
+        install_runtime_patches,
+    )
+
+    # V10 wrapper should use the V10 contract unless the caller explicitly asks
+    # for another profile.
+    os.environ.setdefault("EDGE_EXPERIMENT_PROFILE", "v10")
+    checkpoint = infer_checkpoint_path_from_argv(sys.argv[1:])
+
+    configure_inference_feature_flags(
+        checkpoint_path=checkpoint,
+        profile=os.environ.get("EDGE_EXPERIMENT_PROFILE", "v10"),
+        verbose=True,
+    )
+    install_runtime_patches(
+        strict=env_bool("EDGE_STRICT_RUNTIME_PATCHES", False),
+        profile=os.environ.get("EDGE_EXPERIMENT_PROFILE", "v10"),
+        verbose=True,
+    )
+
+    if env_bool("EDGE_STRICT_EXPERIMENT_GUARD", True):
+        assert_inference_contract(
+            checkpoint_path=checkpoint,
+            profile=os.environ.get("EDGE_EXPERIMENT_PROFILE", "v10"),
+            strict=True,
+        )
 
 
 def _strip_arg(argv: List[str], name: str, takes_value: bool) -> List[str]:
@@ -53,6 +80,11 @@ def _default_prefix_from_out(argv: List[str]) -> str:
 
 
 def _prepare_env_defaults() -> None:
+    # Path/reproducibility: allow scripts to run outside one fixed server path.
+    os.environ.setdefault("EDGE_ROOT", str(Path.cwd()))
+
+    # Unit prior defaults. These are inert unless generate_controlled.py finds
+    # corresponding unit specs or EDGE_UNIT_SOFT_PRIOR=1 is used downstream.
     os.environ.setdefault("EDGE_UNIT_SOFT_PRIOR", "1")
     os.environ.setdefault("EDGE_UNIT_PRIOR_DCT", "1")
     os.environ.setdefault("EDGE_UNIT_PRIOR_LOW_FREQ_K", "4")
@@ -62,15 +94,20 @@ def _prepare_env_defaults() -> None:
 
     os.environ.setdefault("EDGE_TENSION_AWARE_PLANNER", "1")
 
-    os.environ.setdefault("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "1")
+    # Full RAG DB scan for formal V10 runs. The old default in v10_choreo_planner.py
+    # was 20000, which can bias retrieval if the DB has ~77k units. This wrapper
+    # overrides it unless the user explicitly sets a smaller cap for smoke tests.
+    os.environ.setdefault("EDGE_V10_MAX_RAG_UNITS", "1000000")
+
+    # V9 summary shape defaults. Activation itself is controlled by
+    # edge_experiment_guard based on checkpoint keys.
     os.environ.setdefault("EDGE_RAG_SUMMARY_DIM", "7")
     os.environ.setdefault("EDGE_RAG_SUMMARY_BLEND_RADIUS", "18")
     os.environ.setdefault("EDGE_RAG_SUMMARY_MODE", "mean")
 
-    # Text/Pose Context RAG defaults are intentionally conservative:
-    # scripts can override them, but this wrapper will not disable them.
-    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "").strip():
-        os.environ.setdefault("EDGE_TEXT_CONTEXT_DIM", os.environ.get("EDGE_TEXT_BRIDGE_FALLBACK_DIM", "384"))
+    # Text Context shape defaults. Activation itself is controlled by guard.
+    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        os.environ.setdefault("EDGE_TEXT_CONTEXT_DIM", os.environ.get("EDGE_TEXT_BRIDGE_FALLBACK_DIM", "512"))
         os.environ.setdefault("EDGE_TEXT_CONTEXT_MAX_POSE_TOKENS", "64")
         os.environ.setdefault("EDGE_RAG_CONTEXT_MAX_LEN", "45")
 
@@ -84,24 +121,26 @@ def _export_v9_rag_summary_env(plan: dict) -> None:
         print("ℹ️ V9 RAG summary inference token disabled for this run: no unit_paths in plan.")
         return
 
-    os.environ["EDGE_ENABLE_RAG_SUMMARY_TOKEN"] = "1"
-    os.environ["EDGE_RAG_SUMMARY_UNIT_PATHS"] = ",".join(unit_paths)
-    os.environ["EDGE_RAG_SUMMARY_MID_FRAMES"] = ",".join(str(x) for x in frames)
+    if os.environ.get("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        os.environ["EDGE_RAG_SUMMARY_UNIT_PATHS"] = ",".join(unit_paths)
+        os.environ["EDGE_RAG_SUMMARY_MID_FRAMES"] = ",".join(str(x) for x in frames)
 
-    # Text/Pose Context RAG uses the same selected unit clips as context by default.
-    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+    if os.environ.get("EDGE_ENABLE_TEXT_CONTEXT_RAG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
         os.environ["EDGE_RAG_CONTEXT_UNIT_PATHS"] = ",".join(unit_paths)
 
-    print("✅ V9 RAG summary inference env exported:")
-    print(f"  EDGE_RAG_SUMMARY_UNIT_PATHS={os.environ['EDGE_RAG_SUMMARY_UNIT_PATHS']}")
-    print(f"  EDGE_RAG_SUMMARY_MID_FRAMES={os.environ['EDGE_RAG_SUMMARY_MID_FRAMES']}")
-    print(f"  EDGE_RAG_SUMMARY_MODE={os.environ.get('EDGE_RAG_SUMMARY_MODE', 'mean')}")
-    if os.environ.get("EDGE_RAG_CONTEXT_UNIT_PATHS"):
-        print(f"  EDGE_RAG_CONTEXT_UNIT_PATHS={os.environ['EDGE_RAG_CONTEXT_UNIT_PATHS']}")
+    print("✅ V10 planner context env exported:")
+    print(f"  unit_paths={len(unit_paths)}")
+    print(f"  mid_frames={frames}")
+    print(f"  EDGE_ENABLE_RAG_SUMMARY_TOKEN={os.environ.get('EDGE_ENABLE_RAG_SUMMARY_TOKEN', '0')}")
+    print(f"  EDGE_ENABLE_TEXT_CONTEXT_RAG={os.environ.get('EDGE_ENABLE_TEXT_CONTEXT_RAG', '0')}")
+    print(f"  EDGE_V10_MAX_RAG_UNITS={os.environ.get('EDGE_V10_MAX_RAG_UNITS')}")
 
 
 def build_forward_argv(argv: List[str]) -> List[str]:
     _prepare_env_defaults()
+
+    # Import after guard/sitecustomize so planner patches and env isolation are active.
+    from v10_choreo_planner import build_config_from_env, env_int, plan_choreo_from_rag_db
 
     num_frames = env_int("EDGE_V10_NUM_FRAMES", 150)
     out_prefix = os.environ.get("EDGE_V10_OUT_PREFIX", _default_prefix_from_out(argv))
@@ -164,9 +203,7 @@ def main() -> int:
         return 2
 
     repo_root = Path(__file__).resolve().parent
-    os.chdir(repo_root)
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    _repo_bootstrap(repo_root)
 
     cmd = [sys.executable, str(repo_root / "generate_controlled_v9.py")] + build_forward_argv(argv)
     return subprocess.call(cmd)

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Reliable V9/V10 inference entrypoint.
+"""Reliable V9/V10 inference entrypoint with experiment-safety guards.
 
 Run this file with exactly the same arguments as generate_controlled.py.
 
-Why this wrapper is needed:
-- Python does not always import sitecustomize.py from the repository root.
-- If runtime patches are not installed before generate_controlled.py imports EDGE,
-  V9 RAG Summary Token, Text/Pose Context RAG, and safety patches may not activate.
-- This wrapper installs sitecustomize explicitly, then executes generate_controlled.py as __main__.
+Key fixes compared with the old wrapper:
+- Text/Pose Context RAG is NOT enabled just because generate_controlled.py has
+  V10-friendly defaults. It is enabled only when the checkpoint contains
+  text_context_* weights, unless the user explicitly sets EDGE_ENABLE_TEXT_CONTEXT_RAG=1.
+- Clean V9 baselines can set EDGE_EXPERIMENT_PROFILE=v9_baseline and will hard
+  fail if Text/Pose Context RAG is accidentally enabled.
+- Required runtime patches can be checked hard with EDGE_STRICT_RUNTIME_PATCHES=1.
 """
 
 from __future__ import annotations
@@ -18,54 +20,48 @@ import sys
 from pathlib import Path
 
 
-def _install_runtime_patches(repo_root: Path) -> None:
+def _bootstrap(repo_root: Path) -> str:
     os.chdir(repo_root)
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    # Defaults required by V9 RAG Summary Token.
-    os.environ.setdefault("EDGE_ENABLE_RAG_SUMMARY_TOKEN", "1")
-    os.environ.setdefault("EDGE_RAG_SUMMARY_DIM", "7")
-    os.environ.setdefault("EDGE_RAG_SUMMARY_BLEND_RADIUS", "18")
-    os.environ.setdefault("EDGE_RAG_SUMMARY_MODE", "mean")
+    from edge_experiment_guard import (
+        assert_inference_contract,
+        configure_inference_feature_flags,
+        env_bool,
+        infer_checkpoint_path_from_argv,
+        install_runtime_patches,
+        normalize_profile,
+    )
 
-    # Force-load all repository runtime patches:
-    # - V9 RAG inference patch
-    # - full-landing patch
-    # - Text/Pose Context RAG model/IO patch
-    # - Text Bridge semantic planner patch
-    try:
-        import sitecustomize  # noqa: F401
-    except Exception as exc:
-        print(f"⚠️ sitecustomize import failed in generate_controlled_v9.py: {exc}")
+    checkpoint = infer_checkpoint_path_from_argv(sys.argv[1:])
+    profile = normalize_profile(os.environ.get("EDGE_EXPERIMENT_PROFILE", "auto"))
 
-    # Hard fallback: at minimum, install V9 RAG bridge directly.
-    try:
-        from v9_rag_inference_patch import install_v9_rag_inference_patch
-        install_v9_rag_inference_patch(verbose=True)
-    except Exception as exc:
-        print(f"⚠️ direct V9 RAG inference patch install failed: {exc}")
+    configure_inference_feature_flags(
+        checkpoint_path=checkpoint,
+        profile=profile,
+        verbose=True,
+    )
 
-    # Optional direct installs make the wrapper robust even if sitecustomize changes.
-    optional_installers = [
-        ("edge_full_landing_patch", "install_full_landing_patch"),
-        ("text_context_rag_model_patch", "install_text_context_rag_model_patch"),
-        ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
-        ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
-    ]
-    for module_name, func_name in optional_installers:
-        try:
-            module = __import__(module_name, fromlist=[func_name])
-            func = getattr(module, func_name)
-            func(verbose=True)
-        except Exception as exc:
-            # Do not fail old experiments if optional patches are absent.
-            print(f"⚠️ optional runtime patch {module_name}.{func_name} not installed: {exc}")
+    install_runtime_patches(
+        strict=env_bool("EDGE_STRICT_RUNTIME_PATCHES", False),
+        profile=profile,
+        verbose=True,
+    )
+
+    if env_bool("EDGE_STRICT_EXPERIMENT_GUARD", True):
+        assert_inference_contract(
+            checkpoint_path=checkpoint,
+            profile=profile,
+            strict=True,
+        )
+
+    return checkpoint
 
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parent
-    _install_runtime_patches(repo_root)
+    _bootstrap(repo_root)
 
     target = repo_root / "generate_controlled.py"
     if not target.exists():
