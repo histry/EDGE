@@ -12,6 +12,7 @@ def _install_runtime_patches():
         ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
         # New footstep-aware patches. They are env-gated and safe when disabled.
         ("gait_phase_dataset_patch", "install_gait_phase_dataset_patch"),
+        ("trajectory_enhancement_patch", "install_trajectory_enhancement_patch"),
         ("gait_phase_adapter_patch", "install_gait_phase_adapter_patch"),
     ]
 
@@ -60,8 +61,10 @@ except Exception as exc:
 # classes are already importable. Installers are idempotent.
 try:
     from gait_phase_dataset_patch import install_gait_phase_dataset_patch
+    from trajectory_enhancement_patch import install_trajectory_enhancement_patch
     from gait_phase_adapter_patch import install_gait_phase_adapter_patch
     install_gait_phase_dataset_patch(verbose=True)
+    install_trajectory_enhancement_patch(verbose=True)
     install_gait_phase_adapter_patch(verbose=True)
 except Exception as exc:
     print(f"⚠️ EDGE gait phase patches not installed after EDGE import: {exc}")
