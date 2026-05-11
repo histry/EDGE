@@ -1,5 +1,5 @@
-# Runtime patches MUST be installed before importing EDGE / DanceDecoder.
-# Drop-in replacement for train.py.
+# Runtime patches MUST be installed before constructing EDGE / DanceDecoder.
+# Drop-in replacement for train.py with footstep-aware ChoreoRAG additions.
 
 def _install_runtime_patches():
     patch_specs = [
@@ -10,6 +10,9 @@ def _install_runtime_patches():
         ("text_context_rag_model_patch", "install_text_context_rag_model_patch"),
         ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
         ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
+        # New footstep-aware patches. They are env-gated and safe when disabled.
+        ("gait_phase_dataset_patch", "install_gait_phase_dataset_patch"),
+        ("gait_phase_adapter_patch", "install_gait_phase_adapter_patch"),
     ]
 
     for module_name, fn_name in patch_specs:
@@ -52,6 +55,16 @@ try:
     install_nextgen_runtime_patches(verbose=True)
 except Exception as exc:
     print(f"⚠️ EDGE nextgen runtime patches not installed: {exc}")
+
+# Re-install footstep patches after EDGE imports to ensure model.diffusion / model.model
+# classes are already importable. Installers are idempotent.
+try:
+    from gait_phase_dataset_patch import install_gait_phase_dataset_patch
+    from gait_phase_adapter_patch import install_gait_phase_adapter_patch
+    install_gait_phase_dataset_patch(verbose=True)
+    install_gait_phase_adapter_patch(verbose=True)
+except Exception as exc:
+    print(f"⚠️ EDGE gait phase patches not installed after EDGE import: {exc}")
 
 
 def train(opt):
