@@ -132,8 +132,6 @@ python -u generate_controlled.py \
   --out "$BASE_OUT" \
   --pose_space normalized \
   --sampler ddpm \
-  --save_motions \
-  --no_render \
   2>&1 | tee "$LOG_ROOT/stage1b_generate_v12_base.log"
 
 echo "[Stage 1B] Generated files:"
