@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Turn-aware event utilities for EDGE functional ChoreoRAG.
 
-This file turns the manual frame sweep into a deterministic event detector.
-It is intentionally independent from the EDGE model internals, so it can be
-used by selector/compositor/evaluator/training scripts.
+This module replaces manual frame sweep with trajectory-derived event timing.
+It is intentionally independent of the EDGE model internals, so it can be used
+by selector/compositor/evaluator/training scripts.
 
-Motion contract used by EDGE:
+EDGE motion contract:
   [0:4]   foot contacts
   [4:7]   root xyz
   [7:151] 24 joints * 6D rotation
@@ -22,9 +22,26 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-
 ROOT_X_IDX = 4
 ROOT_Z_IDX = 6
+CONTACT_SLICE_FALLBACK = slice(0, 4)
+
+try:  # Prefer project-defined body groups when available.
+    from footstep_phase_utils import (  # type: ignore
+        CONTACT_SLICE,
+        LOWER_ROT_INDEX,
+        TORSO_ROT_INDEX,
+        UPPER_ROT_INDEX,
+    )
+except Exception:  # Robust fallback for standalone usage.
+    CONTACT_SLICE = CONTACT_SLICE_FALLBACK
+    _rot = np.arange(7, 151, dtype=np.int64).reshape(24, 6)
+    _lower_joints = [1, 2, 4, 5, 7, 8, 10, 11]
+    _torso_joints = [0, 3, 6, 9, 12]
+    _upper_joints = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    LOWER_ROT_INDEX = _rot[_lower_joints].reshape(-1)
+    TORSO_ROT_INDEX = _rot[_torso_joints].reshape(-1)
+    UPPER_ROT_INDEX = _rot[_upper_joints].reshape(-1)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -89,10 +106,14 @@ def parse_points(text: str) -> np.ndarray:
     return np.asarray(pts, dtype=np.float32)
 
 
-def parse_int_list(text: str) -> List[int]:
+def parse_int_list(text: Optional[str]) -> List[int]:
     if text is None:
         return []
     return [int(round(float(x))) for x in str(text).replace(";", ",").split(",") if x.strip()]
+
+
+def list_to_csv(xs: Sequence[int]) -> str:
+    return ",".join(str(int(x)) for x in xs)
 
 
 def interp_traj(points: np.ndarray, seq_len: int) -> np.ndarray:
@@ -184,8 +205,8 @@ def greedy_peak_select(score: np.ndarray, count: int, min_gap: int, edge_margin:
             break
     if len(out) < count:
         # Fill with evenly spaced frames when trajectory has too few peaks.
-        fallback = [int(round((i + 1) * T / (count + 1))) for i in range(count)]
-        for f in fallback:
+        fill = [int(round((i + 1) * T / (count + 1))) for i in range(count)]
+        for f in fill:
             f = int(np.clip(f, edge_margin, max(edge_margin, T - edge_margin - 1)))
             if all(abs(f - j) >= max(4, min_gap // 2) for j in out):
                 out.append(f)
@@ -194,110 +215,94 @@ def greedy_peak_select(score: np.ndarray, count: int, min_gap: int, edge_margin:
     return sorted(out[:count])
 
 
-def detect_turn_events(
-    trajectory: str | np.ndarray,
-    seq_len: int = 150,
-    count: int = 5,
-    config: Optional[TurnEventConfig] = None,
-) -> Dict[str, object]:
-    cfg = config or TurnEventConfig.from_env(seq_len=seq_len, count=count)
+def detect_turn_events(trajectory: str | np.ndarray, cfg: TurnEventConfig) -> Dict[str, object]:
     if isinstance(trajectory, str):
-        traj = interp_traj(parse_points(trajectory), seq_len)
-        traj_text = trajectory
+        traj = interp_traj(parse_points(trajectory), cfg.seq_len)
     else:
         traj = np.asarray(trajectory, dtype=np.float32)
-        if len(traj) != seq_len:
-            src = np.linspace(0, 1, len(traj))
-            dst = np.linspace(0, 1, seq_len)
-            traj = np.stack([
-                np.interp(dst, src, traj[:, 0]),
-                np.interp(dst, src, traj[:, 1]),
-            ], axis=-1).astype(np.float32)
-        traj_text = "<array>"
+        if len(traj) != cfg.seq_len:
+            # Reinterpolate to cfg.seq_len by treating input rows as control samples.
+            traj = interp_traj(traj[:, :2], cfg.seq_len)
     feat = trajectory_features(traj)
-    event_score = (
+    score = (
         cfg.speed_weight * feat["speed_norm"]
         + cfg.turn_weight * feat["turn_norm"]
         + cfg.curvature_weight * feat["curvature_norm"]
-    ).astype(np.float32)
-    centers = greedy_peak_select(event_score, cfg.count, cfg.min_gap, cfg.edge_margin)
-    T = seq_len
-    support_frames = [int(np.clip(c - cfg.support_lag, 0, T - 1)) for c in centers]
-    expressive_frames = [int(np.clip(c + cfg.expressive_lag, 0, T - 1)) for c in centers]
-    settle_frames = [int(np.clip(c + cfg.settle_lag, 0, T - 1)) for c in centers]
+    )
+    if not cfg.include_speed_peaks:
+        score = cfg.turn_weight * feat["turn_norm"] + cfg.curvature_weight * feat["curvature_norm"]
+    centers = greedy_peak_select(score, cfg.count, cfg.min_gap, cfg.edge_margin)
+    support_frames = [int(np.clip(c - cfg.support_lag, 0, cfg.seq_len - 1)) for c in centers]
+    expressive_frames = [int(np.clip(c + cfg.expressive_lag, 0, cfg.seq_len - 1)) for c in centers]
+    settle_frames = [int(np.clip(c + cfg.settle_lag, 0, cfg.seq_len - 1)) for c in centers]
     gates = {
-        "turn_gate": gaussian_gate(T, centers, sigma=cfg.gate_sigma),
-        "support_prepare_gate": gaussian_gate(T, support_frames, sigma=cfg.gate_sigma),
-        "expressive_response_gate": gaussian_gate(T, expressive_frames, sigma=cfg.gate_sigma),
-        "settle_gate": gaussian_gate(T, settle_frames, sigma=cfg.gate_sigma),
+        "turn_gate": gaussian_gate(cfg.seq_len, centers, cfg.gate_sigma),
+        "support_gate": gaussian_gate(cfg.seq_len, support_frames, cfg.gate_sigma),
+        "expressive_gate": gaussian_gate(cfg.seq_len, expressive_frames, cfg.gate_sigma),
+        "settle_gate": gaussian_gate(cfg.seq_len, settle_frames, cfg.gate_sigma),
+        "speed_gate": norm01(feat["speed"]),
     }
-    event_features = np.stack(
-        [
-            feat["speed_norm"],
-            feat["heading_sin"],
-            feat["heading_cos"],
-            feat["turn_norm"],
-            feat["curvature_norm"],
-            feat["acceleration_norm"],
-            gates["turn_gate"],
-            gates["support_prepare_gate"],
-            gates["expressive_response_gate"],
-            gates["settle_gate"],
-        ],
-        axis=-1,
-    ).astype(np.float32)
     return {
-        "trajectory": traj_text,
-        "seq_len": int(seq_len),
         "config": asdict(cfg),
+        "trajectory": traj,
+        "features": feat,
+        "score": score.astype(np.float32),
         "event_centers": centers,
         "support_frames": support_frames,
         "expressive_frames": expressive_frames,
         "settle_frames": settle_frames,
-        "event_score": event_score,
-        "features": feat,
         "gates": gates,
-        "event_features": event_features,
     }
 
 
-def save_event_report(report: Dict[str, object], out_json: str | Path, out_npy: Optional[str | Path] = None) -> None:
-    out_json = Path(out_json)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    clean = {
-        k: v
-        for k, v in report.items()
-        if k not in {"features", "gates", "event_score", "event_features"}
+def event_feature_matrix(trajectory: str | np.ndarray, cfg: Optional[TurnEventConfig] = None) -> Tuple[np.ndarray, List[str], Dict[str, object]]:
+    if cfg is None:
+        if isinstance(trajectory, np.ndarray):
+            seq_len = int(len(trajectory))
+        else:
+            seq_len = 150
+        cfg = TurnEventConfig.from_env(seq_len=seq_len)
+    ev = detect_turn_events(trajectory, cfg)
+    feat: Dict[str, np.ndarray] = ev["features"]  # type: ignore
+    gates: Dict[str, np.ndarray] = ev["gates"]  # type: ignore
+    names = [
+        "speed_norm",
+        "turn_norm",
+        "curvature_norm",
+        "acceleration_norm",
+        "heading_sin",
+        "heading_cos",
+        "turn_gate",
+        "support_gate",
+        "expressive_gate",
+        "settle_gate",
+        "speed_gate",
+    ]
+    cols = [
+        feat["speed_norm"],
+        feat["turn_norm"],
+        feat["curvature_norm"],
+        feat["acceleration_norm"],
+        feat["heading_sin"],
+        feat["heading_cos"],
+        gates["turn_gate"],
+        gates["support_gate"],
+        gates["expressive_gate"],
+        gates["settle_gate"],
+        gates["speed_gate"],
+    ]
+    mat = np.stack(cols, axis=-1).astype(np.float32)
+    return mat, names, ev
+
+
+def save_event_report(path: str | Path, event: Dict[str, object]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    compact = {
+        "config": event.get("config"),
+        "event_centers": event.get("event_centers"),
+        "support_frames": event.get("support_frames"),
+        "expressive_frames": event.get("expressive_frames"),
+        "settle_frames": event.get("settle_frames"),
     }
-    clean["event_feature_dim"] = int(np.asarray(report["event_features"]).shape[-1])
-    out_json.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
-    if out_npy is not None:
-        np.save(out_npy, np.asarray(report["event_features"], dtype=np.float32))
-
-
-def load_event_features(path: str | Path) -> np.ndarray:
-    arr = np.load(path, allow_pickle=True)
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError(f"event features must be [T,D], got {arr.shape}")
-    return arr
-
-
-if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trajectory", required=True)
-    ap.add_argument("--seq_len", type=int, default=150)
-    ap.add_argument("--count", type=int, default=5)
-    ap.add_argument("--out_json", required=True)
-    ap.add_argument("--out_npy", default="")
-    args = ap.parse_args()
-    rep = detect_turn_events(args.trajectory, seq_len=args.seq_len, count=args.count)
-    save_event_report(rep, args.out_json, args.out_npy or None)
-    print(f"✅ turn-aware event report saved: {args.out_json}")
-    if args.out_npy:
-        print(f"✅ event features saved: {args.out_npy}")
-    print("event_centers:", rep["event_centers"])
-    print("support_frames:", rep["support_frames"])
-    print("expressive_frames:", rep["expressive_frames"])
+    path.write_text(json.dumps(compact, ensure_ascii=False, indent=2), encoding="utf-8")
