@@ -22,6 +22,8 @@ _env_default("EDGE_TEXT_CONTEXT_DEBUG", "0")
 def _install_runtime_patches():
     patch_specs = [
         ("trajectory_native_control", "install_native_trajectory_control_patch"),
+        ("trajectory_enhancement_patch", "install_trajectory_enhancement_patch"),
+        ("trajectory_gait_phase_patch", "install_trajectory_gait_phase_patch"),
         ("edge_safety_patch", "install_edge_safety_patch"),
         ("v9_rag_inference_patch", "install_v9_rag_inference_patch"),
         ("edge_full_landing_patch", "install_full_landing_patch"),
@@ -250,6 +252,93 @@ def parse_mid_frames(text: str, num_mid: int, num_frames: int):
         frames.append(frame)
 
     return frames
+
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default)).strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+
+def _split_paths_csv(text: str):
+    if not text:
+        return []
+    return [x.strip() for x in str(text).replace(";", ",").split(",") if x.strip()]
+
+
+def _infer_unit_paths_from_mid_pose_paths(mid_pose_text: str):
+    """Infer sibling *_unit.npy files from mid pose paths.
+
+    Example:
+        output/foo_mid01_f25.npy -> output/foo_mid01_f25_unit.npy
+
+    This is required because Text/Pose Context RAG inference attaches context
+    through EDGE_RAG_CONTEXT_UNIT_PATHS / EDGE_RAG_SUMMARY_UNIT_PATHS, while
+    --auto_mid_keyframes / --rag_db only populate mid pose files by default.
+    """
+    out = []
+    for item in _split_paths_csv(mid_pose_text):
+        path = Path(item)
+        if path.name.endswith("_unit.npy"):
+            candidate = path
+        elif path.suffix == ".npy":
+            candidate = path.with_name(path.stem + "_unit.npy")
+        else:
+            continue
+        if candidate.exists():
+            out.append(str(candidate))
+    return out
+
+
+def _sync_text_context_env_from_mid_poses(args, out_path: str = ""):
+    """Make retrieved unit clips visible to Text/Pose Context RAG IO patch.
+
+    text_context_rag_io_patch.py reads context unit paths from env variables.
+    This helper bridges generate_controlled.py's auto-mid output to that env
+    contract, so sampler-time IO patch can attach:
+
+        cond["rag_context"]
+        cond["rag_context_text_embedding"]
+        cond["rag_context_mask"]
+    """
+    if not _truthy_env("EDGE_ENABLE_TEXT_CONTEXT_RAG", "1"):
+        return []
+
+    existing = os.environ.get("EDGE_RAG_CONTEXT_UNIT_PATHS", "").strip()
+    if existing:
+        paths = _split_paths_csv(existing)
+    else:
+        paths = _infer_unit_paths_from_mid_pose_paths(getattr(args, "mid_poses", ""))
+
+        if paths:
+            os.environ["EDGE_RAG_CONTEXT_UNIT_PATHS"] = ",".join(paths)
+            os.environ.setdefault("EDGE_RAG_SUMMARY_UNIT_PATHS", ",".join(paths))
+
+    if paths:
+        os.environ.setdefault("EDGE_RAG_CONTEXT_MODE", "normal")
+        if out_path and not os.environ.get("EDGE_RAG_CONTEXT_REPORT_JSON", ""):
+            report_path = str(Path(out_path).with_suffix("")) + "_context_report.json"
+            os.environ["EDGE_RAG_CONTEXT_REPORT_JSON"] = report_path
+
+        print(
+            "✅ Text/Pose Context RAG unit paths exported: "
+            f"count={len(paths)}, env=EDGE_RAG_CONTEXT_UNIT_PATHS"
+        )
+        for i, path in enumerate(paths[:8]):
+            print(f"   rag_context_unit[{i}]={path}")
+    else:
+        if _truthy_env("EDGE_TEXT_CONTEXT_REQUIRED", "0"):
+            raise RuntimeError(
+                "EDGE_TEXT_CONTEXT_REQUIRED=1 but no retrieved *_unit.npy files "
+                "were found from --mid_poses and EDGE_RAG_CONTEXT_UNIT_PATHS is empty."
+            )
+        print(
+            "⚠️ Text/Pose Context RAG enabled, but no unit context paths found. "
+            "Set EDGE_RAG_CONTEXT_UNIT_PATHS or use mid poses with sibling *_unit.npy files."
+        )
+
+    return paths
 
 
 def parse_trajectory_points(text: str) -> np.ndarray:
