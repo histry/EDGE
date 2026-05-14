@@ -720,8 +720,56 @@ class DunhuangDataset(Dataset):
 
         for f in self.pkl_files:
             data = pickle.load(open(f, "rb"))
+            # ===== 新增：直接读取 151D motion =====
+            if "motion" in data:
+                motion = np.asarray(data["motion"], dtype=np.float32)
+
+            elif "motion_151" in data:
+                motion = np.asarray(data["motion_151"], dtype=np.float32)
+
+            elif "poses" in data:
+                motion = np.asarray(data["poses"], dtype=np.float32)
+
+            elif "unit_motions_physical" in data:
+                motion = np.asarray(data["unit_motions_physical"], dtype=np.float32)
+
+            else:
+                motion = None
+
+            # ===== 151D fallback =====
+            if motion is not None:
+                _edge_151d_path = locals().get('pkl_path', None) or locals().get('pkl_file', None) or locals().get('file', None) or locals().get('path', None) or locals().get('pkl', None) or 'direct_151d_motion'
+                if motion.ndim != 2 or motion.shape[-1] != 151:
+                    print(f"⚠️ 跳过 {_edge_151d_path}: invalid 151D motion shape {motion.shape}")
+                    continue
+
+                if motion.shape[0] < self.seq_len:
+                    print(f"⚠️ 跳过 {_edge_151d_path}: too short {motion.shape[0]}")
+                    continue
+
+                motion = motion[: self.seq_len].astype(np.float32)
+
+                motions_list.append(motion)
+
+                trajs_list.append(
+                    motion[:, [ROOT_X_IDX, ROOT_Z_IDX]].astype(np.float32)
+                )
+
+                self.motion_window_ids.append(
+                    Path(_edge_151d_path).stem
+                )
+
+                self.motion_source_ids.append(
+                    infer_original_source_id_from_pkl(_edge_151d_path, data)
+                )
+
+                self.window_source_paths.append(str(_edge_151d_path))
+
+                continue
+
+            # ===== 原始 pos/q 流程 =====
             if "pos" not in data or "q" not in data:
-                print(f"⚠️ 跳过 {f}: missing pos/q")
+                print(f"⚠️ 跳过 {_edge_151d_path}: missing pos/q")
                 continue
             source_id = infer_original_source_id_from_pkl(f, data)
             pos = np.asarray(data["pos"], dtype=np.float32)
