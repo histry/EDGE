@@ -30,6 +30,7 @@ def _install_runtime_patches():
         ("text_context_rag_model_patch", "install_text_context_rag_model_patch"),
         ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
         ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
+        ("edge_recon_contract_patch", "install_recon_contract_patch"),
     ]
 
     # render patch is useful when this script later renders / saves visual assets.
@@ -639,11 +640,15 @@ def normalize_pose_if_needed(pose: np.ndarray, normalizer, pose_space: str) -> n
     raise ValueError(f"Unknown pose_space: {pose_space}")
 
 
-def make_keyframe_feature_mask(constrain_contacts: bool) -> np.ndarray:
+def make_keyframe_feature_mask(constrain_contacts: bool, constrain_root_xz: bool = False) -> np.ndarray:
     mask_one_frame = np.zeros((151,), dtype=np.float32)
 
     if constrain_contacts:
         mask_one_frame[CONTACT_SLICE] = 1.0
+
+    if constrain_root_xz or _truthy_env("EDGE_KEYFRAME_CONSTRAIN_ROOT_XZ", "0"):
+        mask_one_frame[ROOT_X_IDX] = 1.0
+        mask_one_frame[ROOT_Z_IDX] = 1.0
 
     mask_one_frame[ROOT_Y_IDX] = 1.0
     mask_one_frame[ROT_SLICE] = 1.0
@@ -656,6 +661,7 @@ def build_constraint(args, normalizer, num_frames: int, device) -> dict:
 
     frame_mask = make_keyframe_feature_mask(
         constrain_contacts=args.constrain_contacts,
+        constrain_root_xz=bool(getattr(args, "keyframe_constrain_root_xz", False)),
     )
 
     def add_pose(path: str, frame: int, name: str, strength: float = 1.0):
@@ -867,6 +873,26 @@ def apply_trajectory_anchor(
         (1.0 - strength) * motion[:, ROOT_Z_IDX] + strength * traj[:, 1]
     )
     return motion.astype(np.float32)
+
+
+
+def project_clean_motion_numpy(motion_norm: np.ndarray, constraint: dict) -> np.ndarray:
+    if constraint is None:
+        return motion_norm.astype(np.float32)
+    mask = constraint.get("mask", None)
+    value = constraint.get("value", None)
+    if mask is None or value is None:
+        return motion_norm.astype(np.float32)
+
+    mask_np = to_numpy(mask)[0].astype(np.float32)
+    value_np = to_numpy(value)[0].astype(np.float32)
+
+    if mask_np.shape[-1] == 1:
+        mask_np = np.repeat(mask_np, motion_norm.shape[-1], axis=-1)
+    elif mask_np.shape[-1] != motion_norm.shape[-1]:
+        raise ValueError(f"constraint mask last dim mismatch: {mask_np.shape[-1]}")
+
+    return (motion_norm * (1.0 - mask_np) + value_np * mask_np).astype(np.float32)
 
 
 def unnormalize_motion(normalizer, motion_norm: np.ndarray) -> np.ndarray:
@@ -1171,6 +1197,12 @@ def build_arg_parser():
     parser.add_argument("--mid_keyframe_strength", type=float, default=0.35)
     parser.add_argument("--pose_space", default="normalized", choices=["normalized", "physical"])
     parser.add_argument("--constrain_contacts", action="store_true")
+    parser.add_argument("--hard_keyframe_project", action="store_true")
+    parser.add_argument("--infer_project_xstart", action="store_true")
+    parser.add_argument("--keyframe_constrain_root_xz", action="store_true")
+    parser.add_argument("--disable_traj_cond", action="store_true")
+    parser.add_argument("--save_normalized_motion", action="store_true")
+    parser.add_argument("--no_ema", action="store_true")
 
     parser.add_argument("--trajectory", default="0,0;1,1;0,2")
     parser.add_argument("--target_traj", default="")
@@ -1227,7 +1259,7 @@ def main():
     model = EDGE(
         feature_type=args.feature_type,
         checkpoint_path=args.checkpoint,
-        EMA=True,
+        EMA=not bool(getattr(args, "no_ema", False)),
         audio_dim=args.audio_dim,
         seq_len=num_frames,
         mixed_precision=args.mixed_precision,
@@ -1236,6 +1268,17 @@ def main():
 
     device = model.accelerator.device
     normalizer = model.normalizer
+
+    if bool(getattr(args, "hard_keyframe_project", False)) or _truthy_env("EDGE_HARD_KEYFRAME_PROJECT", "0"):
+        os.environ["EDGE_HARD_KEYFRAME_PROJECT"] = "1"
+        os.environ["EDGE_INFER_PROJECT_XSTART"] = "1"
+        if hasattr(model, "diffusion"):
+            model.diffusion.hard_keyframe_project = True
+        print("✅ Strict hard keyframe projection enabled.")
+
+    if bool(getattr(args, "infer_project_xstart", False)):
+        os.environ["EDGE_INFER_PROJECT_XSTART"] = "1"
+        print("✅ Clean x_start projection enabled.")
 
     traj_physical, traj_norm = build_control_trajectory(
         trajectory_text=args.trajectory,
@@ -1258,8 +1301,12 @@ def main():
 
     cond = {
         "audio": torch.from_numpy(audio_feature[None]).to(device=device, dtype=torch.float32),
-        "trajectory": torch.from_numpy(traj_norm[None]).to(device=device, dtype=torch.float32),
     }
+
+    if not bool(getattr(args, "disable_traj_cond", False)) and not _truthy_env("EDGE_DISABLE_TRAJ_COND", "0"):
+        cond["trajectory"] = torch.from_numpy(traj_norm[None]).to(device=device, dtype=torch.float32)
+    else:
+        print("✅ Trajectory condition disabled for inference.")
 
     constraint = build_constraint(
         args=args,
@@ -1287,6 +1334,17 @@ def main():
         )
 
     motion_norm = to_numpy(sample)[0].astype(np.float32)
+
+    if bool(getattr(args, "hard_keyframe_project", False)) or _truthy_env("EDGE_FINAL_KEYFRAME_PROJECT", "1"):
+        motion_norm = project_clean_motion_numpy(motion_norm, constraint)
+        print("✅ Final normalized clean-motion keyframe projection applied.")
+
+    if bool(getattr(args, "save_normalized_motion", False)):
+        norm_path = Path(args.out).with_suffix("")
+        norm_path = norm_path.parent / f"{norm_path.name}_norm.npy"
+        np.save(norm_path, motion_norm.astype(np.float32))
+        print(f"✅ normalized motion: {norm_path}")
+
     motion_raw_physical = unnormalize_motion(normalizer, motion_norm)
     motion_final_physical = motion_raw_physical.copy()
 
