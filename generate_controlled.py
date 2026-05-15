@@ -876,6 +876,58 @@ def apply_trajectory_anchor(
 
 
 
+
+def add_all_frame_root_xz_constraint(
+    constraint: dict,
+    reference_motion: np.ndarray,
+    normalizer,
+    pose_space: str,
+    num_frames: int,
+    device,
+) -> dict:
+    """Add all-frame root X/Z hard constraint to the existing keyframe constraint.
+
+    reference_motion:
+      - [T,151] physical when pose_space='physical'
+      - [T,151] normalized when pose_space='normalized'
+
+    The final constraint is always in model normalized space.
+    """
+    ref = np.asarray(reference_motion, dtype=np.float32)
+    if ref.ndim != 2 or ref.shape[-1] != 151:
+        raise ValueError(f"root_xz_reference must have shape [T,151], got {ref.shape}")
+
+    if len(ref) < num_frames:
+        pad = np.repeat(ref[-1:], num_frames - len(ref), axis=0)
+        ref = np.concatenate([ref, pad], axis=0)
+    ref = ref[:num_frames].astype(np.float32)
+
+    if str(pose_space).lower() == "physical":
+        ref_norm = normalize_motion(normalizer, ref)
+    else:
+        ref_norm = ref
+
+    if constraint is None:
+        value = np.zeros((1, num_frames, 151), dtype=np.float32)
+        mask = np.zeros((1, num_frames, 151), dtype=np.float32)
+    else:
+        value = to_numpy(constraint["value"]).astype(np.float32).copy()
+        mask = to_numpy(constraint["mask"]).astype(np.float32).copy()
+
+        if mask.shape[-1] == 1:
+            mask = np.repeat(mask, 151, axis=-1)
+
+    value[0, :, ROOT_X_IDX] = ref_norm[:, ROOT_X_IDX]
+    value[0, :, ROOT_Z_IDX] = ref_norm[:, ROOT_Z_IDX]
+    mask[0, :, ROOT_X_IDX] = 1.0
+    mask[0, :, ROOT_Z_IDX] = 1.0
+
+    return {
+        "value": torch.from_numpy(value).to(device=device, dtype=torch.float32),
+        "mask": torch.from_numpy(mask).to(device=device, dtype=torch.float32),
+    }
+
+
 def project_clean_motion_numpy(motion_norm: np.ndarray, constraint: dict) -> np.ndarray:
     if constraint is None:
         return motion_norm.astype(np.float32)
@@ -893,6 +945,29 @@ def project_clean_motion_numpy(motion_norm: np.ndarray, constraint: dict) -> np.
         raise ValueError(f"constraint mask last dim mismatch: {mask_np.shape[-1]}")
 
     return (motion_norm * (1.0 - mask_np) + value_np * mask_np).astype(np.float32)
+
+
+
+def normalize_motion(normalizer, motion_physical: np.ndarray) -> np.ndarray:
+    """Convert physical [T,151] motion to checkpoint/model normalized space."""
+    if normalizer is None:
+        return np.asarray(motion_physical, dtype=np.float32)
+
+    motion_np = np.asarray(motion_physical, dtype=np.float32)
+    motion_t = torch.from_numpy(motion_np[None]).float()
+
+    if hasattr(normalizer, "normalize"):
+        motion_norm = normalizer.normalize(motion_t)
+    else:
+        mean = getattr(normalizer, "mean", None)
+        std = getattr(normalizer, "std", None)
+        if mean is None or std is None:
+            raise RuntimeError("Normalizer has neither normalize() nor mean/std.")
+        mean_t = torch.as_tensor(mean, dtype=torch.float32).view(1, 1, -1)
+        std_t = torch.as_tensor(std, dtype=torch.float32).view(1, 1, -1)
+        motion_norm = (motion_t - mean_t) / torch.clamp(std_t, min=1e-8)
+
+    return to_numpy(motion_norm)[0].astype(np.float32)
 
 
 def unnormalize_motion(normalizer, motion_norm: np.ndarray) -> np.ndarray:
@@ -1180,6 +1255,7 @@ def build_arg_parser():
     parser.add_argument("--num_frames", type=int, default=150)
     parser.add_argument("--mixed_precision", default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--sampler", default="ddpm", choices=["ddpm", "ddim"])
+    parser.add_argument("--guidance_weight", type=float, default=1.0, help="Classifier-free guidance weight for diffusion sampling. Use 1.0 for strict reconstruction.")
     parser.add_argument(
         "--trajectory_onset_index",
         default="auto",
@@ -1200,6 +1276,7 @@ def build_arg_parser():
     parser.add_argument("--hard_keyframe_project", action="store_true")
     parser.add_argument("--infer_project_xstart", action="store_true")
     parser.add_argument("--keyframe_constrain_root_xz", action="store_true")
+    parser.add_argument("--root_xz_reference", default="", help="Optional [T,151] physical or normalized motion whose root X/Z will constrain all frames.")
     parser.add_argument("--disable_traj_cond", action="store_true")
     parser.add_argument("--save_normalized_motion", action="store_true")
     parser.add_argument("--no_ema", action="store_true")
@@ -1269,6 +1346,10 @@ def main():
     device = model.accelerator.device
     normalizer = model.normalizer
 
+    if hasattr(model, "diffusion") and hasattr(model.diffusion, "guidance_weight"):
+        model.diffusion.guidance_weight = float(getattr(args, "guidance_weight", 1.0))
+        print(f"✅ diffusion guidance_weight set to {model.diffusion.guidance_weight}")
+
     if bool(getattr(args, "hard_keyframe_project", False)) or _truthy_env("EDGE_HARD_KEYFRAME_PROJECT", "0"):
         os.environ["EDGE_HARD_KEYFRAME_PROJECT"] = "1"
         os.environ["EDGE_INFER_PROJECT_XSTART"] = "1"
@@ -1314,6 +1395,18 @@ def main():
         num_frames=num_frames,
         device=device,
     )
+
+    if str(getattr(args, "root_xz_reference", "")).strip():
+        root_ref = np.load(args.root_xz_reference).astype(np.float32)
+        constraint = add_all_frame_root_xz_constraint(
+            constraint=constraint,
+            reference_motion=root_ref,
+            normalizer=normalizer,
+            pose_space=args.pose_space,
+            num_frames=num_frames,
+            device=device,
+        )
+        print(f"✅ Added all-frame root X/Z constraint from: {args.root_xz_reference}")
 
     if hasattr(model.diffusion, "tto_steps"):
         model.diffusion.tto_steps = int(args.tto_steps)

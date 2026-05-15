@@ -1,3 +1,4 @@
+import os
 import copy
 from functools import partial
 from pathlib import Path
@@ -1200,6 +1201,14 @@ class GaussianDiffusion(nn.Module):
                 t,
             )
 
+        # Optional direct x0 reconstruction loss for strict reconstruction / single-unit overfit.
+        # Normal EDGE training optimizes epsilon prediction. For sanity reconstruction we also
+        # need the predicted clean motion x0 to match the training motion directly.
+        x0_recon_loss = model_motion_x0.new_tensor(0.0)
+        if os.environ.get("EDGE_X0_RECON_LOSS", "0").lower() in {"1", "true", "yes", "on"}:
+            x0_recon_raw = F.mse_loss(model_motion_x0, target_motion_x0)
+            x0_recon_loss = float(os.environ.get("EDGE_X0_RECON_LOSS_WEIGHT", "1.0")) * x0_recon_raw
+
         # Main temporal smoothness loss.
         velocity_loss = self._velocity_loss(
             model_motion_x0,
@@ -1329,7 +1338,25 @@ class GaussianDiffusion(nn.Module):
             motion_energy_loss=motion_energy_term,
         )
 
-        total_loss = sum(losses)
+        total_loss = sum(losses) + x0_recon_loss
+
+        if (
+            os.environ.get("EDGE_X0_RECON_LOSS", "0").lower() in {"1", "true", "yes", "on"}
+            and os.environ.get("EDGE_X0_RECON_LOSS_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+        ):
+            try:
+                if not hasattr(self, "_edge_x0_debug_counter"):
+                    self._edge_x0_debug_counter = 0
+                self._edge_x0_debug_counter += 1
+                if self._edge_x0_debug_counter <= 20 or self._edge_x0_debug_counter % 100 == 0:
+                    print(
+                        f"🧪 EDGE_X0_RECON_LOSS_DEBUG "
+                        f"step={self._edge_x0_debug_counter} "
+                        f"x0_weighted={float(x0_recon_loss.detach().mean().cpu()):.6f} "
+                        f"total={float(total_loss.detach().mean().cpu()):.6f}"
+                    )
+            except Exception:
+                pass
 
         total_loss = torch.nan_to_num(
             total_loss,

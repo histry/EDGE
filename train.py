@@ -10,6 +10,7 @@ def _install_runtime_patches():
         ("text_context_rag_model_patch", "install_text_context_rag_model_patch"),
         ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
         ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
+        ("edge_recon_contract_patch", "install_recon_contract_patch"),
         # New footstep-aware patches. They are env-gated and safe when disabled.
         ("gait_phase_dataset_patch", "install_gait_phase_dataset_patch"),
         ("trajectory_enhancement_patch", "install_trajectory_enhancement_patch"),

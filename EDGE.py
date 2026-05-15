@@ -208,6 +208,26 @@ class EDGE:
             rag_summary_drop_prob=rag_summary_drop_prob,
         )
 
+        # Strict reconstruction / inference architecture guard:
+        # Remove ONLY the outer GaitPhaseTrajectoryProjection wrapper.
+        # Do NOT recursively unwrap, because the inner advanced trajectory wrapper
+        # is part of the training/replay architecture.
+        if os.environ.get("EDGE_DISABLE_GAIT_TRAJECTORY_WRAPPER", "0").lower() in {"1", "true", "yes", "on"}:
+            try:
+                tp = getattr(model, "trajectory_projection", None)
+                if (
+                    tp is not None
+                    and hasattr(tp, "base")
+                    and (
+                        "GaitPhaseTrajectoryProjection" in tp.__class__.__name__
+                        or hasattr(tp, "gait_phase_gate")
+                    )
+                ):
+                    model.trajectory_projection = tp.base
+                    print("✅ Force-unwrapped ONE GaitPhaseTrajectoryProjection before checkpoint load")
+            except Exception as exc:
+                print(f"⚠️ Failed to force-unwrap gait trajectory wrapper: {exc}")
+
         self._apply_stage_freezing(model, train_stage, adapter_train_decoder=adapter_train_decoder)
         _print_trainable_summary(self, model)
 
