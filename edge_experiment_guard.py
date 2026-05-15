@@ -47,6 +47,7 @@ PATCH_SPECS: Dict[str, Tuple[str, str]] = {
     "text_context_io": ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
     "text_bridge": ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
     "render_contact": ("render_contact_fix_patch", "install_render_contact_fix_patch"),
+    "nextgen": ("edge_nextgen_runtime_patch", "install_nextgen_runtime_patches"),
 }
 
 DEFAULT_REQUIRED_BY_PROFILE: Dict[str, Tuple[str, ...]] = {
