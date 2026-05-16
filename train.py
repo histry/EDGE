@@ -1,5 +1,6 @@
 # Runtime patches MUST be installed before constructing EDGE / DanceDecoder.
-# Drop-in replacement for train.py with footstep-aware ChoreoRAG additions.
+# Drop-in replacement for train.py with native trajectory-event conditioning
+# and optional weak trajectory energy guidance.
 
 def _install_runtime_patches():
     patch_specs = [
@@ -11,10 +12,20 @@ def _install_runtime_patches():
         ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
         ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
         ("edge_recon_contract_patch", "install_recon_contract_patch"),
-        # New footstep-aware patches. They are env-gated and safe when disabled.
+
+        # Existing trajectory / footstep patches.
         ("gait_phase_dataset_patch", "install_gait_phase_dataset_patch"),
         ("trajectory_enhancement_patch", "install_trajectory_enhancement_patch"),
+
+        # New main-method patch:
+        # native event-conditioned trajectory branch.
+        ("trajectory_event_condition_patch", "install_trajectory_event_condition_patch"),
+
         ("gait_phase_adapter_patch", "install_gait_phase_adapter_patch"),
+
+        # New optional inference-only correction patch.
+        # Off by default; enable only with EDGE_WEAK_TRAJ_ENERGY=1.
+        ("trajectory_weak_energy_guidance_patch", "install_weak_trajectory_energy_guidance_patch"),
     ]
 
     for module_name, fn_name in patch_specs:
@@ -58,17 +69,23 @@ try:
 except Exception as exc:
     print(f"⚠️ EDGE nextgen runtime patches not installed: {exc}")
 
-# Re-install footstep patches after EDGE imports to ensure model.diffusion / model.model
-# classes are already importable. Installers are idempotent.
+# Re-install advanced trajectory patches after EDGE imports to ensure
+# model.diffusion / model.model classes are already importable.
+# Installers are idempotent.
 try:
     from gait_phase_dataset_patch import install_gait_phase_dataset_patch
     from trajectory_enhancement_patch import install_trajectory_enhancement_patch
+    from trajectory_event_condition_patch import install_trajectory_event_condition_patch
     from gait_phase_adapter_patch import install_gait_phase_adapter_patch
+    from trajectory_weak_energy_guidance_patch import install_weak_trajectory_energy_guidance_patch
+
     install_gait_phase_dataset_patch(verbose=True)
     install_trajectory_enhancement_patch(verbose=True)
+    install_trajectory_event_condition_patch(verbose=True)
     install_gait_phase_adapter_patch(verbose=True)
+    install_weak_trajectory_energy_guidance_patch(verbose=True)
 except Exception as exc:
-    print(f"⚠️ EDGE gait phase patches not installed after EDGE import: {exc}")
+    print(f"⚠️ EDGE native trajectory/event patches not installed after EDGE import: {exc}")
 
 
 def train(opt):

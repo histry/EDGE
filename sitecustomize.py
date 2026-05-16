@@ -1,9 +1,17 @@
 """Repository-wide runtime patches for EDGE advanced trajectory / ChoreoRAG work.
 
-This version preserves the existing patch order and adds the optional
-turn-aware event model adapter patch.  All behavior is environment-gated, so
-clean baselines remain clean unless the corresponding EDGE_* flags are enabled.
+This version preserves the existing patch order and adds:
+
+1. trajectory_event_condition_patch
+   Native trajectory-event condition branch:
+     X/Z + speed + heading + curvature + support/turn/expression gates
+     -> trajectory_projection residual adapter
+
+2. trajectory_weak_energy_guidance_patch
+   Optional weak tolerance-band energy guidance during sampling.
+   This is OFF by default and should not be treated as the main method.
 """
+
 from __future__ import annotations
 
 try:
@@ -17,13 +25,16 @@ try:
 except Exception as exc:
     print(f"⚠️ EDGE sitecustomize base patch installer failed: {exc}")
 
+
 # Advanced patches are idempotent and fail-soft here.  Formal train.py also
 # installs them after EDGE imports, so a startup-time miss is not fatal.
 for module_name, fn_name in [
     ("gait_phase_dataset_patch", "install_gait_phase_dataset_patch"),
     ("trajectory_enhancement_patch", "install_trajectory_enhancement_patch"),
+    ("trajectory_event_condition_patch", "install_trajectory_event_condition_patch"),
     ("gait_phase_adapter_patch", "install_gait_phase_adapter_patch"),
     ("turn_event_model_adapter_patch", "install_turn_event_model_adapter_patch"),
+    ("trajectory_weak_energy_guidance_patch", "install_weak_trajectory_energy_guidance_patch"),
 ]:
     try:
         module = __import__(module_name, fromlist=[fn_name])
