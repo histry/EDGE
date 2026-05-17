@@ -1,6 +1,6 @@
 # Runtime patches MUST be installed before constructing EDGE / DanceDecoder.
-# Drop-in replacement for train.py with native trajectory-event conditioning
-# and optional weak trajectory energy guidance.
+# Drop-in replacement for train.py with native trajectory-event conditioning,
+# optional weak trajectory energy guidance, and V2E temporal-progress supervision.
 
 def _install_runtime_patches():
     patch_specs = [
@@ -12,22 +12,12 @@ def _install_runtime_patches():
         ("text_context_rag_io_patch", "install_text_context_rag_io_patch"),
         ("text_bridge_planner_patch", "install_text_bridge_planner_patch"),
         ("edge_recon_contract_patch", "install_recon_contract_patch"),
-
-        # Existing trajectory / footstep patches.
         ("gait_phase_dataset_patch", "install_gait_phase_dataset_patch"),
         ("trajectory_enhancement_patch", "install_trajectory_enhancement_patch"),
-
-        # New main-method patch:
-        # native event-conditioned trajectory branch.
         ("trajectory_event_condition_patch", "install_trajectory_event_condition_patch"),
-
         ("gait_phase_adapter_patch", "install_gait_phase_adapter_patch"),
-
-        # New optional inference-only correction patch.
-        # Off by default; enable only with EDGE_WEAK_TRAJ_ENERGY=1.
         ("trajectory_weak_energy_guidance_patch", "install_weak_trajectory_energy_guidance_patch"),
     ]
-
     for module_name, fn_name in patch_specs:
         try:
             module = __import__(module_name, fromlist=[fn_name])
@@ -39,14 +29,11 @@ def _install_runtime_patches():
         except Exception as exc:
             print(f"⚠️ {module_name}.{fn_name} not installed: {exc}")
 
-
 _install_runtime_patches()
 
 from args import parse_train_opt
 from EDGE import EDGE
 
-# These fixes can be installed after EDGE/model.diffusion are importable but
-# before EDGE(...) constructs DanceDecoder/GaussianDiffusion instances.
 try:
     from edge_text_context_training_fix import install_edge_text_context_training_fix
     install_edge_text_context_training_fix(EDGE, verbose=True)
@@ -59,26 +46,18 @@ try:
 except Exception as exc:
     print(f"⚠️ render_contact_fix_patch not installed: {exc}")
 
-# Next-generation experimental patches:
-# - EDGE_DIFF_CONTACT_LOSS=1
-# - EDGE_BEAT_GUIDANCE=1
-# - EDGE_V11_CROSS_ATTN_RAG=1
 try:
     from edge_nextgen_runtime_patch import install_nextgen_runtime_patches
     install_nextgen_runtime_patches(verbose=True)
 except Exception as exc:
     print(f"⚠️ EDGE nextgen runtime patches not installed: {exc}")
 
-# Re-install advanced trajectory patches after EDGE imports to ensure
-# model.diffusion / model.model classes are already importable.
-# Installers are idempotent.
 try:
     from gait_phase_dataset_patch import install_gait_phase_dataset_patch
     from trajectory_enhancement_patch import install_trajectory_enhancement_patch
     from trajectory_event_condition_patch import install_trajectory_event_condition_patch
     from gait_phase_adapter_patch import install_gait_phase_adapter_patch
     from trajectory_weak_energy_guidance_patch import install_weak_trajectory_energy_guidance_patch
-
     install_gait_phase_dataset_patch(verbose=True)
     install_trajectory_enhancement_patch(verbose=True)
     install_trajectory_event_condition_patch(verbose=True)
@@ -87,15 +66,14 @@ try:
 except Exception as exc:
     print(f"⚠️ EDGE native trajectory/event patches not installed after EDGE import: {exc}")
 
-
-
-# Freeze-aware motion coverage patch:
-# fixes endpoint-collapse / static-hold failure in no-trajectory endpoint training.
+# V2E temporal-progress patch:
+# fixes early endpoint arrival / top-k jump dominance in endpoint-only training.
 try:
     from freeze_aware_motion_patch import install_freeze_aware_motion_patch
     install_freeze_aware_motion_patch(verbose=True)
 except Exception as exc:
-    print(f"⚠️ freeze-aware motion patch not installed: {exc}")
+    print(f"⚠️ V2E temporal-progress motion patch not installed: {exc}")
+
 
 def train(opt):
     model = EDGE(
@@ -140,7 +118,6 @@ def train(opt):
         rag_summary_drop_prob=getattr(opt, "rag_summary_drop_prob", 0.15),
     )
     model.train_loop(opt)
-
 
 if __name__ == "__main__":
     opt = parse_train_opt()
