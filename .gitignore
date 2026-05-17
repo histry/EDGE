@@ -121,3 +121,5 @@ __pycache__/
 
 # Local patch backups
 _backup_choreorag_stage_patch_v2/
+logs/
+backup_native_traj_event_*/
