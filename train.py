@@ -88,6 +88,15 @@ except Exception as exc:
     print(f"⚠️ EDGE native trajectory/event patches not installed after EDGE import: {exc}")
 
 
+
+# Freeze-aware motion coverage patch:
+# fixes endpoint-collapse / static-hold failure in no-trajectory endpoint training.
+try:
+    from freeze_aware_motion_patch import install_freeze_aware_motion_patch
+    install_freeze_aware_motion_patch(verbose=True)
+except Exception as exc:
+    print(f"⚠️ freeze-aware motion patch not installed: {exc}")
+
 def train(opt):
     model = EDGE(
         feature_type=opt.feature_type,
