@@ -2,72 +2,96 @@ import os
 import argparse
 import numpy as np
 import torch
-from vis import skeleton_render, SMPLSkeleton 
+from vis import skeleton_render, SMPLSkeleton
 from dataset.quaternion import ax_from_6v
 
-def main():
-    parser = argparse.ArgumentParser(description="将生成的 npy 动作与音乐合成为视频")
-    parser.add_argument("--motion", type=str, required=True, help="输入的 .npy 文件路径")
-    parser.add_argument("--audio", type=str, required=True, help="输入的测试音乐 .wav 路径")
-    parser.add_argument("--output", type=str, required=True, help="输出的 .mp4 文件路径")
-    parser.add_argument(
-        "--camera_mode",
-        type=str,
-        choices=["fixed", "follow"],
-        default="fixed",
-        help="fixed 用固定世界坐标观察轨迹；follow 用骨盆跟拍观察动作细节",
-    )
-    args = parser.parse_args()
+def _as_batch_motion(arr):
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        if arr.shape[-1] != 151:
+            raise ValueError(f"Expected [T,151], got {arr.shape}")
+        return arr[None]
+    if arr.ndim == 3:
+        if arr.shape[-1] != 151:
+            raise ValueError(f"Expected [B,T,151], got {arr.shape}")
+        return arr
+    raise ValueError(f"Expected [T,151] or [B,T,151], got {arr.shape}")
 
-    if not os.path.exists(args.motion):
-        raise FileNotFoundError(f"❌ 找不到动作文件: {args.motion}")
-    if not os.path.exists(args.audio):
-        raise FileNotFoundError(f"❌ 找不到音乐文件: {args.audio}")
+def _sanitize_contacts(contacts, seq_len):
+    contacts = np.asarray(contacts)
+    if contacts.ndim == 1:
+        contacts = np.repeat(contacts[:, None], 4, axis=1)
+    if contacts.ndim == 2 and contacts.shape[1] == 1:
+        contacts = np.repeat(contacts, 4, axis=1)
+    if contacts.ndim != 2:
+        return np.zeros((seq_len, 4), dtype=np.float32)
+    if contacts.shape[1] != 4:
+        if contacts.shape[1] > 4:
+            contacts = contacts[:, :4]
+        else:
+            pad = np.zeros((contacts.shape[0], 4 - contacts.shape[1]), dtype=contacts.dtype)
+            contacts = np.concatenate([contacts, pad], axis=1)
+    if contacts.shape[0] == seq_len - 1:
+        contacts = np.concatenate([contacts, contacts[-1:]], axis=0)
+    elif contacts.shape[0] < seq_len:
+        pad_src = contacts[-1:] if len(contacts) else np.zeros((1, 4), dtype=np.float32)
+        pad = np.repeat(pad_src, seq_len - contacts.shape[0], axis=0)
+        contacts = np.concatenate([contacts, pad], axis=0)
+    elif contacts.shape[0] > seq_len:
+        contacts = contacts[:seq_len]
+    return contacts.astype(np.float32)
 
-    print(f"🎬 正在读取动作张量: {args.motion}")
-    motion_data = np.load(args.motion)
-    
-    # ==================== ✨ 修复核心：正向运动学 (FK) 还原 3D 关节坐标 ====================
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def _render_one(motion_data, audio, output, camera_mode):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     motion_tensor = torch.tensor(motion_data, dtype=torch.float32, device=device).unsqueeze(0)
-    
-    # 拆分特征
-    contacts = motion_tensor[0, :, 0:4].cpu().numpy()
+    contacts = _sanitize_contacts(motion_tensor[0, :, 0:4].detach().cpu().numpy(), motion_data.shape[0])
     pos = motion_tensor[:, :, 4:7]
     seq_len = pos.shape[1]
     q_6d = motion_tensor[:, :, 7:].reshape(1, seq_len, 24, 6)
-    
-    # 6D 转 Axis-Angle
     q_ax = ax_from_6v(q_6d)
-    
-    # SMPL 前向推导 3D 坐标
     smpl = SMPLSkeleton(device=device)
     poses_3d = smpl.forward(q_ax, pos).detach().cpu().numpy()[0]
-    # =========================================================================================
-    
-    # 提取输出目录
-    out_dir = os.path.dirname(args.output)
-    if out_dir == "": out_dir = "."
+    out_dir = os.path.dirname(output) or "."
     os.makedirs(out_dir, exist_ok=True)
-    
-    # 为了适配 vis.py 的命名习惯，构造 epoch 前缀
-    base_name = os.path.basename(args.output).replace(".mp4", "")
-    
-    print(f"🎥 开始渲染 3D 骨架并合成音频 (camera={args.camera_mode})...")
+    base_name = os.path.basename(output).replace(".mp4", "")
     skeleton_render(
-        poses=poses_3d,       # ✨ 替换：传入运算好的 3D 坐标
-        epoch=base_name,    
+        poses=poses_3d,
+        epoch=base_name,
         out=out_dir,
-        name=[args.audio],  
+        name=[audio],
         sound=True,
         stitch=False,
-        contact=contacts,     # ✨ 新增：传入脚部物理接触点数据，让地面支撑更直观（红/绿切换）
+        contact=contacts,
         render=True,
-        camera_mode=args.camera_mode,
-        output_path=args.output,
+        camera_mode=camera_mode,
+        output_path=output,
     )
-    
-    print(f"✅ 视频渲染完成！请查看: {args.output}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Render EDGE 151D .npy motion to mp4. Supports [T,151] or [B,T,151].")
+    parser.add_argument("--motion", type=str, required=True)
+    parser.add_argument("--audio", type=str, required=True)
+    parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--camera_mode", type=str, choices=["fixed", "follow"], default="fixed")
+    args = parser.parse_args()
+    if not os.path.exists(args.motion):
+        raise FileNotFoundError(f"Motion not found: {args.motion}")
+    if not os.path.exists(args.audio):
+        raise FileNotFoundError(f"Audio not found: {args.audio}")
+    print(f"🎬 正在读取动作张量: {args.motion}")
+    motion_batch = _as_batch_motion(np.load(args.motion, allow_pickle=True))
+    print(f"motion shape: {motion_batch.shape}")
+    if motion_batch.shape[0] == 1:
+        print(f"🎥 开始渲染 (camera={args.camera_mode})...")
+        _render_one(motion_batch[0], args.audio, args.output, args.camera_mode)
+        print(f"✅ 视频渲染完成: {args.output}")
+    else:
+        root, ext = os.path.splitext(args.output)
+        for i in range(motion_batch.shape[0]):
+            out = f"{root}_b{i:02d}{ext or '.mp4'}"
+            print(f"🎥 渲染 batch {i}: {out}")
+            _render_one(motion_batch[i], args.audio, out, args.camera_mode)
+        print(f"✅ batch 视频渲染完成，共 {motion_batch.shape[0]} 条。")
 
 if __name__ == "__main__":
     main()
