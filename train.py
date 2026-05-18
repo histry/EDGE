@@ -59,6 +59,7 @@ def _install_runtime_patches():
             ("edge_recon_contract_patch", "install_recon_contract_patch"),
             ("unit_reconstruction_patch", "install_v3_unit_reconstruction_patch"),
             ("v3c_visible_fk_patch", "install_v3c_visible_fk_patch"),
+            ("v3f_body_centered_response_patch", "install_v3f_body_centered_response_patch"),
         ]
     else:
         # Previous patch-heavy path retained for backward compatibility.
@@ -92,6 +93,7 @@ if _profile() == "v3_unit_recon":
     # Install once more after model.diffusion is definitely importable.
     _call_install("unit_reconstruction_patch", "install_v3_unit_reconstruction_patch", verbose=True)
     _call_install("v3c_visible_fk_patch", "install_v3c_visible_fk_patch", verbose=True)
+    _call_install("v3f_body_centered_response_patch", "install_v3f_body_centered_response_patch", verbose=True)
 else:
     try:
         from edge_text_context_training_fix import install_edge_text_context_training_fix
