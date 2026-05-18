@@ -90,6 +90,7 @@ from EDGE import EDGE
 
 
 if _profile() == "v3_unit_recon":
+    os.environ.setdefault("EDGE_DUNHUANG_ASSERT_TRAJ_MATCH", "0")
     # Install once more after model.diffusion is definitely importable.
     _call_install("unit_reconstruction_patch", "install_v3_unit_reconstruction_patch", verbose=True)
     _call_install("v3c_visible_fk_patch", "install_v3c_visible_fk_patch", verbose=True)

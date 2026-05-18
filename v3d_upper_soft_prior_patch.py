@@ -1,22 +1,46 @@
 """
-V3D/V4 retrieved upper_safe_plus soft prior sampling patch.
+V3D/V4 retrieved motion soft prior patch.
 
-V3D:
-  Softly guides upper_safe_plus rotation channels toward retrieved_prior_motion
-  during late DDPM denoising.
+Original V3D/V4 only guided upper_safe_plus rotations:
+  torso / neck / shoulders / arms / hands
 
-V4 extension:
-  If EDGE_V4_RHYTHM_ADAPTIVE_PRIOR=1 and cond["rhythm_weight"] is provided,
-  the prior strength becomes frame-adaptive:
-    strong music frames  -> stronger prior guidance
-    weak music frames    -> softer prior guidance
+This replacement keeps the old behavior by default, but adds a
+style-fullbody prior mode for Dunhuang dance:
 
-This patch still does NOT guide:
-  contacts, root position, pelvis translation, knees, ankles, feet.
+  body_part=upper_safe_plus:
+      old behavior, upper-body only.
+
+  body_part=style_fullbody:
+      soft spatial prior over:
+        - root Y only, not root X/Z by default
+        - pelvis rotation
+        - hips rotation
+        - knees rotation
+        - ankles / feet rotation, very weak
+        - spine / torso / neck / head
+        - shoulders / arms / hands
+
+The goal is to preserve Dunhuang "three-bend" silhouette:
+  head-neck + chest-waist + pelvis/legs S-curve,
+without hard-copying root X/Z or foot contacts.
+
+Important:
+  - Root X/Z remains disabled by default.
+  - Contact channels remain disabled by default.
+  - Lower body is weakly guided, not hard projected.
+  - This is still a soft prior in diffusion space, not post-hoc IK.
 
 Enable V3D:
   EDGE_V3D_UPPER_SOFT_PRIOR=1
   EDGE_V3D_UPPER_PRIOR_STRENGTH=0.35
+
+Enable style-fullbody:
+  EDGE_V3D_UPPER_PRIOR_BODY_PART=style_fullbody
+  EDGE_V3D_ROOT_Y_PRIOR_SCALE=0.25
+  EDGE_V3D_PELVIS_PRIOR_SCALE=0.35
+  EDGE_V3D_HIPS_PRIOR_SCALE=0.30
+  EDGE_V3D_KNEES_PRIOR_SCALE=0.18
+  EDGE_V3D_ANKLES_FEET_PRIOR_SCALE=0.08
 
 Enable V4 rhythm-adaptive prior:
   EDGE_V4_RHYTHM_ADAPTIVE_PRIOR=1
@@ -54,31 +78,113 @@ def _rot_dims(joints):
 
 
 # EDGE 151D:
-# 0:4 contacts, 4:7 root pos, 7:151 24 joint 6D rotations.
+#   0:4    foot contacts
+#   4:7    root xyz, where x=4, y=5, z=6
+#   7:151  24 joints × 6D rotations
+CONTACTS = [0, 1, 2, 3]
+ROOT_XZ = [4, 6]
+ROOT_Y = [5]
+
+# SMPL-like 24-joint convention used by EDGE/SMPLSkeleton.
+PELVIS = _rot_dims([0])
+HIPS = _rot_dims([1, 2])
 SPINE_TORSO = _rot_dims([3, 6, 9])
+KNEES = _rot_dims([4, 5])
+ANKLES_FEET = _rot_dims([7, 8, 10, 11])
 NECK_HEAD = _rot_dims([12, 15])
 SHOULDERS_ARMS_HANDS = _rot_dims([13, 14, 16, 17, 18, 19, 20, 21, 22, 23])
+
 UPPER_SAFE_PLUS = SPINE_TORSO + NECK_HEAD + SHOULDERS_ARMS_HANDS
+STYLE_FULLBODY_ROT = (
+    PELVIS
+    + HIPS
+    + SPINE_TORSO
+    + KNEES
+    + ANKLES_FEET
+    + NECK_HEAD
+    + SHOULDERS_ARMS_HANDS
+)
+ALL_ROT = list(range(7, 151))
 
 
 def _make_feature_mask(x: torch.Tensor) -> torch.Tensor:
+    """Build a spatially weighted soft-prior mask.
+
+    This is deliberately not a 0/1 hard split for Dunhuang:
+    upper receives stronger guidance, pelvis/hips/knees receive weaker guidance,
+    feet/contact/root_xz are either off or very weak unless explicitly enabled.
+    """
     mask = torch.zeros_like(x)
 
-    body_part = os.environ.get("EDGE_V3D_UPPER_PRIOR_BODY_PART", "upper_safe_plus").strip().lower()
+    body_part = os.environ.get(
+        "EDGE_V3D_UPPER_PRIOR_BODY_PART", "upper_safe_plus"
+    ).strip().lower()
 
     if body_part in {"arms", "hands", "arms_hands"}:
         dims = SHOULDERS_ARMS_HANDS
     elif body_part in {"torso", "torso_only"}:
         dims = SPINE_TORSO + NECK_HEAD
+    elif body_part in {"style_fullbody", "fullbody_style", "dunhuang_style"}:
+        dims = STYLE_FULLBODY_ROT
+    elif body_part in {"all_rot", "full_rot"}:
+        dims = ALL_ROT
     else:
         dims = UPPER_SAFE_PLUS
 
     mask[:, :, dims] = 1.0
 
+    # Global lower-body style multiplier.
+    lower_style_scale = _env_float("EDGE_V3D_LOWER_STYLE_PRIOR_SCALE", 1.0)
+
+    # Non-rotation channels. Disabled by default except root Y in style-fullbody.
+    root_xz_scale = _env_float("EDGE_V3D_ROOT_XZ_PRIOR_SCALE", 0.0)
+    root_y_scale_default = 0.25 if body_part in {
+        "style_fullbody",
+        "fullbody_style",
+        "dunhuang_style",
+    } else 0.0
+    root_y_scale = _env_float("EDGE_V3D_ROOT_Y_PRIOR_SCALE", root_y_scale_default)
+    contact_scale = _env_float("EDGE_V3D_CONTACT_PRIOR_SCALE", 0.0)
+
+    if root_xz_scale > 0:
+        mask[:, :, ROOT_XZ] = root_xz_scale
+    if root_y_scale > 0:
+        mask[:, :, ROOT_Y] = root_y_scale
+    if contact_scale > 0:
+        mask[:, :, CONTACTS] = contact_scale
+
+    # Rotation-channel scales.
+    pelvis_scale = _env_float("EDGE_V3D_PELVIS_PRIOR_SCALE", 0.0)
+    hips_scale = _env_float("EDGE_V3D_HIPS_PRIOR_SCALE", 0.0)
+    knees_scale = _env_float("EDGE_V3D_KNEES_PRIOR_SCALE", 0.0)
+    ankles_feet_scale = _env_float("EDGE_V3D_ANKLES_FEET_PRIOR_SCALE", 0.0)
+
+    # Preserve old upper-only defaults.
     torso_scale = _env_float("EDGE_V3D_TORSO_PRIOR_SCALE", 0.65)
     neck_scale = _env_float("EDGE_V3D_NECK_HEAD_PRIOR_SCALE", 0.85)
     arms_scale = _env_float("EDGE_V3D_ARMS_PRIOR_SCALE", 1.00)
 
+    if body_part in {"style_fullbody", "fullbody_style", "dunhuang_style"}:
+        if pelvis_scale <= 0:
+            pelvis_scale = 0.35
+        if hips_scale <= 0:
+            hips_scale = 0.30
+        if knees_scale <= 0:
+            knees_scale = 0.18
+        if ankles_feet_scale <= 0:
+            ankles_feet_scale = 0.08
+        if torso_scale <= 0:
+            torso_scale = 1.15
+        if neck_scale <= 0:
+            neck_scale = 1.10
+
+    # Lower-body style should be weak but nonzero for Dunhuang silhouette.
+    mask[:, :, PELVIS] *= pelvis_scale * lower_style_scale
+    mask[:, :, HIPS] *= hips_scale * lower_style_scale
+    mask[:, :, KNEES] *= knees_scale * lower_style_scale
+    mask[:, :, ANKLES_FEET] *= ankles_feet_scale * lower_style_scale
+
+    # Upper and spine style.
     mask[:, :, SPINE_TORSO] *= torso_scale
     mask[:, :, NECK_HEAD] *= neck_scale
     mask[:, :, SHOULDERS_ARMS_HANDS] *= arms_scale
@@ -168,12 +274,14 @@ def install_v3d_upper_soft_prior_patch(verbose: bool = True) -> bool:
         from model.diffusion import GaussianDiffusion
     except Exception as exc:
         if verbose:
-            print(f"⚠️ V3D/V4 upper soft prior patch skipped: {exc}")
+            print(f"⚠️ V3D/V4 soft prior patch skipped: {exc}")
         return False
 
+    # In a fresh Python process this will be False. Keeping the same flag
+    # preserves compatibility with existing scripts.
     if getattr(GaussianDiffusion, "_edge_v3d_upper_soft_prior_patched", False):
         if verbose:
-            print("✅ V3D/V4 upper soft prior patch already installed")
+            print("✅ V3D/V4 soft prior patch already installed")
         return True
 
     orig_p_sample = GaussianDiffusion.p_sample
@@ -198,6 +306,8 @@ def install_v3d_upper_soft_prior_patch(verbose: bool = True) -> bool:
             prior_clean = _resize_prior_to_x(cond["retrieved_prior_motion"], x_out)
 
             # Match the current x_{t-1} noise level approximately.
+            # This keeps guidance inside the diffusion trajectory instead of
+            # directly hard-overwriting clean x0 features.
             t_next = (t - 1).clamp_min(0)
             prior_noisy = self.q_sample(prior_clean, t_next, noise=torch.zeros_like(prior_clean))
 
@@ -205,20 +315,27 @@ def install_v3d_upper_soft_prior_patch(verbose: bool = True) -> bool:
             w = _soft_prior_weight(self, t)
             w = _apply_v4_rhythm_gain(w, x_out, cond)
 
-            x_guided = x_out * (1.0 - w * mask) + prior_noisy * (w * mask)
+            max_blend = _env_float("EDGE_V3D_PRIOR_MAX_BLEND", 0.85)
+            blend = (w * mask).clamp(0.0, max_blend)
+
+            x_guided = x_out * (1.0 - blend) + prior_noisy * blend
 
             if _env_bool("EDGE_V3D_UPPER_PRIOR_DEBUG", False) or _env_bool("EDGE_V4_RHYTHM_DEBUG", False):
                 if not hasattr(self, "_edge_v3d_prior_debug_counter"):
                     self._edge_v3d_prior_debug_counter = 0
                 self._edge_v3d_prior_debug_counter += 1
                 if self._edge_v3d_prior_debug_counter <= 20 or self._edge_v3d_prior_debug_counter % 100 == 0:
+                    body_part = os.environ.get("EDGE_V3D_UPPER_PRIOR_BODY_PART", "upper_safe_plus")
                     msg = (
-                        "🧪 V3D/V4 upper soft prior | "
+                        "🧪 V3D/V4 soft prior | "
+                        f"body={body_part} "
                         f"t={int(t[0].detach().cpu())} "
                         f"w_mean={float(w.mean().detach().cpu()):.4f} "
                         f"w_min={float(w.min().detach().cpu()):.4f} "
                         f"w_max={float(w.max().detach().cpu()):.4f} "
-                        f"mask_mean={float(mask.mean().detach().cpu()):.4f}"
+                        f"mask_mean={float(mask.mean().detach().cpu()):.4f} "
+                        f"blend_mean={float(blend.mean().detach().cpu()):.4f} "
+                        f"blend_max={float(blend.max().detach().cpu()):.4f}"
                     )
                     if _env_bool("EDGE_V4_RHYTHM_ADAPTIVE_PRIOR", False) and cond.get("rhythm_weight", None) is not None:
                         rhythm = _resize_rhythm_to_x(cond["rhythm_weight"], x_out)
@@ -233,12 +350,12 @@ def install_v3d_upper_soft_prior_patch(verbose: bool = True) -> bool:
 
         except Exception as exc:
             if _env_bool("EDGE_V3D_UPPER_PRIOR_DEBUG", False) or _env_bool("EDGE_V4_RHYTHM_DEBUG", False):
-                print(f"⚠️ V3D/V4 upper soft prior skipped: {exc}", flush=True)
+                print(f"⚠️ V3D/V4 soft prior skipped: {exc}", flush=True)
             return x_out, pred_xstart
 
     GaussianDiffusion.p_sample = patched_p_sample
     GaussianDiffusion._edge_v3d_upper_soft_prior_patched = True
 
     if verbose:
-        print("✅ Installed V3D/V4 retrieved upper_safe_plus rhythm-adaptive soft prior patch")
+        print("✅ Installed V3D/V4 style-fullbody soft prior patch")
     return True
