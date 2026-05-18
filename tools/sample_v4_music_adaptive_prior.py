@@ -47,13 +47,13 @@ def main():
     ap.add_argument("--audio", required=True, help="music wav used for rhythm adaptation")
     ap.add_argument("--out", required=True)
 
-    ap.add_argument("--batch_size", type=int, default=2)
+    ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--seq_len", type=int, default=45)
     ap.add_argument("--audio_dim", type=int, default=803)
     ap.add_argument("--feature_type", default="hybrid")
     ap.add_argument("--seed", type=int, default=1234)
 
-    # V3D/V4 prior schedule.
+    # V3D/V4/V4E prior schedule.
     ap.add_argument("--strength", type=float, default=0.35)
     ap.add_argument("--start_frac", type=float, default=0.45)
     ap.add_argument("--gamma", type=float, default=1.2)
@@ -83,23 +83,32 @@ def main():
             "style_fullbody",
             "fullbody_style",
             "dunhuang_style",
+            "support_chain",
             "all_rot",
             "full_rot",
         ],
-        help=(
-            "Which feature group to guide. "
-            "Use style_fullbody for Dunhuang three-bend silhouette guidance."
-        ),
     )
+
+    # Guidance mode.
+    ap.add_argument(
+        "--guidance_mode",
+        default="blend",
+        choices=["blend", "grad", "gradient", "hybrid"],
+        help="blend = old soft blend; grad/hybrid = V4E support-chain gradient guidance",
+    )
+    ap.add_argument("--support_chain", type=int, default=0)
+    ap.add_argument("--grad_step", type=float, default=1.25)
+    ap.add_argument("--grad_clip", type=float, default=0.10)
 
     # Upper/spine scales.
     ap.add_argument("--torso_scale", type=float, default=1.00)
     ap.add_argument("--neck_head_scale", type=float, default=1.00)
     ap.add_argument("--arms_scale", type=float, default=1.00)
 
-    # Style-fullbody scales.
+    # Style-fullbody / V4E support-chain scales.
     ap.add_argument("--root_y_scale", type=float, default=0.25)
     ap.add_argument("--root_xz_scale", type=float, default=0.00)
+    ap.add_argument("--root_xz_vel_scale", type=float, default=0.00)
     ap.add_argument("--contact_scale", type=float, default=0.00)
     ap.add_argument("--pelvis_scale", type=float, default=0.35)
     ap.add_argument("--hips_scale", type=float, default=0.30)
@@ -107,6 +116,20 @@ def main():
     ap.add_argument("--ankles_feet_scale", type=float, default=0.08)
     ap.add_argument("--lower_style_scale", type=float, default=1.00)
 
+    # V4E separate gradient-loss scales. Defaults reuse the mask scales.
+    ap.add_argument("--root_y_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--root_xz_abs_loss_scale", type=float, default=0.0)
+    ap.add_argument("--root_xz_vel_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--contact_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--pelvis_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--hips_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--knees_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--ankles_feet_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--torso_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--neck_head_loss_scale", type=float, default=-1.0)
+    ap.add_argument("--arms_loss_scale", type=float, default=-1.0)
+
+    ap.add_argument("--debug_prior", type=int, default=0)
     ap.add_argument("--save_warped_prior", default="")
     ap.add_argument("--save_diag", default="")
     args = ap.parse_args()
@@ -126,7 +149,12 @@ def main():
     os.environ["EDGE_V3D_UPPER_PRIOR_START_FRAC"] = str(args.start_frac)
     os.environ["EDGE_V3D_UPPER_PRIOR_GAMMA"] = str(args.gamma)
     os.environ["EDGE_V3D_PRIOR_MAX_BLEND"] = str(args.prior_max_blend)
-    os.environ.setdefault("EDGE_V3D_UPPER_PRIOR_DEBUG", "1")
+
+    # V4E guidance mode.
+    os.environ["EDGE_V4E_GUIDANCE_MODE"] = str(args.guidance_mode)
+    os.environ["EDGE_V4E_SUPPORT_CHAIN_PRIOR"] = "1" if int(args.support_chain) else "0"
+    os.environ["EDGE_V4E_GRAD_STEP"] = str(args.grad_step)
+    os.environ["EDGE_V4E_GRAD_CLIP"] = str(args.grad_clip)
 
     # Body-part / style-fullbody mask.
     os.environ["EDGE_V3D_UPPER_PRIOR_BODY_PART"] = str(args.body_part)
@@ -143,11 +171,35 @@ def main():
     os.environ["EDGE_V3D_ANKLES_FEET_PRIOR_SCALE"] = str(args.ankles_feet_scale)
     os.environ["EDGE_V3D_LOWER_STYLE_PRIOR_SCALE"] = str(args.lower_style_scale)
 
-    # V4 rhythm adaptive per-frame prior strength.
+    # V4E gradient-loss scales.
+    def set_if_nonneg(env_name, value):
+        if float(value) >= 0:
+            os.environ[env_name] = str(value)
+
+    set_if_nonneg("EDGE_V4E_ROOT_Y_LOSS_SCALE", args.root_y_loss_scale)
+    set_if_nonneg("EDGE_V4E_ROOT_XZ_ABS_LOSS_SCALE", args.root_xz_abs_loss_scale)
+    if args.root_xz_vel_loss_scale >= 0:
+        os.environ["EDGE_V4E_ROOT_XZ_VEL_LOSS_SCALE"] = str(args.root_xz_vel_loss_scale)
+    else:
+        os.environ["EDGE_V4E_ROOT_XZ_VEL_LOSS_SCALE"] = str(args.root_xz_vel_scale)
+
+    set_if_nonneg("EDGE_V4E_CONTACT_LOSS_SCALE", args.contact_loss_scale)
+    set_if_nonneg("EDGE_V4E_PELVIS_LOSS_SCALE", args.pelvis_loss_scale)
+    set_if_nonneg("EDGE_V4E_HIPS_LOSS_SCALE", args.hips_loss_scale)
+    set_if_nonneg("EDGE_V4E_KNEES_LOSS_SCALE", args.knees_loss_scale)
+    set_if_nonneg("EDGE_V4E_ANKLES_FEET_LOSS_SCALE", args.ankles_feet_loss_scale)
+    set_if_nonneg("EDGE_V4E_TORSO_LOSS_SCALE", args.torso_loss_scale)
+    set_if_nonneg("EDGE_V4E_NECK_HEAD_LOSS_SCALE", args.neck_head_loss_scale)
+    set_if_nonneg("EDGE_V4E_ARMS_LOSS_SCALE", args.arms_loss_scale)
+
+    # V4 rhythm-adaptive per-frame prior strength.
     os.environ["EDGE_V4_RHYTHM_ADAPTIVE_PRIOR"] = "1"
     os.environ["EDGE_V4_RHYTHM_MIN_GAIN"] = str(args.rhythm_min_gain)
     os.environ["EDGE_V4_RHYTHM_MAX_GAIN"] = str(args.rhythm_max_gain)
-    os.environ.setdefault("EDGE_V4_RHYTHM_DEBUG", "1")
+
+    os.environ["EDGE_V3D_UPPER_PRIOR_DEBUG"] = "1" if args.debug_prior else os.environ.get("EDGE_V3D_UPPER_PRIOR_DEBUG", "0")
+    os.environ["EDGE_V4_RHYTHM_DEBUG"] = "1" if args.debug_prior else os.environ.get("EDGE_V4_RHYTHM_DEBUG", "0")
+    os.environ["EDGE_V4E_DEBUG"] = "1" if args.debug_prior else os.environ.get("EDGE_V4E_DEBUG", "0")
 
     from unit_reconstruction_patch import install_v3_unit_reconstruction_patch
     from v3d_upper_soft_prior_patch import install_v3d_upper_soft_prior_patch
@@ -208,8 +260,13 @@ def main():
         "gamma": args.gamma,
         "prior_max_blend": args.prior_max_blend,
         "body_part": args.body_part,
+        "guidance_mode": args.guidance_mode,
+        "support_chain": int(args.support_chain),
+        "grad_step": args.grad_step,
+        "grad_clip": args.grad_clip,
         "root_y_scale": args.root_y_scale,
         "root_xz_scale": args.root_xz_scale,
+        "root_xz_vel_scale": args.root_xz_vel_scale,
         "contact_scale": args.contact_scale,
         "pelvis_scale": args.pelvis_scale,
         "hips_scale": args.hips_scale,
@@ -282,7 +339,7 @@ def main():
 
     shape = (args.batch_size, args.seq_len, 151)
 
-    print("==== V4 music-adaptive retrieved prior sampling ====")
+    print("==== V4/V4E music-adaptive retrieved prior sampling ====")
     print("checkpoint:", args.checkpoint)
     print("prior:", args.prior)
     print("audio:", args.audio)
@@ -291,11 +348,14 @@ def main():
     print("diag:", diag_path)
     print("shape:", shape)
     print("body_part:", args.body_part)
+    print("guidance_mode:", args.guidance_mode)
+    print("support_chain:", args.support_chain)
     print("strength:", args.strength)
     print("start_frac:", args.start_frac)
     print("gamma:", args.gamma)
     print("prior_max_blend:", args.prior_max_blend)
-    print("root_y/root_xz/contact:", args.root_y_scale, args.root_xz_scale, args.contact_scale)
+    print("grad_step/clip:", args.grad_step, args.grad_clip)
+    print("root_y/root_xz/root_xz_vel/contact:", args.root_y_scale, args.root_xz_scale, args.root_xz_vel_scale, args.contact_scale)
     print("pelvis/hips/knees/ankles_feet:", args.pelvis_scale, args.hips_scale, args.knees_scale, args.ankles_feet_scale)
     print("torso/neck/arms:", args.torso_scale, args.neck_head_scale, args.arms_scale)
     print("warp_strength:", args.warp_strength)
@@ -304,6 +364,8 @@ def main():
     print("rhythm mean/min/max:", float(rhythm_curve.mean()), float(rhythm_curve.min()), float(rhythm_curve.max()))
     print("phase first/mid/last:", float(phase[0]), float(phase[len(phase)//2]), float(phase[-1]))
 
+    # Keep no_grad for model sampling; V4E patch uses torch.enable_grad()
+    # internally only for feature-space support-chain guidance.
     with torch.no_grad():
         samples_norm = edge.diffusion.p_sample_loop(
             shape,
