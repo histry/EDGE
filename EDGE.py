@@ -673,7 +673,6 @@ class EDGE:
             "Root Turn Loss",
             "Contact Turn Loss",
             "Body Stability Loss",
-            "Root-Lower Coupling Loss",
             "Motion Energy Loss",
         ]
 

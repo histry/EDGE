@@ -58,6 +58,8 @@ def _install_runtime_patches():
             ("edge_safety_patch", "install_edge_safety_patch"),
             ("edge_recon_contract_patch", "install_recon_contract_patch"),
             ("unit_reconstruction_patch", "install_v3_unit_reconstruction_patch"),
+            ("v3_loss_stability_patch", "install_v3_base_loss_stability_patch"),
+            ("v3_loss_stability_patch", "install_v3_disable_raw_physical_losses_patch"),
             ("v3c_visible_fk_patch", "install_v3c_visible_fk_patch"),
             ("v3f_body_centered_response_patch", "install_v3f_body_centered_response_patch"),
         ]
@@ -93,6 +95,8 @@ if _profile() == "v3_unit_recon":
     os.environ.setdefault("EDGE_DUNHUANG_ASSERT_TRAJ_MATCH", "0")
     # Install once more after model.diffusion is definitely importable.
     _call_install("unit_reconstruction_patch", "install_v3_unit_reconstruction_patch", verbose=True)
+    _call_install("v3_loss_stability_patch", "install_v3_base_loss_stability_patch", verbose=True)
+    _call_install("v3_loss_stability_patch", "install_v3_disable_raw_physical_losses_patch", verbose=True)
     _call_install("v3c_visible_fk_patch", "install_v3c_visible_fk_patch", verbose=True)
     _call_install("v3f_body_centered_response_patch", "install_v3f_body_centered_response_patch", verbose=True)
 else:
