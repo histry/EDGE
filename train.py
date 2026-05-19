@@ -62,6 +62,7 @@ def _install_runtime_patches():
             ("v3_loss_stability_patch", "install_v3_disable_raw_physical_losses_patch"),
             ("v3c_visible_fk_patch", "install_v3c_visible_fk_patch"),
             ("v3f_body_centered_response_patch", "install_v3f_body_centered_response_patch"),
+            ("hf_event_contrastive_patch", "install_hf_event_contrastive_patch"),
         ]
     else:
         # Previous patch-heavy path retained for backward compatibility.
@@ -99,6 +100,7 @@ if _profile() == "v3_unit_recon":
     _call_install("v3_loss_stability_patch", "install_v3_disable_raw_physical_losses_patch", verbose=True)
     _call_install("v3c_visible_fk_patch", "install_v3c_visible_fk_patch", verbose=True)
     _call_install("v3f_body_centered_response_patch", "install_v3f_body_centered_response_patch", verbose=True)
+    _call_install("hf_event_contrastive_patch", "install_hf_event_contrastive_patch", verbose=True)
 else:
     try:
         from edge_text_context_training_fix import install_edge_text_context_training_fix
