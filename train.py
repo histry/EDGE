@@ -147,7 +147,11 @@ def train(opt):
     if _profile() == "v3_unit_recon":
         # Fail-safe option overrides. These mirror the shell scripts, but they
         # also protect against stale tmux/env copy-paste.
-        opt.audio_pairing_mode = "none"
+        if _truthy("EDGE_V3_KEEP_AUDIO_FOR_HF", False) and _truthy("EDGE_HF_EVENT_CONTRASTIVE", False):
+            opt.audio_pairing_mode = os.environ.get("EDGE_V3_AUDIO_PAIRING_MODE", "proxy")
+            print(f"🎵 V3 HF-event mode: keeping audio_pairing_mode={opt.audio_pairing_mode}")
+        else:
+            opt.audio_pairing_mode = "none"
         opt.mmr_loss_weight = 0.0
         opt.disable_traj_cond = True
         opt.trajectory_loss_weight = 0.0

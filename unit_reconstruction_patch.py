@@ -92,7 +92,12 @@ def _clone_cond_without_controls(cond: Any, x_start: torch.Tensor) -> Any:
 
     audio = cond.get("audio", None)
     if torch.is_tensor(audio):
-        cleaned["audio"] = torch.zeros_like(audio)
+        # V3 normally zeros audio to avoid accidental music supervision.
+        # For Stage-E HF-event contrastive training, keep weak/proxy audio explicitly.
+        if _env_bool("EDGE_V3_KEEP_AUDIO_FOR_HF", False) and _env_bool("EDGE_HF_EVENT_CONTRASTIVE", False):
+            cleaned["audio"] = audio
+        else:
+            cleaned["audio"] = torch.zeros_like(audio)
     # Keep bookkeeping fields only if they are harmless.
     audio_paired = cond.get("audio_paired", None)
     if torch.is_tensor(audio_paired):
