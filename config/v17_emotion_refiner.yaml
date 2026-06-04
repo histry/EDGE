@@ -1,0 +1,31 @@
+# V17 Emotion-aware Dunhuang Refiner config
+# 这是说明文件，脚本主要通过环境变量控制。
+
+music:
+  use_emotion: true
+  feature_dim: 8
+  feature_names:
+    - energy
+    - onset
+    - beat
+    - tempo_norm
+    - arousal_proxy
+    - valence_brightness_proxy
+    - tension_proxy
+    - calmness_proxy
+
+training:
+  default_epochs: 800
+  default_batch_size: 8
+  default_lr: 0.0003
+  lambda_music: 0.04
+  lambda_preserve: 0.25
+
+losses:
+  reconstruction: "接缝加权 SmoothL1 重建"
+  velocity: "一阶速度连续性"
+  acceleration: "二阶加速度 / jitter 抑制"
+  root_lock: "root X/Z 原地约束"
+  preserve: "非接缝区域保持输入，避免重写整段"
+  residual: "残差幅度正则"
+  music_emotion: "动作能量曲线与音乐 arousal/tension/calmness 弱对齐"
