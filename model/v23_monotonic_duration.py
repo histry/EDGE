@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V23 monotonic duration-and-time-warp network.
+"""V23-v2 natural-duration and monotonic time-warp network.
 
-The network never predicts a pose residual.  It predicts:
-1. a monotonic source-time map tau for a fixed-length motion window; and
-2. the number of output frames that the detected turn should occupy.
+The network never predicts a pose residual. It predicts:
+1. a bounded natural event duration;
+2. a monotonic source-time map tau; and
+3. an edit probability used by runtime safety gating.
 
-The final motion is produced only by SO(3)-aware temporal resampling, which
-preserves the original motion manifold much better than frame-wise pose edits.
+The time map is parameterized by positive increments, so monotonicity and exact
+endpoints are guaranteed by construction.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -55,7 +56,6 @@ class FiLMBlock1D(nn.Module):
 
 
 def root_yaw_velocity_dps(motion: torch.Tensor, fps: float = 30.0) -> torch.Tensor:
-    """Signed global-heading yaw velocity, consistent with runtime evaluation."""
     root = rotation_6d_to_matrix(motion[..., ROOT_ROT6D])
     yaw = torch.atan2(root[..., 0, 2], root[..., 2, 2])
     delta = yaw[:, 1:] - yaw[:, :-1]
@@ -64,34 +64,33 @@ def root_yaw_velocity_dps(motion: torch.Tensor, fps: float = 30.0) -> torch.Tens
 
 
 def warp_motion_so3(motion: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-    """Resample [B,T,151] motion using monotonic normalized source positions tau."""
+    """Resample [B,T,151] motion using normalized source positions tau."""
     if motion.ndim != 3 or motion.shape[-1] != 151:
         raise ValueError(f"motion must be [B,T,151], got {tuple(motion.shape)}")
     if tau.ndim != 2 or tau.shape[:2] != motion.shape[:2]:
         raise ValueError(f"tau must be [B,T], got {tuple(tau.shape)}")
 
-    b, t, _ = motion.shape
-    pos = torch.clamp(tau, 0.0, 1.0) * float(t - 1)
-    lower = torch.floor(pos).long().clamp(0, t - 1)
-    upper = (lower + 1).clamp(0, t - 1)
-    alpha = (pos - lower.to(pos.dtype)).clamp(0.0, 1.0)
+    batch_size, time_steps, _ = motion.shape
+    positions = torch.clamp(tau, 0.0, 1.0) * float(time_steps - 1)
+    lower = torch.floor(positions).long().clamp(0, time_steps - 1)
+    upper = (lower + 1).clamp(0, time_steps - 1)
+    alpha = (positions - lower.to(positions.dtype)).clamp(0.0, 1.0)
+    batch = torch.arange(batch_size, device=motion.device)[:, None]
 
-    batch = torch.arange(b, device=motion.device)[:, None]
     lower_motion = motion[batch, lower]
     upper_motion = motion[batch, upper]
-
     nearest = torch.where(alpha < 0.5, lower, upper)
     contacts = motion[batch, nearest, CONTACT]
     root = torch.lerp(lower_motion[..., ROOT], upper_motion[..., ROOT], alpha[..., None])
 
-    rot_all = rotation_6d_to_matrix(motion[..., ROT].reshape(b, t, 24, 6))
-    r0 = rot_all[batch, lower]
-    r1 = rot_all[batch, upper]
+    rotations = rotation_6d_to_matrix(motion[..., ROT].reshape(batch_size, time_steps, 24, 6))
+    r0 = rotations[batch, lower]
+    r1 = rotations[batch, upper]
     relative = torch.matmul(r0.transpose(-1, -2), r1)
     axis_angle = matrix_to_axis_angle(relative)
     delta = axis_angle_to_matrix(axis_angle * alpha[..., None, None])
     rotation = torch.matmul(r0, delta)
-    rot6d = matrix_to_rotation_6d(rotation).reshape(b, t, 144)
+    rot6d = matrix_to_rotation_6d(rotation).reshape(batch_size, time_steps, 144)
     return torch.cat([contacts, root, rot6d], dim=-1)
 
 
@@ -101,7 +100,6 @@ def soft_turn_duration_ratio(
     turn_end: torch.Tensor,
     temperature: float = 0.012,
 ) -> torch.Tensor:
-    """Differentiable number of output frames mapped into the input turn interval."""
     if turn_start.ndim == 1:
         turn_start = turn_start[:, None]
     if turn_end.ndim == 1:
@@ -112,7 +110,7 @@ def soft_turn_duration_ratio(
 
 
 class V23MonotonicDurationNet(nn.Module):
-    """Predict a monotonic time map and explicit target turn duration."""
+    """Predict natural duration, edit confidence and a monotonic time map."""
 
     def __init__(
         self,
@@ -120,13 +118,21 @@ class V23MonotonicDurationNet(nn.Module):
         condition_dim: int = 17,
         hidden_dim: int = 256,
         dropout: float = 0.10,
+        duration_min_frames: float = 8.0,
+        duration_max_frames: float = 56.0,
+        window_len: int = 72,
     ) -> None:
         super().__init__()
         self.motion_dim = int(motion_dim)
         self.condition_dim = int(condition_dim)
         self.hidden_dim = int(hidden_dim)
+        self.duration_min_frames = float(duration_min_frames)
+        self.duration_max_frames = float(duration_max_frames)
+        self.window_len = int(window_len)
+        if not (0.0 < self.duration_min_frames < self.duration_max_frames <= self.window_len):
+            raise ValueError("Invalid duration range")
 
-        # motion + first velocity + mask + time + signed yaw velocity
+        # observed motion + first velocity + edit mask + normalized time + signed yaw
         input_dim = motion_dim * 2 + 3
         self.input_projection = nn.Conv1d(input_dim, hidden_dim, 1)
         self.condition_projection = nn.Sequential(
@@ -137,23 +143,45 @@ class V23MonotonicDurationNet(nn.Module):
         )
         dilations = (1, 2, 4, 8, 16, 32, 16, 8, 4, 2)
         self.blocks = nn.ModuleList(
-            [FiLMBlock1D(hidden_dim, hidden_dim, d, dropout) for d in dilations]
+            [FiLMBlock1D(hidden_dim, hidden_dim, dilation, dropout) for dilation in dilations]
         )
         groups = 8 if hidden_dim % 8 == 0 else 1
         self.output_norm = nn.GroupNorm(groups, hidden_dim)
-        self.increment_head = nn.Conv1d(hidden_dim, 1, 1)
-        nn.init.zeros_(self.increment_head.weight)
-        nn.init.zeros_(self.increment_head.bias)
 
+        pooled_dim = hidden_dim * 2
         self.duration_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        self.edit_head = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self.duration_embedding = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.increment_head = nn.Conv1d(hidden_dim, 1, 1)
+
+        # Start from identity tau and the middle of the valid duration range.
+        nn.init.zeros_(self.increment_head.weight)
+        nn.init.zeros_(self.increment_head.bias)
         nn.init.zeros_(self.duration_head[-1].weight)
-        nn.init.constant_(self.duration_head[-1].bias, -1.38629436)  # sigmoid ~= 0.20
+        nn.init.zeros_(self.duration_head[-1].bias)
+        nn.init.zeros_(self.edit_head[-1].weight)
+        nn.init.zeros_(self.edit_head[-1].bias)
+
+    def _bounded_duration(self, duration_logit: torch.Tensor, time_steps: int) -> torch.Tensor:
+        minimum = self.duration_min_frames / float(time_steps)
+        maximum = self.duration_max_frames / float(time_steps)
+        return minimum + (maximum - minimum) * torch.sigmoid(duration_logit)
 
     def forward(
         self,
@@ -168,48 +196,60 @@ class V23MonotonicDurationNet(nn.Module):
         if edit_mask.ndim != 2:
             raise ValueError(f"edit_mask must be [B,T], got {tuple(edit_mask.shape)}")
         if condition.ndim != 2 or condition.shape[-1] != self.condition_dim:
-            raise ValueError(
-                f"condition must be [B,{self.condition_dim}], got {tuple(condition.shape)}"
-            )
+            raise ValueError(f"condition must be [B,{self.condition_dim}], got {tuple(condition.shape)}")
 
-        b, t, _ = motion.shape
+        batch_size, time_steps, _ = motion.shape
         velocity = torch.zeros_like(motion)
-        if t > 1:
+        if time_steps > 1:
             velocity[:, 1:] = motion[:, 1:] - motion[:, :-1]
             velocity[:, 0] = velocity[:, 1]
         yaw = root_yaw_velocity_dps(motion)
         yaw = torch.cat([yaw[:, :1], yaw], dim=1) / 600.0
         yaw = torch.clamp(yaw, -2.0, 2.0)[..., None]
-        time = torch.linspace(0.0, 1.0, t, device=motion.device, dtype=motion.dtype)
-        time = time[None, :, None].expand(b, -1, -1)
+        time = torch.linspace(0.0, 1.0, time_steps, device=motion.device, dtype=motion.dtype)
+        time = time[None, :, None].expand(batch_size, -1, -1)
         mask = edit_mask[..., None].to(motion.dtype)
         x = torch.cat([motion, velocity, mask, time, yaw], dim=-1).transpose(1, 2)
 
-        h = self.input_projection(x)
+        hidden = self.input_projection(x)
         cond = self.condition_projection(condition)
         for block in self.blocks:
-            h = block(h, cond)
-        h = F.silu(self.output_norm(h))
+            hidden = block(hidden, cond)
+        hidden = F.silu(self.output_norm(hidden))
 
-        # Zero logits -> equal increments -> exact identity map at initialization.
-        logits = self.increment_head(h).squeeze(1)[:, :-1]
-        increments = torch.exp(torch.clamp(logits, -6.0, 6.0)) + 1e-5
+        mask_weight = edit_mask.to(hidden.dtype).clamp_min(0.0)
+        pooled = (hidden.transpose(1, 2) * (0.10 + mask_weight)[..., None]).sum(dim=1)
+        pooled = pooled / (0.10 + mask_weight).sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled_cond = torch.cat([pooled, cond], dim=-1)
+
+        duration_logit = self.duration_head(pooled_cond).squeeze(-1)
+        duration_ratio = self._bounded_duration(duration_logit, time_steps)
+        edit_logit = self.edit_head(pooled_cond).squeeze(-1)
+        edit_probability = torch.sigmoid(edit_logit)
+
+        duration_feature = self.duration_embedding(duration_ratio[:, None])
+        hidden_for_tau = hidden + duration_feature[..., None]
+        raw_logits = self.increment_head(hidden_for_tau).squeeze(1)[:, :-1]
+
+        # Restrict non-uniform timing primarily to the event and its context.
+        interval_gate = torch.maximum(edit_mask[:, :-1], edit_mask[:, 1:]).to(raw_logits.dtype)
+        logits = raw_logits * (0.08 + 0.92 * interval_gate)
+        increments = F.softplus(torch.clamp(logits, -10.0, 10.0)) + 1e-5
         cumulative = torch.cumsum(increments, dim=1)
         cumulative = cumulative / cumulative[:, -1:].clamp_min(1e-8)
         tau = torch.cat(
-            [torch.zeros((b, 1), device=motion.device, dtype=motion.dtype), cumulative],
+            [torch.zeros((batch_size, 1), device=motion.device, dtype=motion.dtype), cumulative],
             dim=1,
         )
-
-        mask_weight = edit_mask.to(h.dtype).clamp_min(0.0)
-        pooled = (h.transpose(1, 2) * mask_weight[..., None]).sum(dim=1)
-        pooled = pooled / mask_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
-        duration_ratio = torch.sigmoid(self.duration_head(torch.cat([pooled, cond], dim=-1))).squeeze(-1)
 
         return {
             "tau": tau,
             "increments": increments,
             "duration_ratio": duration_ratio,
+            "duration_frames": duration_ratio * float(time_steps),
+            "duration_logit": duration_logit,
+            "edit_logit": edit_logit,
+            "edit_probability": edit_probability,
         }
 
 
@@ -221,6 +261,9 @@ def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") ->
         condition_dim=int(config.get("condition_dim", 17)),
         hidden_dim=int(config.get("hidden_dim", 256)),
         dropout=float(config.get("dropout", 0.10)),
+        duration_min_frames=float(config.get("duration_min_frames", 8.0)),
+        duration_max_frames=float(config.get("duration_max_frames", 56.0)),
+        window_len=int(config.get("window_len", 72)),
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()
@@ -229,4 +272,6 @@ def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") ->
         "config": config,
         "epoch": checkpoint.get("epoch", -1),
         "val_loss": checkpoint.get("val_loss", float("inf")),
+        "selection_score": checkpoint.get("selection_score", float("inf")),
+        "split": checkpoint.get("split", {}),
     }

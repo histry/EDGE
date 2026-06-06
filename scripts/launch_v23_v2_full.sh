@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cd /home/disk/lsm/storage/EDGE
+export PATH="/home/disk/lsm/conda_envs/edge/bin:$PATH"
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+STAMP=$(date +%Y%m%d_%H%M%S)
+export V23_RUN_ROOT="${V23_RUN_ROOT:-output/v23_v2_1_natural_duration_${STAMP}}"
+export V23_DATASET="${V23_DATASET:-data/v23_v2_natural_duration_dataset.npz}"
+export V23_REBUILD_DATASET="${V23_REBUILD_DATASET:-1}"
+
+# Recommended settings for complete action-event duration prediction.
+export V23_MIN_PEAK_DPS="${V23_MIN_PEAK_DPS:-32}"
+export V23_MIN_TURN_ANGLE="${V23_MIN_TURN_ANGLE:-10}"
+export V23_MIN_TARGET_DURATION="${V23_MIN_TARGET_DURATION:-10}"
+export V23_MAX_TARGET_DURATION="${V23_MAX_TARGET_DURATION:-56}"
+export V23_TURN_THRESHOLD_RATIO="${V23_TURN_THRESHOLD_RATIO:-0.12}"
+export V23_ACTIVITY_THRESHOLD_RATIO="${V23_ACTIVITY_THRESHOLD_RATIO:-0.18}"
+export V23_BOUNDARY_YAW_RATIO="${V23_BOUNDARY_YAW_RATIO:-0.06}"
+export V23_QUIET_RUN="${V23_QUIET_RUN:-4}"
+export V23_PHRASE_MARGIN="${V23_PHRASE_MARGIN:-3}"
+export V23_DURATION_BINS="${V23_DURATION_BINS:-auto:6}"
+export V23_BALANCE_POWER="${V23_BALANCE_POWER:-0.35}"
+export V23_MAX_BIN_FRACTION="${V23_MAX_BIN_FRACTION:-0.45}"
+
+export V23_MIN_SPEED_FACTOR="${V23_MIN_SPEED_FACTOR:-1.15}"
+export V23_MAX_SPEED_FACTOR="${V23_MAX_SPEED_FACTOR:-3.0}"
+export V23_IDENTITY_FRACTION="${V23_IDENTITY_FRACTION:-0.25}"
+export V23_MAX_SAMPLES="${V23_MAX_SAMPLES:-12000}"
+
+export V23_EPOCHS="${V23_EPOCHS:-600}"
+export V23_BATCH_SIZE="${V23_BATCH_SIZE:-64}"
+export V23_PATIENCE="${V23_PATIENCE:-100}"
+
+bash scripts/run_v23_duration_overnight.sh
