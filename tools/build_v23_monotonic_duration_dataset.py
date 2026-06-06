@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build V23-v2.1 natural-duration supervision.
+"""Build V23-v2.4 slow-aware event-grouped natural-duration supervision.
 
-This builder fixes three failure modes observed in V23-v2:
+This builder preserves the validated slow-aware event segmentation and additionally stores stable natural-event IDs for event-consistent multi-view training.
 1. short root-yaw cores were clamped to one minimum duration;
 2. an online equal-quota collector discarded most usable records when long bins
    were sparse;
@@ -148,6 +148,7 @@ def make_record(
     source_id: int,
     source_path: Path,
     event_index: int,
+    augmentation_id: int,
     window_start: int,
     factor: float,
     is_identity: bool,
@@ -206,6 +207,8 @@ def make_record(
         "speed_factor": float(effective_factor),
         "is_identity": float(is_identity),
         "duration_bin": int(duration_bin),
+        "event_uid": int(source_id * 10000 + event_index),
+        "augmentation_id": int(augmentation_id),
         "metadata": {
             "source": str(source_path),
             "source_id": int(source_id),
@@ -412,6 +415,7 @@ def main() -> None:
                 source_id=source_id,
                 source_path=path,
                 event_index=spec.event_index,
+                augmentation_id=ordinal,
                 window_start=window_start,
                 factor=factor,
                 is_identity=is_identity,
@@ -441,11 +445,13 @@ def main() -> None:
         "speed_factor",
         "is_identity",
         "duration_bin",
+        "event_uid",
+        "augmentation_id",
     )
     for key in stack_keys:
         arrays[key] = np.stack([record[key] for record in records]).astype(np.float32)
     for key in scalar_keys:
-        dtype = np.int32 if key in {"source_id", "duration_bin"} else np.float32
+        dtype = np.int64 if key == "event_uid" else (np.int32 if key in {"source_id", "duration_bin", "augmentation_id"} else np.float32)
         arrays[key] = np.asarray([record[key] for record in records], dtype=dtype)
 
     out = Path(args.out)
@@ -459,11 +465,12 @@ def main() -> None:
     identity = arrays["is_identity"] > 0.5
     selected_bin_counts = np.bincount(arrays["duration_bin"], minlength=num_bins)
     metadata = {
-        "version": "v23_v2_3_slow_aware_two_stage",
+        "version": "v23_v2_4_slow_aware_event_grouped",
         "num_samples": len(records),
         "num_sources": int(len(np.unique(arrays["source_id"]))),
         "failed_sources": int(failed_sources),
         "detected_events": int(len(specs)),
+        "unique_event_uids": int(len(np.unique(arrays["event_uid"]))),
         "window_len": int(args.window_len),
         "condition_dim": int(arrays["condition"].shape[1]),
         "duration_edges": duration_edges.tolist(),

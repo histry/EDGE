@@ -1,31 +1,3 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-cd /home/disk/lsm/storage/EDGE
-export PATH="/home/disk/lsm/conda_envs/edge/bin:$PATH"
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-
-STAMP=$(date +%Y%m%d_%H%M%S)
-export V23_RUN_ROOT="${V23_RUN_ROOT:-output/v23_v2_3_two_stage_${STAMP}}"
-export V23_DATASET="${V23_DATASET:-data/v23_v2_2_slowaware_w120_d88_6k.npz}"
-export V23_REBUILD_DATASET="${V23_REBUILD_DATASET:-0}"
-export V23_WINDOW_LEN="${V23_WINDOW_LEN:-120}"
-export V23_MIN_TARGET_DURATION="${V23_MIN_TARGET_DURATION:-12}"
-export V23_MAX_TARGET_DURATION="${V23_MAX_TARGET_DURATION:-88}"
-export V23_DURATION_BINS="${V23_DURATION_BINS:-auto:6}"
-export V23_MAX_SAMPLES="${V23_MAX_SAMPLES:-9000}"
-export V23_IDENTITY_FRACTION="${V23_IDENTITY_FRACTION:-0.25}"
-export V23_MIN_SPEED_FACTOR="${V23_MIN_SPEED_FACTOR:-1.15}"
-export V23_MAX_SPEED_FACTOR="${V23_MAX_SPEED_FACTOR:-3.0}"
-
-export V23_HIDDEN_DIM="${V23_HIDDEN_DIM:-128}"
-export V23_DROPOUT="${V23_DROPOUT:-0.18}"
-export V23_WEIGHT_DECAY="${V23_WEIGHT_DECAY:-5e-4}"
-export V23_BATCH_SIZE="${V23_BATCH_SIZE:-48}"
-export V23_STAGE1_EPOCHS="${V23_STAGE1_EPOCHS:-160}"
-export V23_STAGE1_PATIENCE="${V23_STAGE1_PATIENCE:-35}"
-export V23_STAGE2_EPOCHS="${V23_STAGE2_EPOCHS:-220}"
-export V23_STAGE2_PATIENCE="${V23_STAGE2_PATIENCE:-50}"
-export V23_SPLIT_SEED="${V23_SPLIT_SEED:-20260620}"
-
-bash scripts/run_v23_duration_overnight.sh
+exec bash /home/disk/lsm/storage/EDGE/scripts/launch_v23_v2_4_full.sh "$@"

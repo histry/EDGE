@@ -14,7 +14,7 @@ from model.v23_monotonic_duration import (
     root_yaw_velocity_dps,
     warp_motion_so3,
 )
-from train_v23_monotonic_duration import group_split
+from train_v23_monotonic_duration import group_split, duration_group_metrics
 
 
 def rotation_activity(x: torch.Tensor) -> torch.Tensor:
@@ -48,7 +48,7 @@ def main() -> None:
     with np.load(args.data, allow_pickle=True) as archive:
         required = (
             "corrupted", "target", "edit_mask", "condition", "target_tau",
-            "source_id", "target_duration_frames", "is_identity", "duration_bin",
+            "source_id", "target_duration_frames", "is_identity", "duration_bin", "event_uid",
         )
         for key in required:
             if key not in archive.files:
@@ -91,7 +91,7 @@ def main() -> None:
         target_bin = torch.from_numpy(arrays["duration_bin"][indices].astype(np.int64)).to(device)
 
         with torch.no_grad():
-            result = model(x, mask, condition, use_hard_duration=True)
+            result = model(x, mask, condition, use_hard_duration=False)
             predicted = warp_motion_so3(x, result["tau"])
             oracle = warp_motion_so3(x, target_tau)
             input_mse = ((x[..., 4:151] - y[..., 4:151]) ** 2).mean(dim=(1, 2))
@@ -131,6 +131,8 @@ def main() -> None:
             "target_bin": target_bin,
             "pred_bin": result["duration_bin_index"],
             "bin_confidence": result["duration_bin_confidence"],
+            "bin_probability": result["duration_bin_probabilities"],
+            "event_uid": torch.from_numpy(arrays["event_uid"][indices].astype(np.int64)).to(device),
             "edit_probability": result["edit_probability"],
             "edit_target": 1.0 - identity,
             "input_yaw_mae": input_yaw_mae,
@@ -202,6 +204,18 @@ def main() -> None:
         "monotonic_violation": 0.0,
         "endpoint_error": 0.0,
     }
+    grouped = duration_group_metrics(
+        values["pred_duration"],
+        values["target_duration"],
+        values["target_bin"].astype(int),
+        values["pred_bin"].astype(int),
+        values["edit_probability"],
+        values["edit_target"],
+        num_bins,
+        event_uid=values["event_uid"],
+        bin_probability=values["bin_probability"],
+    )
+    metrics.update(grouped)
     for bin_id in range(max(num_bins, 0)):
         rows = values["target_bin"] == bin_id
         metrics[f"duration_bin_{bin_id}_mae"] = float(duration_error[rows].mean()) if np.any(rows) else float("nan")
@@ -229,7 +243,7 @@ def main() -> None:
         np.save(output_dir / f"{label}_target_tau.npy", values["target_tau_array"][position])
 
     report = {
-        "version": "v23_v2_3_bin_residual_two_stage",
+        "version": "v23_v2_4_ordinal_event_consistent",
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "checkpoint_epoch": int(bundle["epoch"]),
         "training_stage": bundle["stage"],
@@ -244,10 +258,10 @@ def main() -> None:
         ).tolist(),
         "examples": examples,
     }
-    output_path = output_dir / "V23_V2_3_HELDOUT_EVALUATION.json"
+    output_path = output_dir / "V23_V2_4_HELDOUT_EVALUATION.json"
     output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print("\n" + "=" * 88)
-    print("V23-v2.3 HELD-OUT EVALUATION")
+    print("V23-v2.4 HELD-OUT EVALUATION")
     print("=" * 88)
     for key, value in metrics.items():
         print(f"{key:42s} = {value:.8f}")

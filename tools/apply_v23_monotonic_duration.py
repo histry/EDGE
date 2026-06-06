@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Safely apply V23-v2.3 to V21/EDGE 151D motions."""
+"""Safely apply V23-v2.4 to V21/EDGE 151D motions."""
 from __future__ import annotations
 
 import argparse
@@ -134,7 +134,7 @@ def apply_one(
         m = torch.from_numpy(mask[None]).to(device)
         c = torch.from_numpy(condition[None]).to(device)
         with torch.no_grad():
-            result = model(x, m, c, use_hard_duration=True)
+            result = model(x, m, c, use_hard_duration=False)
             candidate = warp_motion_so3(x, result["tau"])[0].cpu().numpy().astype(np.float32)
 
         predicted_duration = float(result["duration_frames"][0].item())
@@ -249,7 +249,7 @@ def main() -> None:
     parser.add_argument("--reversal_angle_deg", type=float, default=7.0)
     parser.add_argument("--secondary_peak_ratio", type=float, default=0.48)
     parser.add_argument("--split_score_threshold", type=float, default=0.68)
-    parser.add_argument("--long_split_score_threshold", type=float, default=0.42)
+    parser.add_argument("--long_split_score_threshold", type=float, default=0.30)
     parser.add_argument("--min_direction_consistency", type=float, default=0.18)
     parser.add_argument("--cumulative_low", type=float, default=0.03)
     parser.add_argument("--cumulative_high", type=float, default=0.97)
@@ -257,7 +257,7 @@ def main() -> None:
     parser.add_argument("--blend_edge", type=int, default=12)
     parser.add_argument("--event_blend_floor", type=float, default=0.90)
     parser.add_argument("--min_edit_probability", type=float, default=0.70)
-    parser.add_argument("--min_duration_bin_confidence", type=float, default=0.42)
+    parser.add_argument("--min_duration_bin_confidence", type=float, default=0.30)
     parser.add_argument("--min_expansion_ratio", type=float, default=1.06)
     parser.add_argument("--min_activity_ratio", type=float, default=0.75)
     parser.add_argument("--min_pose_range_ratio", type=float, default=0.93)
@@ -293,7 +293,7 @@ def main() -> None:
             f"activity={report['input_activity']:.5f}->{report['output_activity']:.5f}",
             flush=True,
         )
-    (output_dir / "V23_V2_3_RUNTIME_SUMMARY.json").write_text(
+    (output_dir / "V23_V2_4_RUNTIME_SUMMARY.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
 

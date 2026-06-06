@@ -33,8 +33,8 @@ def main() -> None:
     )
     model.eval()
     with torch.no_grad():
-        duration = model.predict_duration(motion, mask, condition, use_hard_duration=True)
-        result = model(motion, mask, condition, use_hard_duration=True)
+        duration = model.predict_duration(motion, mask, condition, use_hard_duration=False)
+        result = model(motion, mask, condition, use_hard_duration=False)
         warped = warp_motion_so3(motion, result["tau"])
     assert result["tau"].shape == (batch_size, args.window_len)
     assert torch.all(result["tau"][:, 1:] >= result["tau"][:, :-1])
@@ -44,10 +44,11 @@ def main() -> None:
     assert torch.isfinite(warped).all()
     print("tau:", tuple(result["tau"].shape))
     print("duration bins:", duration["duration_bin_index"].tolist())
+    print("ordinal thresholds:", model.ordinal_head.thresholds().detach().cpu().tolist())
     print("duration frames:", duration["duration_frames"].tolist())
     print("bin confidence:", duration["duration_bin_confidence"].tolist())
     print("edit probability:", duration["edit_probability"].tolist())
-    print("[PASS] V23-v2.3 bin-residual two-stage smoke test")
+    print("[PASS] V23-v2.4 ordinal event-consistent two-stage smoke test")
 
 
 if __name__ == "__main__":
