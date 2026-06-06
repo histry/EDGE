@@ -1,40 +1,53 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
+
 import torch
 
 from model.v23_monotonic_duration import V23MonotonicDurationNet, warp_motion_so3
 
 
+def parse_edges(text: str) -> list[float]:
+    return [float(value) for value in text.split(",") if value.strip()]
+
+
 def main() -> None:
-    batch_size, time_steps = 4, 72
-    motion = torch.randn(batch_size, time_steps, 151)
-    motion[..., :4] = (torch.rand(batch_size, time_steps, 4) > 0.5).float()
-    mask = torch.zeros(batch_size, time_steps)
-    mask[:, 22:43] = 1.0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--window_len", type=int, default=120)
+    parser.add_argument("--duration_edges", default="12,24,37,50,63,76,89")
+    args = parser.parse_args()
+
+    batch_size = 4
+    motion = torch.randn(batch_size, args.window_len, 151)
+    motion[..., :4] = (torch.rand(batch_size, args.window_len, 4) > 0.5).float()
+    mask = torch.zeros(batch_size, args.window_len)
+    mask[:, args.window_len // 4 : 3 * args.window_len // 4] = 1.0
     condition = torch.rand(batch_size, 17)
     model = V23MonotonicDurationNet(
         condition_dim=17,
-        hidden_dim=128,
-        duration_min_frames=10,
-        duration_max_frames=56,
-        window_len=time_steps,
+        hidden_dim=64,
+        dropout=0.1,
+        duration_edges=parse_edges(args.duration_edges),
+        window_len=args.window_len,
     )
-    result = model(motion, mask, condition)
-    tau = result["tau"]
-    assert tau.shape == (batch_size, time_steps)
-    assert torch.all(tau[:, 1:] >= tau[:, :-1])
-    assert torch.allclose(tau[:, 0], torch.zeros(batch_size), atol=1e-6)
-    assert torch.allclose(tau[:, -1], torch.ones(batch_size), atol=1e-6)
-    assert torch.all(result["duration_frames"] >= 10.0 - 1e-4)
-    assert torch.all(result["duration_frames"] <= 56.0 + 1e-4)
-    warped = warp_motion_so3(motion, tau)
+    model.eval()
+    with torch.no_grad():
+        duration = model.predict_duration(motion, mask, condition, use_hard_duration=True)
+        result = model(motion, mask, condition, use_hard_duration=True)
+        warped = warp_motion_so3(motion, result["tau"])
+    assert result["tau"].shape == (batch_size, args.window_len)
+    assert torch.all(result["tau"][:, 1:] >= result["tau"][:, :-1])
+    assert torch.allclose(result["tau"][:, 0], torch.zeros(batch_size), atol=1e-6)
+    assert torch.allclose(result["tau"][:, -1], torch.ones(batch_size), atol=1e-6)
     assert warped.shape == motion.shape
     assert torch.isfinite(warped).all()
-    print("tau:", tuple(tau.shape))
-    print("duration range:", float(result["duration_frames"].min().detach()), float(result["duration_frames"].max().detach()))
-    print("edit probability:", result["edit_probability"].detach().tolist())
-    print("[PASS] V23-v2 smoke test")
+    print("tau:", tuple(result["tau"].shape))
+    print("duration bins:", duration["duration_bin_index"].tolist())
+    print("duration frames:", duration["duration_frames"].tolist())
+    print("bin confidence:", duration["duration_bin_confidence"].tolist())
+    print("edit probability:", duration["edit_probability"].tolist())
+    print("[PASS] V23-v2.3 bin-residual two-stage smoke test")
 
 
 if __name__ == "__main__":

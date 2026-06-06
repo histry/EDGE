@@ -450,6 +450,7 @@ def main() -> None:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    arrays["duration_edges"] = duration_edges.astype(np.float32)
     np.savez_compressed(out, **arrays)
 
     target_duration = arrays["target_duration_frames"]
@@ -458,7 +459,7 @@ def main() -> None:
     identity = arrays["is_identity"] > 0.5
     selected_bin_counts = np.bincount(arrays["duration_bin"], minlength=num_bins)
     metadata = {
-        "version": "v23_v2_2_slow_aware_phase_split",
+        "version": "v23_v2_3_slow_aware_two_stage",
         "num_samples": len(records),
         "num_sources": int(len(np.unique(arrays["source_id"]))),
         "failed_sources": int(failed_sources),

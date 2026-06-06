@@ -6,8 +6,8 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 python tools/build_v23_monotonic_duration_dataset.py \
   --motion_glob "${V23_MOTION_GLOB:-data/dunhuang_151d_physical/**/*}" \
   --event_db "${V23_EVENT_DB:-}" \
-  --out "${V23_DATASET:-data/v23_v2_natural_duration_dataset.npz}" \
-  --window_len "${V23_WINDOW_LEN:-72}" \
+  --out "${V23_DATASET:-data/v23_v2_3_slowaware_w120_d88.npz}" \
+  --window_len "${V23_WINDOW_LEN:-120}" \
   --min_peak_dps "${V23_MIN_PEAK_DPS:-14}" \
   --min_turn_angle_deg "${V23_MIN_TURN_ANGLE:-10}" \
   --min_gap "${V23_MIN_GAP:-16}" \
@@ -40,5 +40,5 @@ python tools/build_v23_monotonic_duration_dataset.py \
   --duration_bins "${V23_DURATION_BINS:-auto:6}" \
   --balance_power "${V23_BALANCE_POWER:-0.35}" \
   --max_bin_fraction "${V23_MAX_BIN_FRACTION:-0.45}" \
-  --max_samples "${V23_MAX_SAMPLES:-12000}" \
-  --seed "${V23_DATA_SEED:-20260613}"
+  --max_samples "${V23_MAX_SAMPLES:-9000}" \
+  --seed "${V23_DATA_SEED:-20260624}"

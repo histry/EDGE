@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Apply V23-v2 natural-duration correction to EDGE 151D motion files.
-
-This tool is intentionally a post-scheduler module. It can be applied to V21
-outputs without changing the scheduler, and it includes conservative safety
-fallbacks so an unsuccessful local edit never replaces the original motion.
-"""
+"""Safely apply V23-v2.3 to V21/EDGE 151D motions."""
 from __future__ import annotations
 
 import argparse
@@ -81,13 +76,15 @@ def percentile_peak(motion: np.ndarray, percentile: float = 95.0) -> float:
 
 def apply_one(
     motion: np.ndarray,
-    model_bundle: Dict[str, Any],
+    bundle: Dict[str, Any],
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     output = np.asarray(motion, dtype=np.float32).copy()
-    model = model_bundle["model"]
-    window_len = int(model_bundle["config"].get("window_len", 72))
+    model = bundle["model"]
+    config = bundle["config"]
+    window_len = int(config.get("window_len", 120))
+    max_natural_duration = int(round(float(config.get("duration_edges", [12, 89])[-1]) - 1.0))
 
     detected = detect_natural_turn_events(
         output,
@@ -95,30 +92,40 @@ def apply_one(
         min_peak_dps=args.detect_peak_dps,
         min_turn_angle_deg=args.min_turn_angle_deg,
         min_gap=args.min_gap,
-        min_duration=3,
-        max_duration=min(args.detect_max_duration, window_len - 8),
+        min_duration=args.detect_min_duration,
+        max_duration=min(args.detect_max_duration or max_natural_duration, window_len - 8),
         threshold_ratio=args.detect_threshold_ratio,
-        cumulative_low=0.03,
-        cumulative_high=0.97,
+        cumulative_low=args.cumulative_low,
+        cumulative_high=args.cumulative_high,
         max_events=args.max_events,
+        activity_threshold_ratio=args.activity_threshold_ratio,
+        boundary_yaw_ratio=args.boundary_yaw_ratio,
+        quiet_run=args.quiet_run,
+        opposite_run=args.opposite_run,
+        phrase_margin=args.phrase_margin,
+        slow_pose_span=args.slow_pose_span,
+        slow_angle_window=args.slow_angle_window,
+        search_duration_multiplier=args.search_duration_multiplier,
+        split_valley_radius=args.split_valley_radius,
+        reversal_angle_deg=args.reversal_angle_deg,
+        secondary_peak_ratio=args.secondary_peak_ratio,
+        split_score_threshold=args.split_score_threshold,
+        long_split_score_threshold=args.long_split_score_threshold,
+        min_direction_consistency=args.min_direction_consistency,
     )
-    # Strongest first, then reject overlapping edit windows.
     detected = sorted(detected, key=lambda event: event.peak_speed_dps, reverse=True)
     occupied: List[Tuple[int, int]] = []
-    event_reports: List[Dict[str, Any]] = []
+    reports: List[Dict[str, Any]] = []
 
     for event in detected:
         if event.peak_speed_dps < args.apply_peak_dps:
             continue
         window, window_start, local_start, local_end = extract_window_with_event(
-            output,
-            event,
-            window_len,
-            center_jitter=0,
+            output, event, window_len, center_jitter=0
         )
         window_end = window_start + window_len - 1
         if any(max(window_start, lo) <= min(window_end, hi) for lo, hi in occupied):
-            event_reports.append({"event": event.to_dict(), "accepted": False, "reason": "overlapping_window"})
+            reports.append({"event": event.to_dict(), "accepted": False, "reasons": ["overlap"]})
             continue
 
         mask = make_soft_event_mask(window_len, local_start, local_end, context=args.mask_context)
@@ -127,10 +134,15 @@ def apply_one(
         m = torch.from_numpy(mask[None]).to(device)
         c = torch.from_numpy(condition[None]).to(device)
         with torch.no_grad():
-            result = model(x, m, c)
+            result = model(x, m, c, use_hard_duration=True)
             candidate = warp_motion_so3(x, result["tau"])[0].cpu().numpy().astype(np.float32)
+
         predicted_duration = float(result["duration_frames"][0].item())
         edit_probability = float(result["edit_probability"][0].item())
+        bin_confidence = float(result["duration_bin_confidence"][0].item())
+        predicted_bin = int(result["duration_bin_index"][0].item())
+        observed_duration = float(event.duration_frames)
+        expansion_ratio = predicted_duration / max(observed_duration, 1.0)
 
         original_peak = percentile_peak(window)
         candidate_peak = percentile_peak(candidate)
@@ -143,18 +155,18 @@ def apply_one(
         activity_ratio = candidate_activity / max(original_activity, 1e-8)
         range_ratio = candidate_range / max(original_range, 1e-8)
         jump_ratio = candidate_jump / max(original_jump, 1e-8)
-        observed_duration = float(event.duration_frames)
-        expansion_ratio = predicted_duration / max(observed_duration, 1.0)
 
         reasons: List[str] = []
         if edit_probability < args.min_edit_probability:
             reasons.append("low_edit_probability")
+        if bin_confidence < args.min_duration_bin_confidence:
+            reasons.append("low_duration_bin_confidence")
         if expansion_ratio < args.min_expansion_ratio:
-            reasons.append("insufficient_duration_expansion")
-        if range_ratio < args.min_pose_range_ratio:
-            reasons.append("pose_range_loss")
+            reasons.append("insufficient_expansion")
         if activity_ratio < args.min_activity_ratio:
             reasons.append("activity_loss")
+        if range_ratio < args.min_pose_range_ratio:
+            reasons.append("pose_range_loss")
         if jump_ratio > args.max_jump_ratio:
             reasons.append("jump_increase")
         peak_improved = candidate_peak <= original_peak * args.max_peak_ratio
@@ -162,40 +174,42 @@ def apply_one(
         if not (peak_improved or peak_safe):
             reasons.append("yaw_peak_not_improved")
 
-        accepted = len(reasons) == 0
+        accepted = not reasons
         if accepted:
-            alpha = cosine_window(window_len, edge=args.blend_edge)
-            # Give full weight around the detected event and taper only at window boundaries.
-            alpha = np.maximum(alpha, mask * args.event_blend_floor)
-            blended = blend_motion_so3_np(window, candidate, alpha)
-            output[window_start : window_start + window_len] = blended
+            alpha = np.maximum(
+                cosine_window(window_len, edge=args.blend_edge),
+                mask * args.event_blend_floor,
+            )
+            output[window_start : window_start + window_len] = blend_motion_so3_np(
+                window, candidate, alpha
+            )
             occupied.append((window_start, window_end))
 
-        event_reports.append(
-            {
-                "event": event.to_dict(),
-                "window_start": int(window_start),
-                "window_end": int(window_end),
-                "observed_duration": observed_duration,
-                "predicted_duration": predicted_duration,
-                "expansion_ratio": expansion_ratio,
-                "edit_probability": edit_probability,
-                "original_peak_yaw_dps": original_peak,
-                "candidate_peak_yaw_dps": candidate_peak,
-                "activity_ratio": activity_ratio,
-                "pose_range_ratio": range_ratio,
-                "jump_ratio": jump_ratio,
-                "accepted": accepted,
-                "reasons": reasons,
-            }
-        )
+        reports.append({
+            "event": event.to_dict(),
+            "window_start": int(window_start),
+            "window_end": int(window_end),
+            "observed_duration": observed_duration,
+            "predicted_duration": predicted_duration,
+            "predicted_duration_bin": predicted_bin,
+            "duration_bin_confidence": bin_confidence,
+            "expansion_ratio": expansion_ratio,
+            "edit_probability": edit_probability,
+            "original_peak_yaw_dps": original_peak,
+            "candidate_peak_yaw_dps": candidate_peak,
+            "activity_ratio": activity_ratio,
+            "pose_range_ratio": range_ratio,
+            "jump_ratio": jump_ratio,
+            "accepted": accepted,
+            "reasons": reasons,
+        })
 
     output = contact_debounce(output, min_run=args.contact_min_run)
-    report = {
+    return output.astype(np.float32), {
         "checkpoint": args.checkpoint,
         "detected_events": len(detected),
-        "accepted_events": sum(int(report["accepted"]) for report in event_reports),
-        "events": event_reports,
+        "accepted_events": sum(int(item["accepted"]) for item in reports),
+        "events": reports,
         "input_peak_yaw_dps": percentile_peak(motion),
         "output_peak_yaw_dps": percentile_peak(output),
         "input_activity": rotation_activity_np(motion),
@@ -203,34 +217,51 @@ def apply_one(
         "input_pose_range": rotation_range_np(motion),
         "output_pose_range": rotation_range_np(output),
     }
-    return output.astype(np.float32), report
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--motion", action="append", default=[], help="Repeat for .npy/.npz input")
+    parser.add_argument("--motion", action="append", default=[])
     parser.add_argument("--motion_glob", default="")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--suffix", default="_v23v2")
-    parser.add_argument("--detect_peak_dps", type=float, default=45.0)
-    parser.add_argument("--apply_peak_dps", type=float, default=120.0)
-    parser.add_argument("--allowed_peak_dps", type=float, default=140.0)
+    parser.add_argument("--suffix", default="_v23v23")
+    parser.add_argument("--detect_peak_dps", type=float, default=14.0)
+    parser.add_argument("--apply_peak_dps", type=float, default=90.0)
+    parser.add_argument("--allowed_peak_dps", type=float, default=130.0)
     parser.add_argument("--allowed_peak_slack", type=float, default=1.10)
-    parser.add_argument("--max_peak_ratio", type=float, default=0.92)
-    parser.add_argument("--min_turn_angle_deg", type=float, default=12.0)
-    parser.add_argument("--min_gap", type=int, default=18)
-    parser.add_argument("--detect_max_duration", type=int, default=56)
-    parser.add_argument("--detect_threshold_ratio", type=float, default=0.32)
+    parser.add_argument("--max_peak_ratio", type=float, default=0.94)
+    parser.add_argument("--min_turn_angle_deg", type=float, default=10.0)
+    parser.add_argument("--min_gap", type=int, default=16)
+    parser.add_argument("--detect_min_duration", type=int, default=12)
+    parser.add_argument("--detect_max_duration", type=int, default=0)
+    parser.add_argument("--detect_threshold_ratio", type=float, default=0.12)
     parser.add_argument("--max_events", type=int, default=4)
+    parser.add_argument("--activity_threshold_ratio", type=float, default=0.22)
+    parser.add_argument("--boundary_yaw_ratio", type=float, default=0.04)
+    parser.add_argument("--quiet_run", type=int, default=8)
+    parser.add_argument("--opposite_run", type=int, default=4)
+    parser.add_argument("--phrase_margin", type=int, default=3)
+    parser.add_argument("--slow_pose_span", type=int, default=10)
+    parser.add_argument("--slow_angle_window", type=int, default=24)
+    parser.add_argument("--search_duration_multiplier", type=float, default=1.80)
+    parser.add_argument("--split_valley_radius", type=int, default=3)
+    parser.add_argument("--reversal_angle_deg", type=float, default=7.0)
+    parser.add_argument("--secondary_peak_ratio", type=float, default=0.48)
+    parser.add_argument("--split_score_threshold", type=float, default=0.68)
+    parser.add_argument("--long_split_score_threshold", type=float, default=0.42)
+    parser.add_argument("--min_direction_consistency", type=float, default=0.18)
+    parser.add_argument("--cumulative_low", type=float, default=0.03)
+    parser.add_argument("--cumulative_high", type=float, default=0.97)
     parser.add_argument("--mask_context", type=int, default=6)
-    parser.add_argument("--blend_edge", type=int, default=8)
+    parser.add_argument("--blend_edge", type=int, default=12)
     parser.add_argument("--event_blend_floor", type=float, default=0.90)
-    parser.add_argument("--min_edit_probability", type=float, default=0.60)
-    parser.add_argument("--min_expansion_ratio", type=float, default=1.08)
-    parser.add_argument("--min_activity_ratio", type=float, default=0.62)
-    parser.add_argument("--min_pose_range_ratio", type=float, default=0.88)
-    parser.add_argument("--max_jump_ratio", type=float, default=1.20)
+    parser.add_argument("--min_edit_probability", type=float, default=0.70)
+    parser.add_argument("--min_duration_bin_confidence", type=float, default=0.42)
+    parser.add_argument("--min_expansion_ratio", type=float, default=1.06)
+    parser.add_argument("--min_activity_ratio", type=float, default=0.75)
+    parser.add_argument("--min_pose_range_ratio", type=float, default=0.93)
+    parser.add_argument("--max_jump_ratio", type=float, default=1.15)
     parser.add_argument("--contact_min_run", type=int, default=3)
     args = parser.parse_args()
 
@@ -240,7 +271,6 @@ def main() -> None:
     paths = sorted({path.resolve() for path in paths if path.is_file()})
     if not paths:
         raise RuntimeError("No input motion files")
-
     output_dir = Path(args.out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -263,8 +293,7 @@ def main() -> None:
             f"activity={report['input_activity']:.5f}->{report['output_activity']:.5f}",
             flush=True,
         )
-
-    (output_dir / "V23_V2_RUNTIME_SUMMARY.json").write_text(
+    (output_dir / "V23_V2_3_RUNTIME_SUMMARY.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
 
