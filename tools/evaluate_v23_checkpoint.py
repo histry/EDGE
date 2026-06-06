@@ -14,7 +14,7 @@ from model.v23_monotonic_duration import (
     root_yaw_velocity_dps,
     warp_motion_so3,
 )
-from train_v23_monotonic_duration import group_split, duration_group_metrics
+from train_v23_monotonic_duration import group_split, duration_group_metrics, load_duration_edges
 
 
 def rotation_activity(x: torch.Tensor) -> torch.Tensor:
@@ -129,7 +129,8 @@ def main() -> None:
             "target_duration": target_duration,
             "pred_duration": result["duration_frames"],
             "target_bin": target_bin,
-            "pred_bin": result["duration_bin_index"],
+            "pred_bin": result["duration_continuous_bin_index"],
+            "pred_ordinal_bin": result["duration_ordinal_bin_index"],
             "bin_confidence": result["duration_bin_confidence"],
             "bin_probability": result["duration_bin_probabilities"],
             "event_uid": torch.from_numpy(arrays["event_uid"][indices].astype(np.int64)).to(device),
@@ -160,7 +161,8 @@ def main() -> None:
     }
     predicted_motion = np.concatenate(all_predicted_motion)
     duration_error = np.abs(values["pred_duration"] - values["target_duration"])
-    num_bins = len(config.get("duration_edges", [])) - 1
+    duration_edges = load_duration_edges(args.data, arrays)
+    num_bins = len(duration_edges) - 1
     metrics = {
         "input_mse": float(values["input_mse"].mean()),
         "pred_mse": float(values["pred_mse"].mean()),
@@ -214,6 +216,8 @@ def main() -> None:
         num_bins,
         event_uid=values["event_uid"],
         bin_probability=values["bin_probability"],
+        duration_edges=duration_edges,
+        ordinal_predicted_bin=values["pred_ordinal_bin"].astype(int),
     )
     metrics.update(grouped)
     for bin_id in range(max(num_bins, 0)):
@@ -243,7 +247,7 @@ def main() -> None:
         np.save(output_dir / f"{label}_target_tau.npy", values["target_tau_array"][position])
 
     report = {
-        "version": "v23_v2_4_ordinal_event_consistent",
+        "version": "v23_v2_5_continuous_calibrated_gate",
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "checkpoint_epoch": int(bundle["epoch"]),
         "training_stage": bundle["stage"],
@@ -258,10 +262,10 @@ def main() -> None:
         ).tolist(),
         "examples": examples,
     }
-    output_path = output_dir / "V23_V2_4_HELDOUT_EVALUATION.json"
+    output_path = output_dir / "V23_V2_5_HELDOUT_EVALUATION.json"
     output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print("\n" + "=" * 88)
-    print("V23-v2.4 HELD-OUT EVALUATION")
+    print("V23-v2.5 HELD-OUT EVALUATION")
     print("=" * 88)
     for key, value in metrics.items():
         print(f"{key:42s} = {value:.8f}")

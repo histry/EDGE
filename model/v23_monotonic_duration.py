@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V23-v2.4 ordinal event-consistent duration and monotonic time-warp model.
+"""V23-v2.5 continuous-calibrated duration and monotonic time-warp model.
 
 Stage 1 predicts natural event duration from pace/dynamics rather than absolute
 pose identity.  It uses:
@@ -441,10 +441,18 @@ class V23MonotonicDurationNet(nn.Module):
             self.duration_max_frames - self.duration_min_frames
         )
         soft_duration = self.ordinal_blend * ordinal_duration + (1.0 - self.ordinal_blend) * direct_duration
-        hard_bin = torch.argmax(probabilities, dim=-1)
-        hard_candidate = candidates.gather(1, hard_bin[:, None]).squeeze(1)
+        ordinal_bin = torch.argmax(probabilities, dim=-1)
+        hard_candidate = candidates.gather(1, ordinal_bin[:, None]).squeeze(1)
         hard_duration = self.ordinal_blend * hard_candidate + (1.0 - self.ordinal_blend) * direct_duration
-        confidence = probabilities.gather(1, hard_bin[:, None]).squeeze(1)
+        ordinal_confidence = probabilities.gather(1, ordinal_bin[:, None]).squeeze(1)
+        # The final scientific prediction is the blended continuous duration.  All
+        # downstream gating must therefore bin this value rather than the ordinal
+        # argmax.  Keeping both indices avoids conflating an auxiliary ordinal head
+        # with the calibrated continuous estimator.
+        continuous_bin = torch.bucketize(
+            soft_duration, self.duration_edges[1:-1].to(soft_duration.dtype), right=True
+        ).clamp(0, self.num_duration_bins - 1)
+        continuous_confidence = probabilities.gather(1, continuous_bin[:, None]).squeeze(1)
         if use_hard_duration is None:
             use_hard_duration = False
         duration_frames = hard_duration if use_hard_duration else soft_duration
@@ -460,8 +468,12 @@ class V23MonotonicDurationNet(nn.Module):
             "duration_soft_frames": soft_duration,
             "duration_hard_frames": hard_duration,
             "duration_frames": duration_frames,
-            "duration_bin_index": hard_bin,
-            "duration_bin_confidence": confidence,
+            "duration_ordinal_bin_index": ordinal_bin,
+            "duration_continuous_bin_index": continuous_bin,
+            # Backward-compatible aliases now follow the final continuous prediction.
+            "duration_bin_index": continuous_bin,
+            "duration_ordinal_bin_confidence": ordinal_confidence,
+            "duration_bin_confidence": continuous_confidence,
             "duration_score": ordinal_score,
             "edit_logit": edit_logit,
             "edit_probability": torch.sigmoid(edit_logit),

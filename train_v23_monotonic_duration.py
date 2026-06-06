@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V23-v2.4 event-consistent ordinal duration and two-stage time-warp training.
+"""V23-v2.5 continuous-calibrated event duration and two-stage time-warp training.
 
 Stage 1 operates on natural-event groups instead of treating synthetic views as
 independent samples.  Every training item contains two views of the same event
@@ -328,7 +328,7 @@ def dataset_arrays(path: str) -> Dict[str, np.ndarray]:
         missing = sorted(required.difference(archive.files))
         if missing:
             raise RuntimeError(
-                f"Dataset missing V23-v2.4 fields: {missing}. Rebuild the database with the v2.4 builder."
+                f"Dataset missing V23-v2.5 fields: {missing}. Rebuild the database with the v2.4 builder."
             )
         return {key: np.asarray(archive[key]) for key in archive.files}
 
@@ -373,6 +373,95 @@ def teacher_forcing_ratio(epoch: int, start: float, end: float, decay_epochs: in
     return float(start + (end - start) * progress)
 
 
+def duration_bins_from_frames(values: np.ndarray, duration_edges: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    edges = np.asarray(duration_edges, dtype=np.float64)
+    if len(edges) < 3 or np.any(np.diff(edges) <= 0):
+        raise ValueError(f"Invalid duration edges: {edges.tolist()}")
+    return np.searchsorted(edges[1:-1], values, side="right").astype(np.int64)
+
+
+def _binary_metrics(scores: np.ndarray, target: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    scores = np.asarray(scores, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64) >= 0.5
+    predicted = scores >= float(threshold)
+    positive = target
+    negative = ~target
+    tp = float(np.sum(predicted & positive))
+    tn = float(np.sum((~predicted) & negative))
+    fp = float(np.sum(predicted & negative))
+    fn = float(np.sum((~predicted) & positive))
+    tpr = tp / max(tp + fn, 1.0)
+    tnr = tn / max(tn + fp, 1.0)
+    precision = tp / max(tp + fp, 1.0)
+    f1 = 2.0 * precision * tpr / max(precision + tpr, 1e-12)
+    return {
+        "accuracy": float(np.mean(predicted == target)),
+        "balanced_accuracy": 0.5 * (tpr + tnr),
+        "precision": precision,
+        "recall": tpr,
+        "specificity": tnr,
+        "f1": f1,
+    }
+
+
+def _binary_auroc(scores: np.ndarray, target: np.ndarray) -> float:
+    scores = np.asarray(scores, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64) >= 0.5
+    n_pos = int(target.sum())
+    n_neg = int((~target).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty(len(scores), dtype=np.float64)
+    i = 0
+    while i < len(scores):
+        j = i + 1
+        while j < len(scores) and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        # Average 1-based rank for ties.
+        rank = 0.5 * ((i + 1) + j)
+        ranks[order[i:j]] = rank
+        i = j
+    rank_sum = float(ranks[target].sum())
+    return (rank_sum - n_pos * (n_pos + 1) / 2.0) / float(n_pos * n_neg)
+
+
+def _optimal_edit_threshold(scores: np.ndarray, target: np.ndarray) -> tuple[float, Dict[str, float]]:
+    scores = np.asarray(scores, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    candidates = np.unique(np.concatenate([
+        np.asarray([0.5], dtype=np.float64),
+        np.quantile(scores, np.linspace(0.02, 0.98, 97)),
+    ]))
+    best_threshold = 0.5
+    best_metrics = _binary_metrics(scores, target, best_threshold)
+    best_key = (best_metrics["balanced_accuracy"], best_metrics["f1"])
+    for threshold in candidates:
+        metrics = _binary_metrics(scores, target, float(threshold))
+        key = (metrics["balanced_accuracy"], metrics["f1"])
+        if key > best_key:
+            best_threshold = float(threshold)
+            best_metrics = metrics
+            best_key = key
+    return best_threshold, best_metrics
+
+
+def _quantile_calibration(predicted: np.ndarray, target: np.ndarray, prefix: str) -> Dict[str, float]:
+    quantiles = (10, 25, 50, 75, 90)
+    pred_q = np.percentile(predicted, quantiles)
+    target_q = np.percentile(target, quantiles)
+    result: Dict[str, float] = {}
+    for q, p, t in zip(quantiles, pred_q, target_q):
+        result[f"{prefix}_p{q}_predicted"] = float(p)
+        result[f"{prefix}_p{q}_target"] = float(t)
+        result[f"{prefix}_p{q}_error"] = float(abs(p - t))
+        result[f"{prefix}_p{q}_underestimate"] = float(max(0.0, t - p))
+    result[f"{prefix}_quantile_calibration_mae"] = float(np.mean(np.abs(pred_q - target_q)))
+    return result
+
+
 def duration_group_metrics(
     predicted: np.ndarray,
     target: np.ndarray,
@@ -383,17 +472,49 @@ def duration_group_metrics(
     num_bins: int,
     event_uid: np.ndarray | None = None,
     bin_probability: np.ndarray | None = None,
+    duration_edges: np.ndarray | None = None,
+    ordinal_predicted_bin: np.ndarray | None = None,
 ) -> Dict[str, float]:
+    predicted = np.asarray(predicted, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    target_bin = np.asarray(target_bin, dtype=np.int64)
+    predicted_bin = np.asarray(predicted_bin, dtype=np.int64)
+    if duration_edges is None:
+        duration_edges = np.arange(num_bins + 1, dtype=np.float64)
+    duration_edges = np.asarray(duration_edges, dtype=np.float64)
+    continuous_bin = duration_bins_from_frames(predicted, duration_edges)
+    if ordinal_predicted_bin is None:
+        ordinal_predicted_bin = predicted_bin
+    ordinal_predicted_bin = np.asarray(ordinal_predicted_bin, dtype=np.int64)
+
     error = np.abs(predicted - target)
-    bin_distance = np.abs(predicted_bin - target_bin)
+    continuous_distance = np.abs(continuous_bin - target_bin)
+    ordinal_distance = np.abs(ordinal_predicted_bin - target_bin)
+    edit_fixed = _binary_metrics(edit_probability, edit_target, 0.5)
+    edit_threshold, edit_opt = _optimal_edit_threshold(edit_probability, edit_target)
     metrics: Dict[str, float] = {
         "duration_mae_frames": float(np.mean(error)),
         "duration_correlation": safe_corrcoef_np(predicted, target),
-        "duration_bin_accuracy": float(np.mean(predicted_bin == target_bin)),
-        "duration_within_one_bin_accuracy": float(np.mean(bin_distance <= 1)),
-        "duration_ordinal_mae_bins": float(np.mean(bin_distance)),
-        "edit_accuracy": float(np.mean((edit_probability >= 0.5) == (edit_target >= 0.5))),
+        "duration_continuous_bin_accuracy": float(np.mean(continuous_bin == target_bin)),
+        "duration_continuous_within_one_bin_accuracy": float(np.mean(continuous_distance <= 1)),
+        "duration_continuous_mae_bins": float(np.mean(continuous_distance)),
+        "duration_ordinal_bin_accuracy": float(np.mean(ordinal_predicted_bin == target_bin)),
+        "duration_ordinal_within_one_bin_accuracy": float(np.mean(ordinal_distance <= 1)),
+        "duration_ordinal_mae_bins": float(np.mean(ordinal_distance)),
+        # Backward-compatible aliases are deliberately aligned with the final
+        # continuous prediction rather than the auxiliary ordinal argmax.
+        "duration_bin_accuracy": float(np.mean(continuous_bin == target_bin)),
+        "duration_within_one_bin_accuracy": float(np.mean(continuous_distance <= 1)),
+        "edit_accuracy": edit_fixed["accuracy"],
+        "edit_balanced_accuracy": edit_fixed["balanced_accuracy"],
+        "edit_f1": edit_fixed["f1"],
+        "edit_auroc": _binary_auroc(edit_probability, edit_target),
+        "edit_optimal_threshold": float(edit_threshold),
+        "edit_optimal_accuracy": edit_opt["accuracy"],
+        "edit_optimal_balanced_accuracy": edit_opt["balanced_accuracy"],
+        "edit_optimal_f1": edit_opt["f1"],
     }
+    metrics.update(_quantile_calibration(predicted, target, "duration"))
     for bin_id in range(num_bins):
         rows = target_bin == bin_id
         metrics[f"duration_bin_{bin_id}_mae"] = float(np.mean(error[rows])) if np.any(rows) else float("nan")
@@ -406,33 +527,44 @@ def duration_group_metrics(
     if event_uid is not None:
         event_uid = np.asarray(event_uid, dtype=np.int64)
         unique = np.unique(event_uid)
-        event_pred, event_target, event_target_bin, event_pred_bin = [], [], [], []
+        event_pred, event_target, event_target_bin, event_ordinal_bin = [], [], [], []
         for uid in unique:
             rows = event_uid == uid
-            event_pred.append(float(np.mean(predicted[rows])))
-            event_target.append(float(np.mean(target[rows])))
-            event_target_bin.append(int(Counter(target_bin[rows].tolist()).most_common(1)[0][0]))
+            pred_value = float(np.mean(predicted[rows]))
+            target_value = float(np.mean(target[rows]))
+            event_pred.append(pred_value)
+            event_target.append(target_value)
+            event_target_bin.append(int(duration_bins_from_frames(np.asarray([target_value]), duration_edges)[0]))
             if bin_probability is not None:
-                event_pred_bin.append(int(np.argmax(np.mean(bin_probability[rows], axis=0))))
+                event_ordinal_bin.append(int(np.argmax(np.mean(bin_probability[rows], axis=0))))
             else:
-                event_pred_bin.append(int(Counter(predicted_bin[rows].tolist()).most_common(1)[0][0]))
+                event_ordinal_bin.append(int(Counter(ordinal_predicted_bin[rows].tolist()).most_common(1)[0][0]))
         event_pred = np.asarray(event_pred)
         event_target = np.asarray(event_target)
         event_target_bin = np.asarray(event_target_bin)
-        event_pred_bin = np.asarray(event_pred_bin)
+        event_continuous_bin = duration_bins_from_frames(event_pred, duration_edges)
+        event_ordinal_bin = np.asarray(event_ordinal_bin)
         event_error = np.abs(event_pred - event_target)
-        event_distance = np.abs(event_pred_bin - event_target_bin)
-        metrics.update(
-            {
-                "event_duration_mae_frames": float(np.mean(event_error)),
-                "event_duration_correlation": safe_corrcoef_np(event_pred, event_target),
-                "event_duration_bin_accuracy": float(np.mean(event_pred_bin == event_target_bin)),
-                "event_duration_within_one_bin_accuracy": float(np.mean(event_distance <= 1)),
-                "event_duration_ordinal_mae_bins": float(np.mean(event_distance)),
-            }
-        )
+        event_continuous_distance = np.abs(event_continuous_bin - event_target_bin)
+        event_ordinal_distance = np.abs(event_ordinal_bin - event_target_bin)
+        metrics.update({
+            "event_duration_mae_frames": float(np.mean(event_error)),
+            "event_duration_correlation": safe_corrcoef_np(event_pred, event_target),
+            "event_duration_continuous_bin_accuracy": float(np.mean(event_continuous_bin == event_target_bin)),
+            "event_duration_continuous_within_one_bin_accuracy": float(np.mean(event_continuous_distance <= 1)),
+            "event_duration_continuous_mae_bins": float(np.mean(event_continuous_distance)),
+            "event_duration_ordinal_bin_accuracy": float(np.mean(event_ordinal_bin == event_target_bin)),
+            "event_duration_ordinal_within_one_bin_accuracy": float(np.mean(event_ordinal_distance <= 1)),
+            "event_duration_ordinal_mae_bins": float(np.mean(event_ordinal_distance)),
+            # Backward-compatible aliases follow continuous duration.
+            "event_duration_bin_accuracy": float(np.mean(event_continuous_bin == event_target_bin)),
+            "event_duration_within_one_bin_accuracy": float(np.mean(event_continuous_distance <= 1)),
+        })
+        metrics.update(_quantile_calibration(event_pred, event_target, "event_duration"))
         event_long = event_target_bin >= max(0, num_bins - max(1, num_bins // 3))
         event_medium = (event_target_bin >= max(1, num_bins // 3)) & (~event_long)
+        event_short = ~(event_medium | event_long)
+        metrics["event_duration_short_mae"] = float(np.mean(event_error[event_short])) if np.any(event_short) else float("nan")
         metrics["event_duration_long_mae"] = float(np.mean(event_error[event_long])) if np.any(event_long) else float("nan")
         metrics["event_duration_medium_mae"] = float(np.mean(event_error[event_medium])) if np.any(event_medium) else float("nan")
     return metrics
@@ -796,7 +928,10 @@ def main() -> None:
         for key in ("predicted", "target_duration", "duration_bin", "event_uid", "edit_target"):
             merged[key] = torch.cat([a[key], b[key]], dim=0)
         merged["pred_bin"] = torch.cat(
-            [a["result"]["duration_bin_index"], b["result"]["duration_bin_index"]], dim=0
+            [a["result"]["duration_continuous_bin_index"], b["result"]["duration_continuous_bin_index"]], dim=0
+        )
+        merged["pred_ordinal_bin"] = torch.cat(
+            [a["result"]["duration_ordinal_bin_index"], b["result"]["duration_ordinal_bin_index"]], dim=0
         )
         merged["edit_probability"] = torch.cat(
             [a["result"]["edit_probability"], b["result"]["edit_probability"]], dim=0
@@ -822,6 +957,7 @@ def main() -> None:
             "pred_duration": merged["predicted"].detach(),
             "target_duration": merged["target_duration"].detach(),
             "pred_bin": merged["pred_bin"].detach(),
+            "pred_ordinal_bin": merged["pred_ordinal_bin"].detach(),
             "target_bin": merged["duration_bin"].detach(),
             "edit_probability": merged["edit_probability"].detach(),
             "edit_target": merged["edit_target"].detach(),
@@ -844,7 +980,8 @@ def main() -> None:
         return total, {"loss": total}, {
             "pred_duration": view["predicted"].detach(),
             "target_duration": view["target_duration"].detach(),
-            "pred_bin": result["duration_bin_index"].detach(),
+            "pred_bin": result["duration_continuous_bin_index"].detach(),
+            "pred_ordinal_bin": result["duration_ordinal_bin_index"].detach(),
             "target_bin": view["duration_bin"].detach(),
             "edit_probability": result["edit_probability"].detach(),
             "edit_target": view["edit_target"].detach(),
@@ -953,7 +1090,8 @@ def main() -> None:
         }, {
             "pred_duration": predicted_duration.detach(),
             "target_duration": target_duration.detach(),
-            "pred_bin": duration_result["duration_bin_index"].detach(),
+            "pred_bin": duration_result["duration_continuous_bin_index"].detach(),
+            "pred_ordinal_bin": duration_result["duration_ordinal_bin_index"].detach(),
             "target_bin": duration_bin.detach(),
             "edit_probability": duration_result["edit_probability"].detach(),
             "edit_target": edit_target.detach(),
@@ -996,6 +1134,8 @@ def main() -> None:
                 num_bins,
                 event_uid=merged["event_uid"],
                 bin_probability=merged["bin_probability"],
+                duration_edges=duration_edges,
+                ordinal_predicted_bin=merged["pred_ordinal_bin"].astype(int),
             )
         )
         return metrics
@@ -1069,6 +1209,8 @@ def main() -> None:
                 num_bins,
                 event_uid=merged["event_uid"],
                 bin_probability=merged["bin_probability"],
+                duration_edges=duration_edges,
+                ordinal_predicted_bin=merged["pred_ordinal_bin"].astype(int),
             )
         )
         if args.stage != "duration":
@@ -1111,16 +1253,31 @@ def main() -> None:
             event_long = float(metrics.get("event_duration_long_mae", metrics["duration_long_mae"]))
             event_medium = float(metrics.get("event_duration_medium_mae", metrics["duration_medium_mae"]))
             event_corr = float(metrics.get("event_duration_correlation", metrics["duration_correlation"]))
-            ordinal_mae = float(metrics.get("event_duration_ordinal_mae_bins", metrics["duration_ordinal_mae_bins"]))
-            within_one = float(metrics.get("event_duration_within_one_bin_accuracy", metrics["duration_within_one_bin_accuracy"]))
+            continuous_bins = float(metrics.get(
+                "event_duration_continuous_mae_bins", metrics["duration_continuous_mae_bins"]
+            ))
+            continuous_within = float(metrics.get(
+                "event_duration_continuous_within_one_bin_accuracy",
+                metrics["duration_continuous_within_one_bin_accuracy"],
+            ))
+            p90_error = float(metrics.get(
+                "event_duration_p90_error", metrics.get("duration_p90_error", 0.0)
+            ))
+            calibration = float(metrics.get(
+                "event_duration_quantile_calibration_mae",
+                metrics.get("duration_quantile_calibration_mae", 0.0),
+            ))
+            # Scientific checkpoint selection follows the final continuous duration.
+            # Ordinal argmax and edit classification remain diagnostics only.
             return (
                 event_mae / duration_range
                 + 0.55 * event_long / duration_range
                 + 0.30 * event_medium / duration_range
                 + 0.22 * (1.0 - event_corr)
-                + 0.10 * ordinal_mae / max(num_bins - 1, 1)
-                + 0.10 * (1.0 - within_one)
-                + 0.08 * (1.0 - float(metrics["edit_accuracy"]))
+                + 0.12 * continuous_bins / max(num_bins - 1, 1)
+                + 0.12 * (1.0 - continuous_within)
+                + 0.12 * p90_error / duration_range
+                + 0.08 * calibration / duration_range
             )
         return (
             float(metrics["tau_mae"])
@@ -1128,8 +1285,9 @@ def main() -> None:
             + 0.20 * float(metrics["yaw_mae_ratio"])
             + 0.15 * max(0.0, 0.82 - float(metrics["activity_ratio"]))
             + 0.20 * float(metrics["identity_tau_mae"])
-            + 0.08 * (1.0 - float(metrics["edit_accuracy"]))
+            + 0.05 * float(metrics.get("event_duration_mae_frames", metrics["duration_mae_frames"])) / duration_range
         )
+
 
     best_score = float("inf")
     best_val = float("inf")
@@ -1185,7 +1343,7 @@ def main() -> None:
                     f"event_mae={val_metrics.get('event_duration_mae_frames', float('nan')):.3f} "
                     f"long={val_metrics.get('event_duration_long_mae', float('nan')):.3f} "
                     f"corr={val_metrics.get('event_duration_correlation', float('nan')):.3f} "
-                    f"within1={val_metrics.get('event_duration_within_one_bin_accuracy', float('nan')):.3f} "
+                    f"cont_within1={val_metrics.get('event_duration_continuous_within_one_bin_accuracy', float('nan')):.3f} "
                     f"edit={val_metrics['edit_accuracy']:.3f} lr={current_lr:.2e} "
                     f"best={best_score:.6f}@{best_epoch}",
                     flush=True,

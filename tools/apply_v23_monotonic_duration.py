@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Safely apply V23-v2.4 to V21/EDGE 151D motions."""
+"""Safely apply V23-v2.5 to V21/EDGE 151D motions."""
 from __future__ import annotations
 
 import argparse
@@ -83,6 +83,12 @@ def apply_one(
     output = np.asarray(motion, dtype=np.float32).copy()
     model = bundle["model"]
     config = bundle["config"]
+    checkpoint_metrics = bundle.get("val_metrics", {})
+    auto_edit_threshold = float(checkpoint_metrics.get("edit_optimal_threshold", 0.5))
+    edit_threshold = (
+        auto_edit_threshold if float(args.min_edit_probability) < 0.0
+        else float(args.min_edit_probability)
+    )
     window_len = int(config.get("window_len", 120))
     max_natural_duration = int(round(float(config.get("duration_edges", [12, 89])[-1]) - 1.0))
 
@@ -157,10 +163,17 @@ def apply_one(
         jump_ratio = candidate_jump / max(original_jump, 1e-8)
 
         reasons: List[str] = []
-        if edit_probability < args.min_edit_probability:
-            reasons.append("low_edit_probability")
+        warnings: List[str] = []
+        if edit_probability < edit_threshold:
+            if args.edit_gate_mode == "strict":
+                reasons.append("low_edit_probability")
+            elif args.edit_gate_mode == "advisory":
+                warnings.append("low_edit_probability")
         if bin_confidence < args.min_duration_bin_confidence:
-            reasons.append("low_duration_bin_confidence")
+            if args.require_duration_bin_confidence:
+                reasons.append("low_ordinal_support")
+            else:
+                warnings.append("low_ordinal_support")
         if expansion_ratio < args.min_expansion_ratio:
             reasons.append("insufficient_expansion")
         if activity_ratio < args.min_activity_ratio:
@@ -195,6 +208,8 @@ def apply_one(
             "duration_bin_confidence": bin_confidence,
             "expansion_ratio": expansion_ratio,
             "edit_probability": edit_probability,
+            "edit_threshold": edit_threshold,
+            "edit_gate_mode": args.edit_gate_mode,
             "original_peak_yaw_dps": original_peak,
             "candidate_peak_yaw_dps": candidate_peak,
             "activity_ratio": activity_ratio,
@@ -202,11 +217,15 @@ def apply_one(
             "jump_ratio": jump_ratio,
             "accepted": accepted,
             "reasons": reasons,
+            "warnings": warnings,
         })
 
     output = contact_debounce(output, min_run=args.contact_min_run)
     return output.astype(np.float32), {
+        "version": "V23-v2.5-continuous-gate",
         "checkpoint": args.checkpoint,
+        "edit_threshold": edit_threshold,
+        "edit_gate_mode": args.edit_gate_mode,
         "detected_events": len(detected),
         "accepted_events": sum(int(item["accepted"]) for item in reports),
         "events": reports,
@@ -225,7 +244,7 @@ def main() -> None:
     parser.add_argument("--motion_glob", default="")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--suffix", default="_v23v23")
+    parser.add_argument("--suffix", default="_v23v25")
     parser.add_argument("--detect_peak_dps", type=float, default=14.0)
     parser.add_argument("--apply_peak_dps", type=float, default=90.0)
     parser.add_argument("--allowed_peak_dps", type=float, default=130.0)
@@ -256,8 +275,10 @@ def main() -> None:
     parser.add_argument("--mask_context", type=int, default=6)
     parser.add_argument("--blend_edge", type=int, default=12)
     parser.add_argument("--event_blend_floor", type=float, default=0.90)
-    parser.add_argument("--min_edit_probability", type=float, default=0.70)
-    parser.add_argument("--min_duration_bin_confidence", type=float, default=0.30)
+    parser.add_argument("--min_edit_probability", type=float, default=-1.0, help="<0 uses checkpoint-calibrated threshold")
+    parser.add_argument("--edit_gate_mode", choices=["off", "advisory", "strict"], default="advisory")
+    parser.add_argument("--min_duration_bin_confidence", type=float, default=0.0)
+    parser.add_argument("--require_duration_bin_confidence", action="store_true")
     parser.add_argument("--min_expansion_ratio", type=float, default=1.06)
     parser.add_argument("--min_activity_ratio", type=float, default=0.75)
     parser.add_argument("--min_pose_range_ratio", type=float, default=0.93)
@@ -293,7 +314,7 @@ def main() -> None:
             f"activity={report['input_activity']:.5f}->{report['output_activity']:.5f}",
             flush=True,
         )
-    (output_dir / "V23_V2_4_RUNTIME_SUMMARY.json").write_text(
+    (output_dir / "V23_V2_5_RUNTIME_SUMMARY.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
 

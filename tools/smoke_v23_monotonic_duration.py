@@ -43,12 +43,13 @@ def main() -> None:
     assert warped.shape == motion.shape
     assert torch.isfinite(warped).all()
     print("tau:", tuple(result["tau"].shape))
-    print("duration bins:", duration["duration_bin_index"].tolist())
+    print("continuous duration bins:", duration["duration_continuous_bin_index"].tolist())
+    print("ordinal argmax bins:", duration["duration_ordinal_bin_index"].tolist())
     print("ordinal thresholds:", model.ordinal_head.thresholds().detach().cpu().tolist())
     print("duration frames:", duration["duration_frames"].tolist())
     print("bin confidence:", duration["duration_bin_confidence"].tolist())
     print("edit probability:", duration["edit_probability"].tolist())
-    print("[PASS] V23-v2.4 ordinal event-consistent two-stage smoke test")
+    print("[PASS] V23-v2.5 continuous-calibrated gate smoke test")
 
 
 if __name__ == "__main__":
