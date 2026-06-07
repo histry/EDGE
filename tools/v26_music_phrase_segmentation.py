@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 """Whole-song music feature extraction and variable-length phrase segmentation.
 
-The implementation reuses the V21 12D music representation, but removes the
-fixed 150-frame / fixed phrase-count assumption.  Boundaries are estimated from
-multi-scale structural novelty and snapped to nearby beat/onset evidence.
-
-All returned indices use the target motion FPS, so a song of S seconds produces
-round(S * FPS) motion frames.
+V26 music-dominant revision:
+- keeps the original V21 12D music frame representation;
+- adds phrase-level rhythm control fields used by the scheduler:
+  speed_factor, transition_base_frames, transition_profile, and boundary accent;
+- keeps all frame indices in target motion FPS.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ import math
 import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -34,6 +33,20 @@ class MusicPhrase:
     query: List[float]
     planner_feature: List[float]
     boundary_confidence: float
+    speed_factor: float
+    transition_base_frames: int
+    transition_profile: str
+    boundary_accent_strength: float
+    energy: float
+    onset: float
+    beat_density: float
+    tempo_norm: float
+    arousal: float
+    tension: float
+    calmness: float
+    novelty: float
+    section_change: float
+    accent: float
 
     @property
     def length(self) -> int:
@@ -46,7 +59,6 @@ class MusicPhrase:
 
 
 def audio_duration_seconds(path: str | Path) -> float:
-    """Read audio duration without forcing a resample."""
     audio = Path(path)
     if not audio.is_file():
         raise FileNotFoundError(audio)
@@ -105,7 +117,6 @@ def whole_song_features(
     cache_dir: str | Path | None = None,
     max_seconds: float = 0.0,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Extract one 12D feature vector per target motion frame."""
     duration = audio_duration_seconds(audio_path)
     if max_seconds > 0:
         duration = min(duration, float(max_seconds))
@@ -140,7 +151,6 @@ def whole_song_features(
 
 
 def structural_novelty(features: np.ndarray, fps: float = 30.0) -> np.ndarray:
-    """Multi-scale phrase-boundary evidence in [0, 1]."""
     x = np.asarray(features, dtype=np.float32)
     if x.ndim != 2 or x.shape[1] < 12:
         raise ValueError(f"Expected [T,12+] features, got {x.shape}")
@@ -223,10 +233,90 @@ def _repair_phrase_lengths(
 
     if result[-1] != total:
         result[-1] = total
-    # Merge any residual short final segment into its predecessor.
     while len(result) >= 3 and result[-1] - result[-2] < min_frames:
         result.pop(-2)
     return result
+
+
+def phrase_rhythm_profile(
+    features: np.ndarray,
+    start: int,
+    end: int,
+    fps: float,
+) -> Dict[str, Any]:
+    """Build a music-dominant local tempo/transition profile for one phrase.
+
+    speed_factor > 1 means the phrase can move faster, so the natural-duration
+    target will become shorter downstream.
+    """
+    x = np.asarray(features[start:end], dtype=np.float32)
+    if len(x) == 0:
+        x = np.zeros((1, features.shape[1]), dtype=np.float32)
+    energy = float(np.mean(x[:, 0]))
+    onset = float(np.mean(x[:, 1]))
+    beat = float(np.mean(x[:, 2]))
+    tempo = float(np.mean(x[:, 3]))
+    arousal = float(np.mean(x[:, 4]))
+    tension = float(np.mean(x[:, 6]))
+    calm = float(np.mean(x[:, 7]))
+    novelty = float(np.mean(x[:, 8]))
+    section = float(np.max(x[:, 10]))
+    accent = float(np.mean(x[:, 11]))
+    boundary_accent = float(np.percentile(x[:, 11], 90))
+
+    fast_drive = np.clip(
+        0.25 * tempo
+        + 0.22 * beat
+        + 0.20 * onset
+        + 0.16 * energy
+        + 0.12 * tension
+        + 0.05 * accent,
+        0.0,
+        1.0,
+    )
+    slow_drive = np.clip(0.42 * calm + 0.22 * (1.0 - onset) + 0.18 * (1.0 - beat) + 0.18 * (1.0 - energy), 0.0, 1.0)
+    raw_speed = 1.0 + 0.55 * (fast_drive - 0.50) - 0.45 * (slow_drive - 0.50)
+    speed_factor = float(np.clip(raw_speed, 0.72, 1.38))
+
+    transition_slow = np.clip(
+        0.45 * calm + 0.20 * (1.0 - onset) + 0.20 * (1.0 - beat) + 0.15 * (1.0 - accent),
+        0.0,
+        1.0,
+    )
+    transition_fast = np.clip(
+        0.34 * onset + 0.25 * beat + 0.22 * accent + 0.19 * tension,
+        0.0,
+        1.0,
+    )
+    transition_frames = int(round(12.0 + 36.0 * transition_slow - 12.0 * transition_fast))
+    transition_frames = int(np.clip(transition_frames, 12, 48))
+    if section > 0.70 and calm > 0.55:
+        profile = "section_sustain"
+    elif transition_fast > 0.62 and accent > 0.50:
+        profile = "accent_cut"
+    elif calm > 0.62:
+        profile = "calm_sustain"
+    elif tension > 0.62:
+        profile = "tense_drive"
+    else:
+        profile = "balanced"
+
+    return {
+        "speed_factor": speed_factor,
+        "transition_base_frames": transition_frames,
+        "transition_profile": profile,
+        "boundary_accent_strength": boundary_accent,
+        "energy": energy,
+        "onset": onset,
+        "beat_density": beat,
+        "tempo_norm": tempo,
+        "arousal": arousal,
+        "tension": tension,
+        "calmness": calm,
+        "novelty": novelty,
+        "section_change": section,
+        "accent": accent,
+    }
 
 
 def phrase_planner_feature(
@@ -235,7 +325,6 @@ def phrase_planner_feature(
     end: int,
     query: np.ndarray,
 ) -> np.ndarray:
-    """32D phrase feature for the optional learned whole-song planner."""
     x = np.asarray(features[start:end], dtype=np.float32)
     if len(x) == 0:
         x = np.zeros((1, features.shape[1]), dtype=np.float32)
@@ -252,7 +341,6 @@ def phrase_planner_feature(
         ],
         dtype=np.float32,
     )
-    # 12 query + 8 selected means + 4 selected stds + 4 trends + 4 position = 32.
     return np.concatenate([query[:12], mean[[0, 1, 2, 4, 6, 7, 8, 10]], std[[0, 1, 6, 8]], trend, relative]).astype(np.float32)
 
 
@@ -293,10 +381,9 @@ def segment_music_phrases(
     phrases: List[MusicPhrase] = []
     for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
         query, event = calibrated_phrase_query(x[start:end], start, end)
-        confidence = 0.0
-        if 0 < start < len(score):
-            confidence = float(score[start])
+        confidence = float(score[start]) if 0 < start < len(score) else 0.0
         planner = phrase_planner_feature(x, start, end, query)
+        rhythm = phrase_rhythm_profile(x, start, end, fps)
         phrases.append(
             MusicPhrase(
                 index=index,
@@ -306,6 +393,7 @@ def segment_music_phrases(
                 query=np.asarray(query, dtype=np.float32).tolist(),
                 planner_feature=planner.tolist(),
                 boundary_confidence=confidence,
+                **rhythm,
             )
         )
     meta = {
@@ -317,6 +405,9 @@ def segment_music_phrases(
         "max_phrase_frames": max_frames,
         "novelty_threshold": threshold,
         "novelty_score": score.tolist(),
+        "music_speed_factors": [p.speed_factor for p in phrases],
+        "transition_base_frames": [p.transition_base_frames for p in phrases],
+        "transition_profiles": [p.transition_profile for p in phrases],
     }
     return phrases, meta
 
@@ -352,7 +443,7 @@ def main() -> None:
     out = Path(args.out_json)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": "v26_whole_song_phrase_segmentation",
+        "version": "v26_music_dominant_phrase_segmentation",
         "audio_meta": audio_meta,
         "segmentation": segmentation,
         "phrases": [phrase.to_dict() for phrase in phrases],

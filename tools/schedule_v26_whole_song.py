@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V26 whole-song duration-aware ChoreoRAG scheduler.
+"""V26 music-dominant whole-song ChoreoRAG scheduler.
 
-Pipeline:
-1. extract one music feature vector per output motion frame;
-2. predict variable phrase structure for the complete song;
-3. optionally predict phrase-level motion event, duration and transition sequence;
-4. retrieve style/quality/safety-gated Dunhuang motion events;
-5. solve one exact global duration budget for the whole song;
-6. resample each event independently (V23 Tau never crosses phrase boundaries);
-7. synthesize boundary-aware transitions;
-8. assert exact output length; no hidden pad/trim.
+Main change from the previous V26:
+- music controls phrase speed and transition intent;
+- natural duration is a feasibility/calibration constraint;
+- boundary dynamics defines a physical minimum transition length;
+- exact whole-song alignment is still enforced without hidden pad/trim.
 """
 from __future__ import annotations
 
@@ -18,10 +14,9 @@ import argparse
 import glob
 import json
 import math
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -33,9 +28,7 @@ from tools.schedule_v21_multi_music import (
     load_optional_transition,
     load_shared_index,
     precompute_music_similarity,
-    predict_transition_len,
     refine_transition,
-    rule_transition_len,
 )
 from tools.v21_common import (
     CONTACT,
@@ -67,6 +60,14 @@ class CandidateState:
     parts: List[Dict[str, Any]]
 
 
+def _bool_arg(value: str | int | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def planner_predictions(
     phrases: Sequence[MusicPhrase],
     planner_bundle,
@@ -87,15 +88,17 @@ def planner_predictions(
             [EVENT_TYPES.index(event_map.get(p.music_event, "neutral_flow")) for p in phrases],
             dtype=np.int64,
         )
-        durations = np.asarray([max(12, p.length - (0 if i == 0 else 10)) for i, p in enumerate(phrases)], dtype=np.float32)
-        transitions = np.asarray([0] + [3] * max(0, k - 1), dtype=np.int64)  # index 3 -> 12 frames
+        # Music-dominant fallback: phrase length is the first duration prior;
+        # natural duration will constrain this later in the global allocator.
+        durations = np.asarray([max(12, p.length - (0 if i == 0 else p.transition_base_frames)) for i, p in enumerate(phrases)], dtype=np.float32)
+        transitions = np.asarray([0] + [2] * max(0, k - 1), dtype=np.int64)
         activity = np.asarray([float(np.asarray(p.query)[0]) for p in phrases], dtype=np.float32)
         return {
             "event_ids": event_ids,
             "durations": durations,
             "transition_class": transitions,
             "activity": activity,
-            "mode": np.asarray(["rule"], dtype=object),
+            "mode": np.asarray(["music_rule"], dtype=object),
         }
 
     model = planner_bundle["model"]
@@ -109,6 +112,139 @@ def planner_predictions(
         "activity": output["activity"][0].cpu().numpy().astype(np.float32),
         "mode": np.asarray(["learned"], dtype=object),
     }
+
+
+def boundary_metrics(prev: np.ndarray, nxt: np.ndarray) -> Dict[str, float]:
+    pv = prev[-1, ROT] - prev[-2, ROT] if len(prev) > 1 else np.zeros((144,), dtype=np.float32)
+    nv = nxt[1, ROT] - nxt[0, ROT] if len(nxt) > 1 else np.zeros((144,), dtype=np.float32)
+    pa = prev[-1, ROT] - 2.0 * prev[-2, ROT] + prev[-3, ROT] if len(prev) > 2 else np.zeros((144,), dtype=np.float32)
+    na = nxt[2, ROT] - 2.0 * nxt[1, ROT] + nxt[0, ROT] if len(nxt) > 2 else np.zeros((144,), dtype=np.float32)
+    return {
+        "pose_jump": float(np.linalg.norm(prev[-1, ROT] - nxt[0, ROT]) / np.sqrt(144.0)),
+        "velocity_jump": float(np.linalg.norm(pv - nv) / np.sqrt(144.0)),
+        "acceleration_jump": float(np.linalg.norm(pa - na) / np.sqrt(144.0)),
+        "contact_jump": float(np.abs(prev[-1, CONTACT] - nxt[0, CONTACT]).mean()),
+    }
+
+
+def smootherstep01(value: float) -> float:
+    x = float(np.clip(value, 0.0, 1.0))
+    return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+
+def dampen_event_edges(motion: np.ndarray, edge_frames: int, strength: float) -> np.ndarray:
+    """Blend event edges toward low-velocity ease curves.
+
+    V23 preserves the event's internal monotonic timing, but whole-song stitching
+    can still expose high outgoing/incoming velocity at event boundaries.  This
+    local C2-style edge damping leaves the event center untouched and only
+    regularizes the first/last few frames before transitions are built.
+    """
+    x = np.asarray(motion, dtype=np.float32).copy()
+    n = min(max(0, int(edge_frames)), max(0, (len(x) - 3) // 2))
+    s = float(np.clip(strength, 0.0, 1.0))
+    if n <= 1 or s <= 0.0:
+        return x
+
+    left_start = x[0].copy()
+    left_end = x[n + 1].copy()
+    for i in range(1, n + 1):
+        u = i / float(n + 1)
+        eased = smootherstep01(u)
+        target = (1.0 - eased) * left_start + eased * left_end
+        weight = s * (1.0 - eased)
+        x[i, ROT] = (1.0 - weight) * x[i, ROT] + weight * target[ROT]
+        x[i, 5] = (1.0 - weight) * x[i, 5] + weight * target[5]
+
+    right_start_index = len(x) - n - 2
+    right_end_index = len(x) - 1
+    right_start = x[right_start_index].copy()
+    right_end = x[right_end_index].copy()
+    span = max(right_end_index - right_start_index, 1)
+    for idx in range(right_start_index + 1, right_end_index):
+        u = (idx - right_start_index) / float(span)
+        eased = smootherstep01(u)
+        target = (1.0 - eased) * right_start + eased * right_end
+        weight = s * eased
+        x[idx, ROT] = (1.0 - weight) * x[idx, ROT] + weight * target[ROT]
+        x[idx, 5] = (1.0 - weight) * x[idx, 5] + weight * target[5]
+
+    x[:, ROOT_X] = 0.0
+    x[:, ROOT_Z] = 0.0
+    return x.astype(np.float32)
+
+
+def music_transition_frames(phrase: MusicPhrase, args: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
+    base = int(phrase.transition_base_frames)
+    if phrase.transition_profile == "accent_cut":
+        base = min(base, 24)
+    elif phrase.transition_profile in {"calm_sustain", "section_sustain"}:
+        base = max(base, 24)
+    elif phrase.transition_profile == "tense_drive":
+        base = int(round(0.65 * base + 0.35 * 18))
+    base = int(np.clip(base, args.transition_min_frames, args.transition_max_frames))
+    return base, {
+        "music_transition_frames": base,
+        "transition_profile": phrase.transition_profile,
+        "boundary_accent_strength": float(phrase.boundary_accent_strength),
+        "speed_factor": float(phrase.speed_factor),
+        "energy": float(phrase.energy),
+        "onset": float(phrase.onset),
+        "beat_density": float(phrase.beat_density),
+        "tension": float(phrase.tension),
+        "calmness": float(phrase.calmness),
+    }
+
+
+def physical_min_transition_frames(metrics: Dict[str, float], args: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
+    pose = float(metrics.get("pose_jump", 0.0))
+    vel = float(metrics.get("velocity_jump", 0.0))
+    acc = float(metrics.get("acceleration_jump", 0.0))
+    contact = float(metrics.get("contact_jump", 0.0))
+    extra = (
+        args.physical_pose_frames * min(pose / max(args.pose_jump_reference, 1e-6), 2.0)
+        + args.physical_velocity_frames * min(vel / max(args.velocity_jump_reference, 1e-6), 2.0)
+        + args.physical_acceleration_frames * min(acc / max(args.acceleration_jump_reference, 1e-6), 2.0)
+        + args.physical_contact_frames * contact
+    )
+    frames = int(round(args.transition_min_frames + extra))
+    frames = int(np.clip(frames, args.transition_min_frames, args.transition_max_frames))
+    return frames, {
+        "physical_min_frames": frames,
+        "pose_jump": pose,
+        "velocity_jump": vel,
+        "acceleration_jump": acc,
+        "contact_jump": contact,
+    }
+
+
+def dynamic_transition_len(
+    prev_motion: np.ndarray,
+    next_motion: np.ndarray,
+    phrase: MusicPhrase,
+    args: argparse.Namespace,
+) -> Tuple[int, Dict[str, Any]]:
+    metrics = boundary_metrics(prev_motion, next_motion)
+    music_len, music_meta = music_transition_frames(phrase, args)
+    physical_len, physical_meta = physical_min_transition_frames(metrics, args)
+    chosen = max(music_len, physical_len)
+    if phrase.transition_profile == "accent_cut" and physical_len <= music_len:
+        chosen = min(chosen, 24)
+    chosen = int(np.clip(chosen, args.transition_min_frames, args.transition_max_frames))
+    meta = {
+        **music_meta,
+        **physical_meta,
+        "chosen_transition_frames": chosen,
+        "dominant_reason": "physical" if physical_len > music_len else "music",
+    }
+    return chosen, meta
+
+
+def planner_bundle_lengths(path: str) -> Tuple[int, ...]:
+    if not path:
+        return (12, 16, 20, 24, 30, 36, 42, 48)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    return tuple(int(x) for x in checkpoint.get("config", {}).get("transition_lengths", (12, 16, 20, 24, 30, 36, 42, 48)))
 
 
 def choose_events(
@@ -128,6 +264,17 @@ def choose_events(
     quality = np.asarray(arrays["quality_score"], dtype=np.float32)
     safety = np.asarray(arrays["safety_score"], dtype=np.float32)
     natural = np.asarray(arrays["natural_duration"], dtype=np.float32)
+    array_names = set(arrays.files) if hasattr(arrays, "files") else set(arrays.keys())
+    turn_peak_dps = (
+        np.asarray(arrays["turn_peak_dps"], dtype=np.float32)
+        if "turn_peak_dps" in array_names
+        else np.zeros_like(natural, dtype=np.float32)
+    )
+    turn_angle_deg = (
+        np.asarray(arrays["turn_angle_deg"], dtype=np.float32)
+        if "turn_angle_deg" in array_names
+        else np.zeros_like(natural, dtype=np.float32)
+    )
     entry_pose = np.asarray(arrays["entry_pose"], dtype=np.float32)
     exit_pose = np.asarray(arrays["exit_pose"], dtype=np.float32)
     entry_vel = np.asarray(arrays["entry_vel"], dtype=np.float32)
@@ -136,17 +283,9 @@ def choose_events(
     families = [str(item.get("family_id", "")) for item in items]
     queries = [np.asarray(p.query, dtype=np.float32) for p in phrases]
     similarities = precompute_music_similarity(router, queries, motion_desc, device)
+    transition_choices = planner_bundle_lengths(args.planner_ckpt)
 
     beam = [CandidateState(0.0, [], [], [])]
-    transition_choices = tuple(
-        int(x)
-        for x in (
-            planner_bundle_lengths(args.planner_ckpt)
-            if args.planner_ckpt
-            else (6, 8, 10, 12, 14, 16)
-        )
-    )
-
     for slot, phrase in enumerate(phrases):
         predicted_event = EVENT_TYPES[int(predictions["event_ids"][slot])]
         predicted_duration = float(predictions["durations"][slot])
@@ -159,11 +298,23 @@ def choose_events(
             ],
             dtype=np.float32,
         )
+        # Music speed now affects duration matching directly: faster music asks
+        # for shorter calibrated duration; slower music asks for longer duration.
+        music_duration_target = np.maximum(12.0, natural / max(float(phrase.speed_factor), 1e-6))
         duration_match = 1.0 - np.minimum(
+            np.abs(natural - music_duration_target) / np.maximum(music_duration_target, 1.0),
+            1.0,
+        )
+        planner_duration_match = 1.0 - np.minimum(
             np.abs(natural - predicted_duration) / max(predicted_duration, 1.0),
             1.0,
         )
         activity_match = 1.0 - np.minimum(np.abs(motion_desc[:, 0] - desired_activity), 1.0)
+        turn_soft = float(args.turn_peak_soft_dps)
+        turn_hard = max(float(args.turn_peak_hard_dps), turn_soft + 1.0)
+        turn_over = np.clip((turn_peak_dps - turn_soft) / (turn_hard - turn_soft), 0.0, 1.0)
+        turn_angle_over = np.clip((turn_angle_deg - args.turn_angle_soft_deg) / max(args.turn_angle_hard_deg - args.turn_angle_soft_deg, 1.0), 0.0, 1.0)
+        turn_penalty = 0.75 * turn_over + 0.25 * turn_angle_over
         base = (
             args.style_weight * style
             + args.quality_weight * quality
@@ -171,7 +322,9 @@ def choose_events(
             + args.music_weight * similarities[slot]
             + args.event_weight * compat
             + args.duration_weight * duration_match
+            + args.planner_duration_weight * planner_duration_match
             + args.activity_weight * activity_match
+            - args.turn_peak_penalty_weight * turn_penalty
         )
         shortlist = np.argsort(base)[::-1][: min(args.candidate_top_k, len(items))]
         expanded: List[CandidateState] = []
@@ -192,6 +345,9 @@ def choose_events(
 
                 transition_len = 0
                 transition_cost = 0.0
+                boundary_velocity_penalty = 0.0
+                boundary_acceleration_penalty = 0.0
+                transition_meta: Dict[str, Any] = {}
                 if state.selected:
                     previous = state.selected[-1]
                     transition_cost = transition_cost_from_arrays(
@@ -200,25 +356,27 @@ def choose_events(
                         entry_pose[idx],
                         entry_vel[idx],
                     )
-                    if transition_bundle is not None:
-                        transition_len = predict_transition_len(
-                            transition_bundle,
+                    candidate_boundary = boundary_metrics(motions[previous], motions[idx])
+                    boundary_velocity_penalty = min(
+                        candidate_boundary["velocity_jump"] / max(args.velocity_jump_reference, 1e-6),
+                        args.boundary_penalty_cap,
+                    )
+                    boundary_acceleration_penalty = min(
+                        candidate_boundary["acceleration_jump"] / max(args.acceleration_jump_reference, 1e-6),
+                        args.boundary_penalty_cap,
+                    )
+                    if args.music_dominant_timing:
+                        transition_len, transition_meta = dynamic_transition_len(
                             motions[previous],
                             motions[idx],
-                            queries[slot],
-                            phrases[slot - 1].music_event,
-                            event_types[idx],
-                            device,
+                            phrase,
+                            args,
                         )
+                        transition_meta = {**transition_meta, "candidate_boundary": candidate_boundary}
                     else:
                         class_index = int(predictions["transition_class"][slot])
                         transition_len = int(transition_choices[min(class_index, len(transition_choices) - 1)])
-                        if transition_len <= 0:
-                            transition_len = rule_transition_len(
-                                phrases[slot - 1].music_event,
-                                event_types[idx],
-                                queries[slot],
-                            )
+                        transition_meta = {"chosen_transition_frames": transition_len, "dominant_reason": "planner_class"}
                 mmr = 0.0
                 if state.selected:
                     mmr = max(float(mmr_embed[idx] @ mmr_embed[previous]) for previous in state.selected)
@@ -226,6 +384,8 @@ def choose_events(
                     state.score
                     + float(base[idx])
                     - args.transition_weight * transition_cost
+                    - args.boundary_velocity_penalty_weight * boundary_velocity_penalty
+                    - args.boundary_acceleration_penalty_weight * boundary_acceleration_penalty
                     - args.mmr_weight * mmr
                     - args.family_repeat_weight * same_family
                     - args.source_repeat_weight * same_source
@@ -236,6 +396,9 @@ def choose_events(
                     "music_end": phrase.end,
                     "music_length": phrase.length,
                     "music_event": phrase.music_event,
+                    "music_speed_factor": float(phrase.speed_factor),
+                    "music_transition_profile": phrase.transition_profile,
+                    "boundary_accent_strength": float(phrase.boundary_accent_strength),
                     "predicted_motion_event": predicted_event,
                     "predicted_duration": predicted_duration,
                     "event_index": idx,
@@ -244,14 +407,21 @@ def choose_events(
                     "motion_event": event_types[idx],
                     "natural_duration": float(natural[idx]),
                     "transition_len": int(transition_len),
+                    "transition_meta": transition_meta,
                     "style": float(style[idx]),
                     "quality": float(quality[idx]),
                     "safety": float(safety[idx]),
                     "music_similarity": float(similarities[slot, idx]),
                     "event_compatibility": float(compat[idx]),
                     "duration_match": float(duration_match[idx]),
+                    "planner_duration_match": float(planner_duration_match[idx]),
                     "activity_match": float(activity_match[idx]),
+                    "turn_peak_dps": float(turn_peak_dps[idx]),
+                    "turn_angle_deg": float(turn_angle_deg[idx]),
+                    "turn_penalty": float(turn_penalty[idx]),
                     "transition_cost": float(transition_cost),
+                    "boundary_velocity_penalty": float(boundary_velocity_penalty),
+                    "boundary_acceleration_penalty": float(boundary_acceleration_penalty),
                     "mmr_penalty": float(mmr),
                     "score": float(score),
                 }
@@ -270,26 +440,6 @@ def choose_events(
         expanded.sort(key=lambda state: state.score, reverse=True)
         beam = expanded[: args.beam_size]
     return beam[0]
-
-
-def planner_bundle_lengths(path: str) -> Tuple[int, ...]:
-    if not path:
-        return (6, 8, 10, 12, 14, 16)
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    return tuple(int(x) for x in checkpoint.get("config", {}).get("transition_lengths", (6, 8, 10, 12, 14, 16)))
-
-
-def boundary_metrics(prev: np.ndarray, nxt: np.ndarray) -> Dict[str, float]:
-    pv = prev[-1, ROT] - prev[-2, ROT] if len(prev) > 1 else np.zeros((144,), dtype=np.float32)
-    nv = nxt[1, ROT] - nxt[0, ROT] if len(nxt) > 1 else np.zeros((144,), dtype=np.float32)
-    pa = prev[-1, ROT] - 2.0 * prev[-2, ROT] + prev[-3, ROT] if len(prev) > 2 else np.zeros((144,), dtype=np.float32)
-    na = nxt[2, ROT] - 2.0 * nxt[1, ROT] + nxt[0, ROT] if len(nxt) > 2 else np.zeros((144,), dtype=np.float32)
-    return {
-        "pose_jump": float(np.linalg.norm(prev[-1, ROT] - nxt[0, ROT]) / np.sqrt(144.0)),
-        "velocity_jump": float(np.linalg.norm(pv - nv) / np.sqrt(144.0)),
-        "acceleration_jump": float(np.linalg.norm(pa - na) / np.sqrt(144.0)),
-        "contact_jump": float(np.abs(prev[-1, CONTACT] - nxt[0, CONTACT]).mean()),
-    }
 
 
 def generate_one(
@@ -343,6 +493,8 @@ def generate_one(
     music_events = [phrase.music_event for phrase in phrases]
     transition_lengths = selected_state.transition_lengths
     transition_lengths[0] = 0
+    music_speed_factors = [phrase.speed_factor for phrase in phrases]
+    music_content_targets = [max(args.min_content_frames, phrase.length - transition_lengths[i]) for i, phrase in enumerate(phrases)]
     allocation = allocate_whole_song_durations(
         phrase_lengths=phrase_lengths,
         natural_durations=natural_durations,
@@ -357,6 +509,9 @@ def generate_one(
         min_content_frames=args.min_content_frames,
         min_warp=args.min_time_warp,
         max_warp=args.max_time_warp,
+        music_speed_factors=music_speed_factors,
+        music_content_targets=music_content_targets,
+        allow_music_bound_override=args.allow_music_bound_override,
     )
 
     contents: List[np.ndarray] = []
@@ -372,6 +527,7 @@ def generate_one(
         )
         content[:, ROOT_X] = 0.0
         content[:, ROOT_Z] = 0.0
+        content = dampen_event_edges(content, args.edge_damping_frames, args.edge_damping_strength)
         contents.append(content)
         resampling_reports.append(report)
 
@@ -391,6 +547,7 @@ def generate_one(
             )
             metrics = boundary_metrics(contents[slot - 1], content)
             metrics["transition_len"] = k
+            metrics["transition_meta"] = selected_state.parts[slot].get("transition_meta", {})
             boundary_reports.append(metrics)
             pieces.append(transition)
         pieces.append(content)
@@ -413,7 +570,7 @@ def generate_one(
             )
 
     report = {
-        "version": "v26_whole_song_duration_aware_choreorag",
+        "version": "v26_music_dominant_whole_song_choreorag",
         "audio": str(audio_path),
         "audio_meta": audio_meta,
         "planner_mode": str(predictions["mode"][0]),
@@ -422,6 +579,19 @@ def generate_one(
         "score": selected_state.score,
         "schedule": [],
         "boundary_metrics": boundary_reports,
+        "timing_policy": {
+            "music_dominant_timing": bool(args.music_dominant_timing),
+            "transition_min_frames": int(args.transition_min_frames),
+            "transition_max_frames": int(args.transition_max_frames),
+            "global_music_weight": float(args.global_music_weight),
+            "global_natural_weight": float(args.global_natural_weight),
+            "global_planner_weight": float(args.global_planner_weight),
+            "turn_peak_penalty_weight": float(args.turn_peak_penalty_weight),
+            "boundary_velocity_penalty_weight": float(args.boundary_velocity_penalty_weight),
+            "boundary_acceleration_penalty_weight": float(args.boundary_acceleration_penalty_weight),
+            "edge_damping_frames": int(args.edge_damping_frames),
+            "edge_damping_strength": float(args.edge_damping_strength),
+        },
     }
     for slot, part in enumerate(selected_state.parts):
         merged = dict(part)
@@ -459,21 +629,43 @@ def main() -> None:
     parser.add_argument("--style_weight", type=float, default=1.35)
     parser.add_argument("--quality_weight", type=float, default=0.65)
     parser.add_argument("--safety_weight", type=float, default=0.35)
-    parser.add_argument("--music_weight", type=float, default=0.85)
+    parser.add_argument("--music_weight", type=float, default=0.90)
     parser.add_argument("--event_weight", type=float, default=0.70)
     parser.add_argument("--duration_weight", type=float, default=0.45)
+    parser.add_argument("--planner_duration_weight", type=float, default=0.15)
     parser.add_argument("--activity_weight", type=float, default=0.25)
     parser.add_argument("--transition_weight", type=float, default=0.60)
+    parser.add_argument("--boundary_velocity_penalty_weight", type=float, default=0.35)
+    parser.add_argument("--boundary_acceleration_penalty_weight", type=float, default=0.35)
+    parser.add_argument("--boundary_penalty_cap", type=float, default=4.0)
+    parser.add_argument("--turn_peak_soft_dps", type=float, default=360.0)
+    parser.add_argument("--turn_peak_hard_dps", type=float, default=720.0)
+    parser.add_argument("--turn_angle_soft_deg", type=float, default=220.0)
+    parser.add_argument("--turn_angle_hard_deg", type=float, default=420.0)
+    parser.add_argument("--turn_peak_penalty_weight", type=float, default=0.75)
+    parser.add_argument("--edge_damping_frames", type=int, default=10)
+    parser.add_argument("--edge_damping_strength", type=float, default=0.65)
     parser.add_argument("--mmr_weight", type=float, default=0.40)
     parser.add_argument("--family_repeat_weight", type=float, default=0.58)
     parser.add_argument("--source_repeat_weight", type=float, default=0.18)
     parser.add_argument("--hard_family_unique", action="store_true")
-    parser.add_argument("--global_music_weight", type=float, default=1.0)
-    parser.add_argument("--global_natural_weight", type=float, default=1.25)
+    parser.add_argument("--global_music_weight", type=float, default=1.60)
+    parser.add_argument("--global_natural_weight", type=float, default=0.85)
     parser.add_argument("--global_planner_weight", type=float, default=0.75)
     parser.add_argument("--min_content_frames", type=int, default=12)
-    parser.add_argument("--min_time_warp", type=float, default=0.65)
-    parser.add_argument("--max_time_warp", type=float, default=1.55)
+    parser.add_argument("--min_time_warp", type=float, default=0.70)
+    parser.add_argument("--max_time_warp", type=float, default=1.50)
+    parser.add_argument("--allow_music_bound_override", type=_bool_arg, default=True)
+    parser.add_argument("--music_dominant_timing", type=_bool_arg, default=True)
+    parser.add_argument("--transition_min_frames", type=int, default=12)
+    parser.add_argument("--transition_max_frames", type=int, default=48)
+    parser.add_argument("--pose_jump_reference", type=float, default=0.120)
+    parser.add_argument("--velocity_jump_reference", type=float, default=0.010)
+    parser.add_argument("--acceleration_jump_reference", type=float, default=0.018)
+    parser.add_argument("--physical_pose_frames", type=float, default=8.0)
+    parser.add_argument("--physical_velocity_frames", type=float, default=10.0)
+    parser.add_argument("--physical_acceleration_frames", type=float, default=8.0)
+    parser.add_argument("--physical_contact_frames", type=float, default=8.0)
     parser.add_argument("--v23_min_turn_angle", type=float, default=10.0)
     parser.add_argument("--v23_min_peak_dps", type=float, default=14.0)
     args = parser.parse_args()
@@ -506,7 +698,7 @@ def main() -> None:
     planner_bundle = load_v26_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
 
     summary = {
-        "version": "v26_whole_song_duration_aware_choreorag",
+        "version": "v26_music_dominant_whole_song_choreorag",
         "planner_ckpt": args.planner_ckpt,
         "router_ckpt": args.router_ckpt,
         "v23_ckpt": args.v23_ckpt,

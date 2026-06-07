@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Phrase-sequence planner for whole-song cultural dance choreography."""
+"""Phrase-sequence planner for whole-song cultural dance choreography.
+
+This replacement keeps the original planner architecture intact, but changes
+the default transition vocabulary from short fixed cuts to music/physics-ready
+durations. Old checkpoints remain loadable because their saved config still
+overrides this fallback.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,9 +14,11 @@ from typing import Any, Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from tools.v21_common import EVENT_TYPES
+
+
+MUSIC_DOMINANT_TRANSITION_LENGTHS: tuple[int, ...] = (12, 16, 20, 24, 30, 36, 42, 48)
 
 
 class V26WholeSongPlanner(nn.Module):
@@ -24,7 +32,7 @@ class V26WholeSongPlanner(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.15,
         num_event_types: int = len(EVENT_TYPES),
-        transition_lengths: tuple[int, ...] = (6, 8, 10, 12, 14, 16),
+        transition_lengths: tuple[int, ...] = MUSIC_DOMINANT_TRANSITION_LENGTHS,
     ) -> None:
         super().__init__()
         self.feature_dim = int(feature_dim)
@@ -81,7 +89,7 @@ def load_v26_planner_checkpoint(
         num_heads=int(config.get("num_heads", 4)),
         dropout=float(config.get("dropout", 0.15)),
         num_event_types=int(config.get("num_event_types", len(EVENT_TYPES))),
-        transition_lengths=tuple(config.get("transition_lengths", (6, 8, 10, 12, 14, 16))),
+        transition_lengths=tuple(config.get("transition_lengths", MUSIC_DOMINANT_TRANSITION_LENGTHS)),
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device)
