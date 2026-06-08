@@ -57,6 +57,8 @@ python tools/schedule_v26_whole_song.py \
   --max_time_warp "${V26_MAX_TIME_WARP:-1.50}" \
   --transition_min_frames "${V26_TRANSITION_MIN_FRAMES:-12}" \
   --transition_max_frames "${V26_TRANSITION_MAX_FRAMES:-48}" \
+  --transition_yaw_limit_dps "${V26_TRANSITION_YAW_LIMIT_DPS:-220}" \
+  --yaw_transition_safety_factor "${V26_YAW_TRANSITION_SAFETY_FACTOR:-1.90}" \
   --planner_duration_weight "${V26_PLANNER_DURATION_WEIGHT:-0.15}" \
   --boundary_velocity_penalty_weight "${V26_BOUNDARY_VELOCITY_PENALTY_WEIGHT:-0.35}" \
   --boundary_acceleration_penalty_weight "${V26_BOUNDARY_ACCELERATION_PENALTY_WEIGHT:-0.35}" \

@@ -20,6 +20,12 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+from pytorch3d.transforms import (
+    axis_angle_to_matrix,
+    matrix_to_axis_angle,
+    matrix_to_rotation_6d,
+    rotation_6d_to_matrix,
+)
 
 from model.v21_music_router import load_router_checkpoint
 from model.v23_monotonic_duration import load_v23_checkpoint
@@ -50,6 +56,7 @@ from tools.v26_music_phrase_segmentation import (
     segment_music_phrases,
     whole_song_features,
 )
+from tools.v22_turn_utils import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
 
 
 @dataclass
@@ -119,11 +126,14 @@ def boundary_metrics(prev: np.ndarray, nxt: np.ndarray) -> Dict[str, float]:
     nv = nxt[1, ROT] - nxt[0, ROT] if len(nxt) > 1 else np.zeros((144,), dtype=np.float32)
     pa = prev[-1, ROT] - 2.0 * prev[-2, ROT] + prev[-3, ROT] if len(prev) > 2 else np.zeros((144,), dtype=np.float32)
     na = nxt[2, ROT] - 2.0 * nxt[1, ROT] + nxt[0, ROT] if len(nxt) > 2 else np.zeros((144,), dtype=np.float32)
+    yaw = root_yaw_np(np.stack([prev[-1], nxt[0]], axis=0).astype(np.float32))
+    yaw_gap_deg = float(abs(yaw[1] - yaw[0]) * 180.0 / np.pi) if len(yaw) == 2 else 0.0
     return {
         "pose_jump": float(np.linalg.norm(prev[-1, ROT] - nxt[0, ROT]) / np.sqrt(144.0)),
         "velocity_jump": float(np.linalg.norm(pv - nv) / np.sqrt(144.0)),
         "acceleration_jump": float(np.linalg.norm(pa - na) / np.sqrt(144.0)),
         "contact_jump": float(np.abs(prev[-1, CONTACT] - nxt[0, CONTACT]).mean()),
+        "yaw_gap_deg": yaw_gap_deg,
     }
 
 
@@ -174,6 +184,48 @@ def dampen_event_edges(motion: np.ndarray, edge_frames: int, strength: float) ->
     return x.astype(np.float32)
 
 
+def root_geodesic6d(start_frame: np.ndarray, end_frame: np.ndarray, length: int) -> np.ndarray:
+    """Full SO(3) shortest-path interpolation for root rotation.
+
+    The previous yaw-only fix suppressed heading spikes but discarded root
+    pitch/roll, which created pose jumps.  This keeps the full root orientation
+    and interpolates along the geodesic between the two endpoint rotations.
+    """
+    k = max(0, int(length))
+    if k == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+    roots = np.stack(
+        [
+            np.asarray(start_frame, dtype=np.float32)[ROOT_ROT6D],
+            np.asarray(end_frame, dtype=np.float32)[ROOT_ROT6D],
+        ],
+        axis=0,
+    )
+    alphas = np.asarray([smootherstep01((i + 1) / float(k + 1)) for i in range(k)], dtype=np.float32)
+    with torch.no_grad():
+        matrices = rotation_6d_to_matrix(torch.from_numpy(roots).float())
+        r0 = matrices[0]
+        r1 = matrices[1]
+        relative = r0.transpose(0, 1) @ r1
+        axis_angle = matrix_to_axis_angle(relative[None])[0]
+        steps = axis_angle_to_matrix(torch.from_numpy(alphas).float()[:, None] * axis_angle[None])
+        interp = r0[None] @ steps
+        root6d = matrix_to_rotation_6d(interp).cpu().numpy()
+    return root6d.astype(np.float32)
+
+
+def enforce_yaw_safe_transition(transition: np.ndarray, prev: np.ndarray, nxt: np.ndarray) -> np.ndarray:
+    x = np.asarray(transition, dtype=np.float32).copy()
+    if len(x) == 0:
+        return x
+    # Preserve full root orientation while still avoiding the 6D linear
+    # interpolation long-path artifact that produced transition yaw spikes.
+    x[:, ROOT_ROT6D] = root_geodesic6d(prev[-1], nxt[0], len(x))
+    x[:, ROOT_X] = 0.0
+    x[:, ROOT_Z] = 0.0
+    return x.astype(np.float32)
+
+
 def music_transition_frames(phrase: MusicPhrase, args: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
     base = int(phrase.transition_base_frames)
     if phrase.transition_profile == "accent_cut":
@@ -201,13 +253,20 @@ def physical_min_transition_frames(metrics: Dict[str, float], args: argparse.Nam
     vel = float(metrics.get("velocity_jump", 0.0))
     acc = float(metrics.get("acceleration_jump", 0.0))
     contact = float(metrics.get("contact_jump", 0.0))
+    yaw_gap = float(metrics.get("yaw_gap_deg", 0.0))
     extra = (
         args.physical_pose_frames * min(pose / max(args.pose_jump_reference, 1e-6), 2.0)
         + args.physical_velocity_frames * min(vel / max(args.velocity_jump_reference, 1e-6), 2.0)
         + args.physical_acceleration_frames * min(acc / max(args.acceleration_jump_reference, 1e-6), 2.0)
         + args.physical_contact_frames * contact
     )
-    frames = int(round(args.transition_min_frames + extra))
+    yaw_frames = int(math.ceil(
+        args.yaw_transition_safety_factor
+        * yaw_gap
+        * float(args.fps)
+        / max(float(args.transition_yaw_limit_dps), 1.0)
+    ))
+    frames = int(round(max(args.transition_min_frames + extra, yaw_frames)))
     frames = int(np.clip(frames, args.transition_min_frames, args.transition_max_frames))
     return frames, {
         "physical_min_frames": frames,
@@ -215,6 +274,8 @@ def physical_min_transition_frames(metrics: Dict[str, float], args: argparse.Nam
         "velocity_jump": vel,
         "acceleration_jump": acc,
         "contact_jump": contact,
+        "yaw_gap_deg": yaw_gap,
+        "yaw_required_frames": yaw_frames,
     }
 
 
@@ -545,6 +606,7 @@ def generate_one(
                 np.asarray(phrases[slot].query, dtype=np.float32),
                 device,
             )
+            transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
             metrics = boundary_metrics(contents[slot - 1], content)
             metrics["transition_len"] = k
             metrics["transition_meta"] = selected_state.parts[slot].get("transition_meta", {})
@@ -659,6 +721,8 @@ def main() -> None:
     parser.add_argument("--music_dominant_timing", type=_bool_arg, default=True)
     parser.add_argument("--transition_min_frames", type=int, default=12)
     parser.add_argument("--transition_max_frames", type=int, default=48)
+    parser.add_argument("--transition_yaw_limit_dps", type=float, default=220.0)
+    parser.add_argument("--yaw_transition_safety_factor", type=float, default=1.90)
     parser.add_argument("--pose_jump_reference", type=float, default=0.120)
     parser.add_argument("--velocity_jump_reference", type=float, default=0.010)
     parser.add_argument("--acceleration_jump_reference", type=float, default=0.018)
