@@ -293,11 +293,22 @@ def dynamic_transition_len(
     if phrase.transition_profile == "accent_cut" and physical_len <= music_len:
         chosen = min(chosen, 24)
     chosen = int(np.clip(chosen, args.transition_min_frames, args.transition_max_frames))
+    slot_budget_cap = max(0, int(phrase.length) - int(args.min_content_frames))
+    slot_budget_capped_from = None
+    if getattr(args, "lock_music_boundaries", False) and chosen > slot_budget_cap:
+        slot_budget_capped_from = int(chosen)
+        chosen = int(slot_budget_cap)
     meta = {
         **music_meta,
         **physical_meta,
         "chosen_transition_frames": chosen,
-        "dominant_reason": "physical" if physical_len > music_len else "music",
+        "slot_budget_cap": int(slot_budget_cap),
+        "slot_budget_capped_from": slot_budget_capped_from,
+        "dominant_reason": (
+            "slot_budget"
+            if slot_budget_capped_from is not None
+            else ("physical" if physical_len > music_len else "music")
+        ),
     }
     return chosen, meta
 
@@ -598,6 +609,18 @@ def generate_one(
     music_events = [phrase.music_event for phrase in phrases]
     transition_lengths = selected_state.transition_lengths
     transition_lengths[0] = 0
+    if args.lock_music_boundaries:
+        for i, phrase in enumerate(phrases):
+            cap = 0 if i == 0 else max(0, int(phrase.length) - int(args.min_content_frames))
+            if int(transition_lengths[i]) > cap:
+                previous = int(transition_lengths[i])
+                transition_lengths[i] = int(cap)
+                selected_state.parts[i]["transition_len"] = int(cap)
+                meta = dict(selected_state.parts[i].get("transition_meta", {}))
+                meta["pre_allocation_slot_budget_cap"] = int(cap)
+                meta["pre_allocation_capped_from"] = previous
+                meta["dominant_reason"] = "slot_budget"
+                selected_state.parts[i]["transition_meta"] = meta
     music_speed_factors = [phrase.speed_factor for phrase in phrases]
     music_content_targets = [max(args.min_content_frames, phrase.length - transition_lengths[i]) for i, phrase in enumerate(phrases)]
     allocation = allocate_whole_song_durations(
