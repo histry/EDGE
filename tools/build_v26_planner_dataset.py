@@ -25,7 +25,11 @@ from model.v21_music_router import load_router_checkpoint
 from model.v26_whole_song_planner import MUSIC_DOMINANT_TRANSITION_LENGTHS
 from tools.schedule_v21_multi_music import load_shared_index, precompute_music_similarity
 from tools.v21_common import EVENT_TO_ID, EVENT_TYPES, event_compatibility
-from tools.v26_music_phrase_segmentation import segment_music_phrases, whole_song_features
+from tools.v26_music_phrase_segmentation import (
+    segment_music_phrases,
+    split_music_phrases_for_events,
+    whole_song_features,
+)
 
 
 def _nearest_transition_class(frames: float, transition_lengths: Sequence[int]) -> int:
@@ -115,6 +119,12 @@ def main() -> None:
     parser.add_argument("--max_phrase_seconds", type=float, default=7.5)
     parser.add_argument("--boundary_quantile", type=float, default=0.68)
     parser.add_argument("--beat_snap_seconds", type=float, default=0.35)
+    parser.add_argument("--multi_event_phrases", type=int, default=1)
+    parser.add_argument("--max_single_event_seconds", type=float, default=3.20)
+    parser.add_argument("--calm_max_single_event_seconds", type=float, default=2.80)
+    parser.add_argument("--min_subphrase_seconds", type=float, default=1.60)
+    parser.add_argument("--max_events_per_phrase", type=int, default=4)
+    parser.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
     parser.add_argument("--candidate_top_k", type=int, default=1200)
     parser.add_argument("--family_repeat_weight", type=float, default=0.55)
     parser.add_argument("--max_songs", type=int, default=0)
@@ -150,13 +160,24 @@ def main() -> None:
 
     for song_index, path in enumerate(paths):
         features, _ = whole_song_features(path, fps=args.fps, cache_dir=args.cache_dir or None)
-        phrases, segmentation = segment_music_phrases(
+        source_phrases, segmentation = segment_music_phrases(
             features,
             fps=args.fps,
             min_phrase_seconds=args.min_phrase_seconds,
             max_phrase_seconds=args.max_phrase_seconds,
             boundary_quantile=args.boundary_quantile,
             beat_snap_seconds=args.beat_snap_seconds,
+        )
+        phrases, slot_expansion = split_music_phrases_for_events(
+            features,
+            source_phrases,
+            fps=args.fps,
+            enabled=bool(args.multi_event_phrases),
+            max_slot_seconds=args.max_single_event_seconds,
+            min_slot_seconds=args.min_subphrase_seconds,
+            max_events_per_phrase=args.max_events_per_phrase,
+            beat_snap_seconds=args.slot_beat_snap_seconds,
+            calm_max_slot_seconds=args.calm_max_single_event_seconds,
         )
         selected = choose_sequence(
             phrases,
@@ -198,12 +219,13 @@ def main() -> None:
         transition_labels.append(np.asarray(transitions, dtype=np.int64))
         activity_targets.append(activities)
         song_keys.append(path.stem)
-        phrase_boundaries.append(np.asarray(segmentation["boundaries"], dtype=np.int32))
+        phrase_boundaries.append(np.asarray(slot_expansion.get("slot_boundaries", segmentation["boundaries"]), dtype=np.int32))
         speed_factors.append(np.asarray([float(getattr(p, "speed_factor", 1.0)) for p in phrases], dtype=np.float32))
         transition_frame_targets.append(np.asarray(transition_frames, dtype=np.int32))
         print(
             f"[V26 planner data] {song_index + 1}/{len(paths)} {path.name}: "
-            f"phrases={len(phrases)} transition_mean={np.mean(transition_frames[1:] or [0]):.1f}",
+            f"source_phrases={len(source_phrases)} slots={len(phrases)} "
+            f"transition_mean={np.mean(transition_frames[1:] or [0]):.1f}",
             flush=True,
         )
 

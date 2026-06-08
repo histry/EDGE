@@ -156,6 +156,7 @@ def allocate_whole_song_durations(
     music_speed_factors: Sequence[float] | None = None,
     music_content_targets: Sequence[float] | None = None,
     allow_music_bound_override: bool = True,
+    lock_music_boundaries: bool = False,
 ) -> Dict[str, Any]:
     phrase = np.asarray(phrase_lengths, dtype=np.float64)
     natural = np.asarray(natural_durations, dtype=np.float64)
@@ -171,23 +172,81 @@ def allocate_whole_song_durations(
     if int(transitions[0]) != 0:
         raise ValueError("The first transition length must be zero")
 
+    speed = np.clip(_as_array(music_speed_factors, n, 1.0), 0.45, 2.20)
+    phrase_content = np.maximum(phrase - transitions, float(min_content_frames))
+    if music_content_targets is not None:
+        phrase_content = np.maximum(_as_array(music_content_targets, n, min_content_frames), float(min_content_frames))
+    reference = np.maximum(natural, 1.0)
+    lower = np.maximum(float(min_content_frames), np.floor(reference * float(min_warp)))
+    upper = np.maximum(lower, np.ceil(reference * float(max_warp)))
+    importance = np.asarray(
+        [event_importance(e, m) for e, m in zip(event_types, music_events)],
+        dtype=np.float64,
+    )
+    elasticity = np.asarray([event_elasticity(e) for e in event_types], dtype=np.float64)
+
+    if lock_music_boundaries:
+        full_lengths = phrase.astype(np.int64)
+        if int(full_lengths.sum()) != int(total_frames):
+            raise RuntimeError(
+                f"Locked music boundaries require phrase length sum {int(full_lengths.sum())} "
+                f"to equal total_frames {int(total_frames)}"
+            )
+        allocation = full_lengths - transitions.astype(np.int64)
+        if np.any(allocation < int(min_content_frames)):
+            bad = np.where(allocation < int(min_content_frames))[0].tolist()
+            raise RuntimeError(
+                f"Locked music boundaries leave too little content for slots {bad}. "
+                "Reduce transition_min_frames, split less aggressively, or lower min_content_frames."
+            )
+        over = allocation.astype(np.float64) > upper
+        under = allocation.astype(np.float64) < lower
+        boundaries = [0]
+        for length in full_lengths:
+            boundaries.append(boundaries[-1] + int(length))
+        override_reason = "music_boundaries_locked"
+        if bool(np.any(over) or np.any(under)):
+            override_reason = "music_boundaries_locked_with_natural_warp_override"
+        return {
+            "version": "v26_music_dominant_duration_alignment",
+            "total_frames": int(total_frames),
+            "content_budget": int(allocation.sum()),
+            "content_lengths": allocation.astype(int).tolist(),
+            "transition_lengths": transitions.astype(int).tolist(),
+            "phrase_total_lengths": full_lengths.astype(int).tolist(),
+            "output_boundaries": boundaries,
+            "target_continuous": phrase_content.tolist(),
+            "music_duration_target": phrase_content.tolist(),
+            "music_content_targets": phrase_content.tolist(),
+            "music_speed_factors": speed.tolist(),
+            "natural_durations": natural.tolist(),
+            "planner_durations": planned.tolist(),
+            "music_phrase_lengths": phrase.astype(int).tolist(),
+            "warp_ratios": (allocation / np.maximum(natural, 1.0)).tolist(),
+            "strict_natural_min": (reference * float(min_warp)).tolist(),
+            "strict_natural_max": (reference * float(max_warp)).tolist(),
+            "actual_lower_bounds": lower.tolist(),
+            "actual_upper_bounds": upper.tolist(),
+            "bound_override": override_reason,
+            "lock_music_boundaries": True,
+            "num_warp_over_max": int(np.sum(over)),
+            "num_warp_under_min": int(np.sum(under)),
+            "importance": importance.tolist(),
+            "elasticity": elasticity.tolist(),
+            "weights": {
+                "music": float(music_weight),
+                "natural": float(natural_weight),
+                "planner": float(planner_weight),
+            },
+        }
+
     content_budget = int(total_frames - int(transitions.sum()))
     if content_budget < n * int(min_content_frames):
         raise RuntimeError(
             f"Transitions consume too much of the song: content_budget={content_budget}, phrases={n}"
         )
 
-    speed = np.clip(_as_array(music_speed_factors, n, 1.0), 0.45, 2.20)
-    phrase_content = np.maximum(phrase - transitions, float(min_content_frames))
-    if music_content_targets is not None:
-        phrase_content = np.maximum(_as_array(music_content_targets, n, min_content_frames), float(min_content_frames))
     music_duration_target = 0.72 * phrase_content + 0.28 * (np.maximum(natural, 1.0) / speed)
-
-    importance = np.asarray(
-        [event_importance(e, m) for e, m in zip(event_types, music_events)],
-        dtype=np.float64,
-    )
-    elasticity = np.asarray([event_elasticity(e) for e in event_types], dtype=np.float64)
 
     denominator = music_weight + natural_weight + planner_weight
     target = (
@@ -195,10 +254,6 @@ def allocate_whole_song_durations(
         + natural_weight * (np.maximum(natural, 1.0) / speed)
         + planner_weight * planned
     ) / max(denominator, 1e-8)
-
-    reference = np.maximum(natural, 1.0)
-    lower = np.maximum(float(min_content_frames), np.floor(reference * float(min_warp)))
-    upper = np.maximum(lower, np.ceil(reference * float(max_warp)))
 
     strict_lower_sum = float(lower.sum())
     strict_upper_sum = float(upper.sum())
@@ -270,6 +325,7 @@ def allocate_whole_song_durations(
         "actual_lower_bounds": lower.tolist(),
         "actual_upper_bounds": upper.tolist(),
         "bound_override": override_reason,
+        "lock_music_boundaries": False,
         "importance": importance.tolist(),
         "elasticity": elasticity.tolist(),
         "weights": {

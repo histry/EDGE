@@ -44,7 +44,14 @@ python tools/schedule_v26_whole_song.py \
   --max_phrase_seconds "${V26_MAX_PHRASE_SECONDS:-7.5}" \
   --boundary_quantile "${V26_BOUNDARY_QUANTILE:-0.68}" \
   --beat_snap_seconds "${V26_BEAT_SNAP_SECONDS:-0.35}" \
-  --max_phrases "${V26_MAX_PHRASES:-96}" \
+  --max_phrases "${V26_MAX_PHRASES:-160}" \
+  --multi_event_phrases "${V26_MULTI_EVENT_PHRASES:-1}" \
+  --lock_music_boundaries "${V26_LOCK_MUSIC_BOUNDARIES:-1}" \
+  --max_single_event_seconds "${V26_MAX_SINGLE_EVENT_SECONDS:-3.20}" \
+  --calm_max_single_event_seconds "${V26_CALM_MAX_SINGLE_EVENT_SECONDS:-2.80}" \
+  --min_subphrase_seconds "${V26_MIN_SUBPHRASE_SECONDS:-1.60}" \
+  --max_events_per_phrase "${V26_MAX_EVENTS_PER_PHRASE:-4}" \
+  --slot_beat_snap_seconds "${V26_SLOT_BEAT_SNAP_SECONDS:-0.25}" \
   --beam_size "${V26_BEAM_SIZE:-24}" \
   --candidate_top_k "${V26_CANDIDATE_TOP_K:-256}" \
   --music_dominant_timing "${V26_MUSIC_DOMINANT_TIMING:-1}" \
@@ -60,6 +67,10 @@ python tools/schedule_v26_whole_song.py \
   --transition_yaw_limit_dps "${V26_TRANSITION_YAW_LIMIT_DPS:-220}" \
   --yaw_transition_safety_factor "${V26_YAW_TRANSITION_SAFETY_FACTOR:-1.90}" \
   --planner_duration_weight "${V26_PLANNER_DURATION_WEIGHT:-0.15}" \
+  --activity_weight "${V26_ACTIVITY_WEIGHT:-0.25}" \
+  --anti_static_weight "${V26_ANTI_STATIC_WEIGHT:-0.45}" \
+  --anti_static_activity_threshold "${V26_ANTI_STATIC_ACTIVITY_THRESHOLD:-0.030}" \
+  --anti_static_min_content_frames "${V26_ANTI_STATIC_MIN_CONTENT_FRAMES:-60}" \
   --boundary_velocity_penalty_weight "${V26_BOUNDARY_VELOCITY_PENALTY_WEIGHT:-0.35}" \
   --boundary_acceleration_penalty_weight "${V26_BOUNDARY_ACCELERATION_PENALTY_WEIGHT:-0.35}" \
   --boundary_penalty_cap "${V26_BOUNDARY_PENALTY_CAP:-4.0}" \

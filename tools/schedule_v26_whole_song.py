@@ -54,6 +54,7 @@ from tools.v26_global_duration_alignment import allocate_whole_song_durations
 from tools.v26_music_phrase_segmentation import (
     MusicPhrase,
     segment_music_phrases,
+    split_music_phrases_for_events,
     whole_song_features,
 )
 from tools.v22_turn_utils import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
@@ -359,11 +360,17 @@ def choose_events(
             ],
             dtype=np.float32,
         )
-        # Music speed now affects duration matching directly: faster music asks
-        # for shorter calibrated duration; slower music asks for longer duration.
-        music_duration_target = np.maximum(12.0, natural / max(float(phrase.speed_factor), 1e-6))
+        transition_guess = 0 if slot == 0 else int(phrase.transition_base_frames)
+        slot_content_target = max(
+            float(args.min_content_frames),
+            float(phrase.length - min(transition_guess, max(0, phrase.length - args.min_content_frames))),
+        )
+        # A faster phrase can compress a longer natural action into the slot;
+        # a calmer phrase can stretch a shorter one, but the target remains
+        # anchored to this slot's music length rather than to natural duration.
+        target_natural = max(float(args.min_content_frames), slot_content_target * max(float(phrase.speed_factor), 1e-6))
         duration_match = 1.0 - np.minimum(
-            np.abs(natural - music_duration_target) / np.maximum(music_duration_target, 1.0),
+            np.abs(natural - target_natural) / max(target_natural, 1.0),
             1.0,
         )
         planner_duration_match = 1.0 - np.minimum(
@@ -371,6 +378,28 @@ def choose_events(
             1.0,
         )
         activity_match = 1.0 - np.minimum(np.abs(motion_desc[:, 0] - desired_activity), 1.0)
+        low_activity = np.clip(
+            (float(args.anti_static_activity_threshold) - motion_desc[:, 0])
+            / max(float(args.anti_static_activity_threshold), 1e-6),
+            0.0,
+            1.0,
+        )
+        long_slot_pressure = np.clip(
+            (slot_content_target - float(args.anti_static_min_content_frames))
+            / max(float(args.max_single_event_seconds * args.fps) - float(args.anti_static_min_content_frames), 1.0),
+            0.0,
+            1.0,
+        )
+        music_motion_need = np.clip(
+            0.42 * float(phrase.energy)
+            + 0.26 * float(phrase.beat_density)
+            + 0.20 * float(phrase.onset)
+            + 0.12 * float(phrase.tension)
+            - 0.22 * float(phrase.calmness),
+            0.0,
+            1.0,
+        )
+        anti_static_penalty = low_activity * max(float(long_slot_pressure), float(music_motion_need))
         turn_soft = float(args.turn_peak_soft_dps)
         turn_hard = max(float(args.turn_peak_hard_dps), turn_soft + 1.0)
         turn_over = np.clip((turn_peak_dps - turn_soft) / (turn_hard - turn_soft), 0.0, 1.0)
@@ -385,6 +414,7 @@ def choose_events(
             + args.duration_weight * duration_match
             + args.planner_duration_weight * planner_duration_match
             + args.activity_weight * activity_match
+            - args.anti_static_weight * anti_static_penalty
             - args.turn_peak_penalty_weight * turn_penalty
         )
         shortlist = np.argsort(base)[::-1][: min(args.candidate_top_k, len(items))]
@@ -467,6 +497,8 @@ def choose_events(
                     "family_id": family,
                     "motion_event": event_types[idx],
                     "natural_duration": float(natural[idx]),
+                    "slot_content_target": float(slot_content_target),
+                    "target_natural_duration": float(target_natural),
                     "transition_len": int(transition_len),
                     "transition_meta": transition_meta,
                     "style": float(style[idx]),
@@ -477,6 +509,7 @@ def choose_events(
                     "duration_match": float(duration_match[idx]),
                     "planner_duration_match": float(planner_duration_match[idx]),
                     "activity_match": float(activity_match[idx]),
+                    "anti_static_penalty": float(anti_static_penalty[idx]),
                     "turn_peak_dps": float(turn_peak_dps[idx]),
                     "turn_angle_deg": float(turn_angle_deg[idx]),
                     "turn_penalty": float(turn_penalty[idx]),
@@ -521,7 +554,7 @@ def generate_one(
         cache_dir=args.feature_dir,
         max_seconds=args.max_seconds,
     )
-    phrases, segmentation = segment_music_phrases(
+    source_phrases, segmentation = segment_music_phrases(
         features,
         fps=args.fps,
         min_phrase_seconds=args.min_phrase_seconds,
@@ -529,10 +562,21 @@ def generate_one(
         boundary_quantile=args.boundary_quantile,
         beat_snap_seconds=args.beat_snap_seconds,
     )
+    phrases, slot_expansion = split_music_phrases_for_events(
+        features,
+        source_phrases,
+        fps=args.fps,
+        enabled=args.multi_event_phrases,
+        max_slot_seconds=args.max_single_event_seconds,
+        min_slot_seconds=args.min_subphrase_seconds,
+        max_events_per_phrase=args.max_events_per_phrase,
+        beat_snap_seconds=args.slot_beat_snap_seconds,
+        calm_max_slot_seconds=args.calm_max_single_event_seconds,
+    )
     if len(phrases) > args.max_phrases:
         raise RuntimeError(
-            f"{audio_path}: detected {len(phrases)} phrases, above --max_phrases={args.max_phrases}. "
-            "Increase max phrase duration or max_phrases."
+            f"{audio_path}: detected {len(phrases)} event slots, above --max_phrases={args.max_phrases}. "
+            "Increase max_phrases or max_single_event_seconds."
         )
     predictions = planner_predictions(phrases, planner_bundle, device)
     selected_state = choose_events(
@@ -573,6 +617,7 @@ def generate_one(
         music_speed_factors=music_speed_factors,
         music_content_targets=music_content_targets,
         allow_music_bound_override=args.allow_music_bound_override,
+        lock_music_boundaries=args.lock_music_boundaries,
     )
 
     contents: List[np.ndarray] = []
@@ -636,7 +681,14 @@ def generate_one(
         "audio": str(audio_path),
         "audio_meta": audio_meta,
         "planner_mode": str(predictions["mode"][0]),
-        "segmentation": segmentation,
+        "segmentation": {
+            **segmentation,
+            "source_num_phrases": len(source_phrases),
+            "source_boundaries": [int(source_phrases[0].start)] + [int(p.end) for p in source_phrases] if source_phrases else [],
+            "event_slot_expansion": slot_expansion,
+            "effective_num_slots": len(phrases),
+            "effective_slot_boundaries": [int(phrases[0].start)] + [int(p.end) for p in phrases] if phrases else [],
+        },
         "allocation": allocation,
         "score": selected_state.score,
         "schedule": [],
@@ -653,10 +705,17 @@ def generate_one(
             "boundary_acceleration_penalty_weight": float(args.boundary_acceleration_penalty_weight),
             "edge_damping_frames": int(args.edge_damping_frames),
             "edge_damping_strength": float(args.edge_damping_strength),
+            "multi_event_phrases": bool(args.multi_event_phrases),
+            "lock_music_boundaries": bool(args.lock_music_boundaries),
+            "max_single_event_seconds": float(args.max_single_event_seconds),
+            "calm_max_single_event_seconds": float(args.calm_max_single_event_seconds),
+            "anti_static_weight": float(args.anti_static_weight),
         },
     }
     for slot, part in enumerate(selected_state.parts):
         merged = dict(part)
+        if slot < len(slot_expansion.get("slot_meta", [])):
+            merged["slot_meta"] = slot_expansion["slot_meta"][slot]
         merged["allocated_content_len"] = int(allocation["content_lengths"][slot])
         merged["allocated_phrase_total"] = int(allocation["phrase_total_lengths"][slot])
         merged["time_warp_ratio"] = float(allocation["warp_ratios"][slot])
@@ -685,7 +744,14 @@ def main() -> None:
     parser.add_argument("--max_phrase_seconds", type=float, default=7.5)
     parser.add_argument("--boundary_quantile", type=float, default=0.68)
     parser.add_argument("--beat_snap_seconds", type=float, default=0.35)
-    parser.add_argument("--max_phrases", type=int, default=96)
+    parser.add_argument("--max_phrases", type=int, default=160)
+    parser.add_argument("--multi_event_phrases", type=_bool_arg, default=True)
+    parser.add_argument("--lock_music_boundaries", type=_bool_arg, default=True)
+    parser.add_argument("--max_single_event_seconds", type=float, default=3.20)
+    parser.add_argument("--calm_max_single_event_seconds", type=float, default=2.80)
+    parser.add_argument("--min_subphrase_seconds", type=float, default=1.60)
+    parser.add_argument("--max_events_per_phrase", type=int, default=4)
+    parser.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
     parser.add_argument("--beam_size", type=int, default=24)
     parser.add_argument("--candidate_top_k", type=int, default=256)
     parser.add_argument("--style_weight", type=float, default=1.35)
@@ -696,6 +762,9 @@ def main() -> None:
     parser.add_argument("--duration_weight", type=float, default=0.45)
     parser.add_argument("--planner_duration_weight", type=float, default=0.15)
     parser.add_argument("--activity_weight", type=float, default=0.25)
+    parser.add_argument("--anti_static_weight", type=float, default=0.45)
+    parser.add_argument("--anti_static_activity_threshold", type=float, default=0.030)
+    parser.add_argument("--anti_static_min_content_frames", type=int, default=60)
     parser.add_argument("--transition_weight", type=float, default=0.60)
     parser.add_argument("--boundary_velocity_penalty_weight", type=float, default=0.35)
     parser.add_argument("--boundary_acceleration_penalty_weight", type=float, default=0.35)

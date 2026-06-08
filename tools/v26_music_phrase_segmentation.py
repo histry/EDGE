@@ -196,6 +196,22 @@ def _snap_to_rhythm(
     return int(lo + np.argmax(evidence))
 
 
+def boundary_evidence(features: np.ndarray) -> np.ndarray:
+    """Return frame-level evidence for phrase or sub-phrase boundaries."""
+    x = np.asarray(features, dtype=np.float32)
+    if x.ndim != 2 or x.shape[1] < 12:
+        raise ValueError(f"Expected [T,12+] features, got {x.shape}")
+    novelty = structural_novelty(x)
+    evidence = (
+        0.34 * robust_01(x[:, 2])
+        + 0.28 * robust_01(x[:, 1])
+        + 0.20 * robust_01(x[:, 10])
+        + 0.12 * robust_01(x[:, 11])
+        + 0.06 * novelty
+    )
+    return robust_01(evidence).astype(np.float32)
+
+
 def _repair_phrase_lengths(
     boundaries: List[int],
     score: np.ndarray,
@@ -236,6 +252,141 @@ def _repair_phrase_lengths(
     while len(result) >= 3 and result[-1] - result[-2] < min_frames:
         result.pop(-2)
     return result
+
+
+def _subslot_boundaries(
+    features: np.ndarray,
+    phrase: MusicPhrase,
+    slots: int,
+    min_frames: int,
+    snap_radius: int,
+) -> List[int]:
+    slots = max(1, int(slots))
+    start = int(phrase.start)
+    end = int(phrase.end)
+    if slots <= 1 or end - start < slots * min_frames:
+        return [start, end]
+    evidence = boundary_evidence(features)
+    boundaries = [start]
+    for i in range(1, slots):
+        ideal = int(round(start + i * (end - start) / float(slots)))
+        lo = max(boundaries[-1] + min_frames, ideal - snap_radius)
+        hi = min(end - (slots - i) * min_frames, ideal + snap_radius)
+        if hi <= lo:
+            split = ideal
+        else:
+            split = lo + int(np.argmax(evidence[lo : hi + 1]))
+        split = _snap_to_rhythm(split, features, snap_radius, lo, hi)
+        split = int(np.clip(split, boundaries[-1] + min_frames, end - (slots - i) * min_frames))
+        boundaries.append(split)
+    boundaries.append(end)
+    return boundaries
+
+
+def split_music_phrases_for_events(
+    features: np.ndarray,
+    phrases: List[MusicPhrase],
+    fps: float = 30.0,
+    enabled: bool = True,
+    max_slot_seconds: float = 3.20,
+    min_slot_seconds: float = 1.60,
+    max_events_per_phrase: int = 4,
+    beat_snap_seconds: float = 0.25,
+    calm_max_slot_seconds: float = 2.80,
+) -> Tuple[List[MusicPhrase], Dict[str, Any]]:
+    """Split long music phrases into multiple event slots.
+
+    The original phrase boundaries are kept exactly.  Only internal sub-slot
+    boundaries are inserted, so downstream scheduling can lock output
+    boundaries to music while avoiding excessive time-warp on a single action.
+    """
+    x = np.asarray(features, dtype=np.float32)
+    if not enabled:
+        return list(phrases), {
+            "enabled": False,
+            "num_source_phrases": len(phrases),
+            "num_slots": len(phrases),
+            "slot_meta": [
+                {
+                    "slot_index": i,
+                    "source_phrase_index": int(p.index),
+                    "source_phrase_start": int(p.start),
+                    "source_phrase_end": int(p.end),
+                    "subslot_index": 0,
+                    "subslot_count": 1,
+                    "split_reason": "disabled",
+                }
+                for i, p in enumerate(phrases)
+            ],
+        }
+
+    max_frames = max(12, int(round(float(max_slot_seconds) * float(fps))))
+    calm_max_frames = max(12, int(round(float(calm_max_slot_seconds) * float(fps))))
+    min_frames = max(12, int(round(float(min_slot_seconds) * float(fps))))
+    snap_radius = max(1, int(round(float(beat_snap_seconds) * float(fps))))
+    max_events = max(1, int(max_events_per_phrase))
+
+    slots_out: List[MusicPhrase] = []
+    slot_meta: List[Dict[str, Any]] = []
+    for phrase in phrases:
+        local_max = calm_max_frames if phrase.music_event in {"calm_flow", "release"} else max_frames
+        local_max = max(local_max, min_frames)
+        count = int(math.ceil(phrase.length / float(local_max))) if phrase.length > local_max else 1
+        count = min(max(count, 1), max_events)
+        if phrase.length < count * min_frames:
+            count = max(1, phrase.length // max(min_frames, 1))
+        count = max(1, int(count))
+        reason = "long_phrase" if count > 1 else "single"
+        if count > 1 and phrase.music_event in {"calm_flow", "release"}:
+            reason = "anti_static_calm_phrase"
+        boundaries = _subslot_boundaries(x, phrase, count, min_frames=min_frames, snap_radius=snap_radius)
+        actual_count = len(boundaries) - 1
+        for sub_index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+            query, event = calibrated_phrase_query(x[start:end], int(start), int(end))
+            planner = phrase_planner_feature(x, int(start), int(end), np.asarray(query, dtype=np.float32))
+            rhythm = phrase_rhythm_profile(x, int(start), int(end), fps)
+            slot_index = len(slots_out)
+            slots_out.append(
+                MusicPhrase(
+                    index=slot_index,
+                    start=int(start),
+                    end=int(end),
+                    music_event=str(event),
+                    query=np.asarray(query, dtype=np.float32).tolist(),
+                    planner_feature=planner.tolist(),
+                    boundary_confidence=float(phrase.boundary_confidence),
+                    **rhythm,
+                )
+            )
+            slot_meta.append(
+                {
+                    "slot_index": slot_index,
+                    "source_phrase_index": int(phrase.index),
+                    "source_phrase_start": int(phrase.start),
+                    "source_phrase_end": int(phrase.end),
+                    "subslot_index": int(sub_index),
+                    "subslot_count": int(actual_count),
+                    "split_reason": reason,
+                    "source_music_event": str(phrase.music_event),
+                    "slot_start": int(start),
+                    "slot_end": int(end),
+                    "slot_length": int(end - start),
+                }
+            )
+
+    return slots_out, {
+        "enabled": True,
+        "num_source_phrases": len(phrases),
+        "num_slots": len(slots_out),
+        "max_slot_seconds": float(max_slot_seconds),
+        "min_slot_seconds": float(min_slot_seconds),
+        "max_events_per_phrase": int(max_events),
+        "beat_snap_seconds": float(beat_snap_seconds),
+        "calm_max_slot_seconds": float(calm_max_slot_seconds),
+        "slot_meta": slot_meta,
+        "source_boundaries": [int(phrases[0].start)] + [int(p.end) for p in phrases] if phrases else [],
+        "slot_boundaries": [int(slots_out[0].start)] + [int(p.end) for p in slots_out] if slots_out else [],
+    }
 
 
 def phrase_rhythm_profile(
