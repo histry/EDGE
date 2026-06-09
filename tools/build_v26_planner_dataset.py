@@ -135,6 +135,7 @@ def main() -> None:
     parser.add_argument("--duration_index_npz", required=True)
     parser.add_argument("--router_ckpt", required=True)
     parser.add_argument("--hierarchy_index_npz", default="")
+    parser.add_argument("--hyperbolic_ckpt", default="")
     parser.add_argument("--out_npz", required=True)
     parser.add_argument("--cache_dir", default="")
     parser.add_argument("--fps", type=float, default=30.0)
@@ -167,7 +168,7 @@ def main() -> None:
     missing = required.difference(arrays.files)
     if missing:
         raise RuntimeError(f"Duration index is missing arrays: {sorted(missing)}")
-    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz)
+    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz, hyperbolic_ckpt=args.hyperbolic_ckpt)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     router = load_router_checkpoint(args.router_ckpt, device=device)

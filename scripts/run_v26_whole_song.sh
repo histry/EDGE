@@ -36,8 +36,11 @@ python tools/schedule_v26_whole_song.py \
   --v23_ckpt "$V26_V23_CKPT" \
   --planner_ckpt "${V26_PLANNER_CKPT:-}" \
   --transition_ckpt "${V26_TRANSITION_CKPT:-}" \
+  --transition_diffusion_ckpt "${V27_TRANSITION_DIFFUSION_CKPT:-}" \
   --hierarchy_index_npz "${V26_HIERARCHY_INDEX_NPZ:-}" \
+  --hyperbolic_ckpt "${V27_HYPERBOLIC_CKPT:-}" \
   --feature_dir "${V26_FEATURE_CACHE:-data/v26_music_features}" \
+  --deep_music_cache "${V27_DEEP_MUSIC_CACHE:-data/v27_deep_music_features}" \
   --start_pose "${V26_START_POSE:-}" \
   --fps "${V26_FPS:-30}" \
   --max_seconds "${V26_MAX_SECONDS:-0}" \
@@ -65,12 +68,18 @@ python tools/schedule_v26_whole_song.py \
   --max_time_warp "${V26_MAX_TIME_WARP:-1.50}" \
   --transition_min_frames "${V26_TRANSITION_MIN_FRAMES:-12}" \
   --transition_max_frames "${V26_TRANSITION_MAX_FRAMES:-48}" \
+  --transition_diffusion "${V27_TRANSITION_DIFFUSION:-0}" \
+  --transition_diffusion_blend "${V27_TRANSITION_DIFFUSION_BLEND:-0.45}" \
+  --transition_diffusion_steps "${V27_TRANSITION_DIFFUSION_STEPS:-12}" \
   --transition_yaw_limit_dps "${V26_TRANSITION_YAW_LIMIT_DPS:-220}" \
   --yaw_transition_safety_factor "${V26_YAW_TRANSITION_SAFETY_FACTOR:-1.90}" \
   --planner_duration_weight "${V26_PLANNER_DURATION_WEIGHT:-0.15}" \
   --activity_weight "${V26_ACTIVITY_WEIGHT:-0.25}" \
   --hierarchical_retrieval "${V26_HIERARCHICAL_RETRIEVAL:-1}" \
   --hierarchy_weight "${V26_HIERARCHY_WEIGHT:-0.55}" \
+  --deep_music_features "${V27_DEEP_MUSIC_FEATURES:-0}" \
+  --deep_music_model "${V27_DEEP_MUSIC_MODEL:-clap}" \
+  --deep_music_weight "${V27_DEEP_MUSIC_WEIGHT:-0.25}" \
   --graph_scheduler "${V26_GRAPH_SCHEDULER:-1}" \
   --graph_node_top_k "${V26_GRAPH_NODE_TOP_K:-96}" \
   --graph_edge_weight "${V26_GRAPH_EDGE_WEIGHT:-0.45}" \

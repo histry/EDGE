@@ -122,6 +122,57 @@ def tangent_to_poincare(
     return embed.astype(np.float32), tangent.astype(np.float32)
 
 
+def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
+    x = np.asarray(vectors, dtype=np.float32)
+    return x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-8)
+
+
+def learned_tangent_to_poincare(
+    raw_vectors: np.ndarray,
+    radius_ratio: np.ndarray,
+    checkpoint_path: str | Path,
+    curvature: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Use a learned hyperbolic encoder checkpoint when available.
+
+    The checkpoint is trained by ``train_v27_hyperbolic_hierarchy.py`` with a
+    hierarchy-aware contrastive loss.  If loading fails, raise a clear error so
+    the caller can decide whether to fall back to deterministic expmap.
+    """
+    import torch
+
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    state = ckpt.get("model", ckpt)
+    config = ckpt.get("config", {})
+    in_dim = int(config.get("in_dim", raw_vectors.shape[1]))
+    hidden_dim = int(config.get("hidden_dim", 128))
+    out_dim = int(config.get("out_dim", raw_vectors.shape[1]))
+    if in_dim != int(raw_vectors.shape[1]):
+        raise RuntimeError(f"Hyperbolic checkpoint in_dim={in_dim} does not match raw dim={raw_vectors.shape[1]}")
+
+    model = torch.nn.Sequential(
+        torch.nn.Linear(in_dim, hidden_dim),
+        torch.nn.GELU(),
+        torch.nn.Linear(hidden_dim, hidden_dim),
+        torch.nn.GELU(),
+        torch.nn.Linear(hidden_dim, out_dim),
+    )
+    model.load_state_dict(state)
+    model.eval()
+    with torch.no_grad():
+        tangent = model(torch.from_numpy(np.asarray(raw_vectors, dtype=np.float32))).cpu().numpy().astype(np.float32)
+    # Keep the learned direction but use the hierarchy radius as explicit
+    # coarse-to-fine control.  This prevents learned embeddings from collapsing
+    # to a Euclidean cluster while still letting contrastive learning shape the
+    # angular topology.
+    unit = _l2_unit(tangent)
+    c = max(float(curvature), 1e-6)
+    tangent_norm = np.arctanh(np.clip(np.asarray(radius_ratio, dtype=np.float32), 0.05, 0.95)).reshape(-1, 1) / np.sqrt(c)
+    tangent = unit * tangent_norm
+    embed = expmap0(tangent, curvature=c)
+    return embed.astype(np.float32), tangent.astype(np.float32)
+
+
 def _hierarchy_curvature(hierarchy: Mapping[str, np.ndarray] | None = None) -> float:
     if not hierarchy:
         return 1.0
@@ -156,7 +207,11 @@ def poincare_pair_distance(a: np.ndarray, b: np.ndarray, curvature: float = 1.0)
     )
 
 
-def build_hierarchy_features(arrays: Any, items: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarray]:
+def build_hierarchy_features(
+    arrays: Any,
+    items: Sequence[Mapping[str, Any]],
+    hyperbolic_ckpt: str | Path | None = None,
+) -> Dict[str, np.ndarray]:
     n = len(items)
     natural = _get_array(arrays, "natural_duration", np.full((n,), 41.0, dtype=np.float32)).astype(np.float32)
     style = _get_array(arrays, "style_score", np.full((n,), 0.5, dtype=np.float32)).astype(np.float32)
@@ -193,16 +248,25 @@ def build_hierarchy_features(arrays: Any, items: Sequence[Mapping[str, Any]]) ->
     coarse = _one_hot(body_code, 6)
     continuous = np.stack([activity01, turn01, duration01, style, quality, safety], axis=1).astype(np.float32)
     raw = np.concatenate([coarse, continuous], axis=1)
+    semantic_proxy = _normalize_rows(raw)
     specificity = np.clip(0.30 * activity01 + 0.28 * turn01 + 0.22 * style + 0.20 * duration01, 0.0, 1.0)
     radius = 0.18 + 0.72 * specificity
     curvature = 1.0
-    embed, tangent = tangent_to_poincare(raw, radius, curvature=curvature)
+    encoder_mode = "deterministic_expmap"
+    if hyperbolic_ckpt and Path(str(hyperbolic_ckpt)).is_file():
+        embed, tangent = learned_tangent_to_poincare(raw, radius, hyperbolic_ckpt, curvature=curvature)
+        encoder_mode = "learned_contrastive_expmap"
+    else:
+        embed, tangent = tangent_to_poincare(raw, radius, curvature=curvature)
 
     return {
+        "hierarchy_raw": raw.astype(np.float32),
         "hierarchy_embed": embed.astype(np.float32),
         "hierarchy_tangent": tangent.astype(np.float32),
         "hierarchy_radius": radius.astype(np.float32),
         "hierarchy_curvature": np.asarray([curvature], dtype=np.float32),
+        "hierarchy_encoder_mode": np.asarray([encoder_mode], dtype=object),
+        "semantic_proxy": semantic_proxy.astype(np.float32),
         "body_code": body_code,
         "center_code": center_code,
         "gesture_code": gesture_code,
@@ -217,6 +281,7 @@ def load_or_build_hierarchy(
     arrays: Any,
     items: Sequence[Mapping[str, Any]],
     hierarchy_index_npz: str | Path | None = None,
+    hyperbolic_ckpt: str | Path | None = None,
 ) -> Dict[str, np.ndarray]:
     path = Path(str(hierarchy_index_npz)) if hierarchy_index_npz else None
     if path and path.is_file():
@@ -231,7 +296,7 @@ def load_or_build_hierarchy(
                 f"Hierarchy index length {len(out['hierarchy_embed'])} does not match event index length {len(items)}"
             )
         return out
-    return build_hierarchy_features(arrays, items)
+    return build_hierarchy_features(arrays, items, hyperbolic_ckpt=hyperbolic_ckpt)
 
 
 def build_slot_query(
@@ -239,6 +304,8 @@ def build_slot_query(
     predicted_event: str,
     target_natural: float,
     desired_activity: float,
+    music_semantic: np.ndarray | None = None,
+    deep_music_weight: float = 0.0,
 ) -> Dict[str, Any]:
     music_event = str(getattr(phrase, "music_event", "neutral_flow"))
     group = int(MUSIC_TO_GROUP.get(music_event, EVENT_GROUPS.get(str(predicted_event), 2)))
@@ -248,11 +315,29 @@ def build_slot_query(
     tension = float(getattr(phrase, "tension", 0.0))
     calm = float(getattr(phrase, "calmness", 0.0))
     boundary = float(getattr(phrase, "boundary_accent_strength", 0.0))
-    activity = float(np.clip(0.45 * desired_activity + 0.25 * energy + 0.18 * beat + 0.12 * onset - 0.20 * calm, 0.0, 1.0))
-    turn = float(np.clip(0.45 * tension + 0.25 * boundary + 0.20 * beat + (0.22 if music_event in {"climax", "section_change"} else 0.0), 0.0, 1.0))
+    semantic = None
+    semantic_activity = 0.0
+    semantic_turn = 0.0
+    semantic_group_bias = np.zeros((6,), dtype=np.float32)
+    if music_semantic is not None:
+        semantic = np.asarray(music_semantic, dtype=np.float32).reshape(-1)
+        if semantic.size >= 12:
+            semantic_group_bias = semantic[:6].astype(np.float32)
+            semantic_activity = float(semantic[6])
+            semantic_turn = float(semantic[7])
+    deep_w = float(np.clip(deep_music_weight, 0.0, 1.0))
+    activity_rule = float(np.clip(0.45 * desired_activity + 0.25 * energy + 0.18 * beat + 0.12 * onset - 0.20 * calm, 0.0, 1.0))
+    turn_rule = float(np.clip(0.45 * tension + 0.25 * boundary + 0.20 * beat + (0.22 if music_event in {"climax", "section_change"} else 0.0), 0.0, 1.0))
+    activity = float(np.clip((1.0 - deep_w) * activity_rule + deep_w * semantic_activity, 0.0, 1.0))
+    turn = float(np.clip((1.0 - deep_w) * turn_rule + deep_w * semantic_turn, 0.0, 1.0))
     duration01 = float(np.clip((target_natural - 24.0) / 72.0, 0.0, 1.0))
     coarse = np.zeros((6,), dtype=np.float32)
     coarse[np.clip(group, 0, 5)] = 1.0
+    if deep_w > 0.0 and np.linalg.norm(semantic_group_bias) > 1e-6:
+        semantic_group_bias = semantic_group_bias / max(float(np.sum(np.abs(semantic_group_bias))), 1e-6)
+        coarse = (1.0 - deep_w) * coarse + deep_w * np.clip(semantic_group_bias, 0.0, 1.0)
+        if float(coarse.sum()) > 1e-6:
+            coarse = coarse / float(coarse.sum())
     raw = np.concatenate(
         [
             coarse,
@@ -262,6 +347,7 @@ def build_slot_query(
     radius = 0.18 + 0.72 * np.clip(0.34 * activity + 0.30 * turn + 0.20 * duration01 + 0.16 * boundary, 0.0, 1.0)
     curvature = 1.0
     embed, tangent = tangent_to_poincare(raw[None], np.asarray([radius], dtype=np.float32), curvature=curvature)
+    semantic_proxy = _normalize_rows(raw[None])[0]
     return {
         "music_event": music_event,
         "group": group,
@@ -273,6 +359,8 @@ def build_slot_query(
         "tangent": tangent[0].astype(np.float32),
         "radius": float(radius),
         "curvature": float(curvature),
+        "semantic_proxy": semantic_proxy.astype(np.float32),
+        "deep_music_weight": float(deep_w),
     }
 
 
@@ -296,13 +384,19 @@ def hierarchical_node_scores(
     activity_score = (1.0 - np.minimum(np.abs(activity - float(query["activity"])), 1.0)).astype(np.float32)
     turn_score = (1.0 - np.minimum(np.abs(turn - float(query["turn"])), 1.0)).astype(np.float32)
     duration_score = (1.0 - np.minimum(np.abs(duration - float(query["duration01"])), 1.0)).astype(np.float32)
+    semantic_score = np.zeros_like(hyper_score, dtype=np.float32)
+    if "semantic_proxy" in hierarchy and "semantic_proxy" in query:
+        event_sem = _normalize_rows(np.asarray(hierarchy["semantic_proxy"], dtype=np.float32))
+        query_sem = _normalize_rows(np.asarray(query["semantic_proxy"], dtype=np.float32).reshape(1, -1))[0]
+        semantic_score = np.clip(0.5 + 0.5 * (event_sem @ query_sem), 0.0, 1.0).astype(np.float32)
     score = (
         0.34 * hyper_score
         + 0.24 * coarse_score
         + 0.14 * exact_group
-        + 0.12 * activity_score
-        + 0.10 * turn_score
+        + 0.10 * activity_score
+        + 0.08 * turn_score
         + 0.06 * duration_score
+        + 0.04 * semantic_score
     ).astype(np.float32)
     return score, {
         "hierarchy_hyper_score": hyper_score,
@@ -311,6 +405,7 @@ def hierarchical_node_scores(
         "hierarchy_activity_score": activity_score,
         "hierarchy_turn_score": turn_score,
         "hierarchy_duration_score": duration_score,
+        "hierarchy_semantic_score": semantic_score,
         "hierarchy_distance": dist.astype(np.float32),
     }
 

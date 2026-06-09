@@ -34,10 +34,11 @@ def main() -> None:
     parser.add_argument("--duration_index_npz", required=True)
     parser.add_argument("--out_npz", required=True)
     parser.add_argument("--out_json", default="")
+    parser.add_argument("--hyperbolic_ckpt", default="")
     args = parser.parse_args()
 
     meta, arrays, items = load_shared_index(Path(args.index_json), Path(args.duration_index_npz))
-    hierarchy = build_hierarchy_features(arrays, items)
+    hierarchy = build_hierarchy_features(arrays, items, hyperbolic_ckpt=args.hyperbolic_ckpt)
 
     out_npz = Path(args.out_npz)
     out_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +48,7 @@ def main() -> None:
         "version": "v26_hierarchical_event_index",
         "source_index_json": str(args.index_json),
         "source_duration_index_npz": str(args.duration_index_npz),
+        "hyperbolic_ckpt": str(args.hyperbolic_ckpt),
         "num_events": len(items),
         "arrays": {name: list(np.asarray(value).shape) for name, value in hierarchy.items()},
         "body_code_histogram": {

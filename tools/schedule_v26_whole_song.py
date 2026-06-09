@@ -63,6 +63,8 @@ from tools.v26_music_phrase_segmentation import (
     split_music_phrases_for_events,
     whole_song_features,
 )
+from tools.v27_deep_music_features import phrase_semantic_matrix
+from tools.v27_transition_diffusion import load_transition_diffusion, sample_transition_diffusion
 from tools.v22_turn_utils import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
 
 
@@ -328,6 +330,7 @@ def planner_bundle_lengths(path: str) -> Tuple[int, ...]:
 
 def choose_events(
     phrases: Sequence[MusicPhrase],
+    phrase_semantics: np.ndarray,
     predictions: Dict[str, np.ndarray],
     arrays,
     hierarchy,
@@ -432,6 +435,8 @@ def choose_events(
                 predicted_event=predicted_event,
                 target_natural=target_natural,
                 desired_activity=desired_activity,
+                music_semantic=phrase_semantics[slot] if len(phrase_semantics) > slot else None,
+                deep_music_weight=args.deep_music_weight if args.deep_music_features else 0.0,
             )
             hierarchy_score, hierarchy_components = hierarchical_node_scores(hierarchy, hierarchy_query)
         base = (
@@ -569,6 +574,7 @@ def choose_events(
                     "hierarchy_coarse_score": float(hierarchy_components.get("hierarchy_coarse_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
                     "hierarchy_activity_score": float(hierarchy_components.get("hierarchy_activity_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
                     "hierarchy_turn_score": float(hierarchy_components.get("hierarchy_turn_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
+                    "hierarchy_semantic_score": float(hierarchy_components.get("hierarchy_semantic_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
                     "transition_cost": float(transition_cost),
                     "boundary_velocity_penalty": float(boundary_velocity_penalty),
                     "boundary_acceleration_penalty": float(boundary_acceleration_penalty),
@@ -638,9 +644,17 @@ def generate_one(
             f"{audio_path}: detected {len(phrases)} event slots, above --max_phrases={args.max_phrases}. "
             "Increase max_phrases or max_single_event_seconds."
         )
+    phrase_semantics, semantic_meta = phrase_semantic_matrix(
+        audio_path,
+        phrases,
+        enabled=bool(args.deep_music_features),
+        model_name=str(args.deep_music_model),
+        cache_dir=args.deep_music_cache or args.feature_dir,
+    )
     predictions = planner_predictions(phrases, planner_bundle, device)
     selected_state = choose_events(
         phrases,
+        phrase_semantics,
         predictions,
         arrays,
         hierarchy,
@@ -725,9 +739,25 @@ def generate_one(
                 device,
             )
             transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
+            if args.transition_diffusion and args.transition_diffusion_ckpt:
+                transition, diffusion_meta = sample_transition_diffusion(
+                    args.transition_diffusion_bundle,
+                    contents[slot - 1][-1],
+                    content[0],
+                    k,
+                    np.asarray(phrases[slot].query, dtype=np.float32),
+                    rough=transition,
+                    device=device,
+                    blend=args.transition_diffusion_blend,
+                    steps=args.transition_diffusion_steps,
+                )
+                transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
+            else:
+                diffusion_meta = {"enabled": False}
             metrics = boundary_metrics(contents[slot - 1], content)
             metrics["transition_len"] = k
             metrics["transition_meta"] = selected_state.parts[slot].get("transition_meta", {})
+            metrics["transition_diffusion"] = diffusion_meta
             boundary_reports.append(metrics)
             pieces.append(transition)
         pieces.append(content)
@@ -754,6 +784,7 @@ def generate_one(
         "audio": str(audio_path),
         "audio_meta": audio_meta,
         "planner_mode": str(predictions["mode"][0]),
+        "music_semantic": semantic_meta,
         "segmentation": {
             **segmentation,
             "source_num_phrases": len(source_phrases),
@@ -771,6 +802,9 @@ def generate_one(
             "graph_scheduler": bool(args.graph_scheduler),
             "hierarchy_index_npz": str(args.hierarchy_index_npz),
             "hierarchy_weight": float(args.hierarchy_weight),
+            "deep_music_features": bool(args.deep_music_features),
+            "deep_music_model": str(args.deep_music_model),
+            "deep_music_weight": float(args.deep_music_weight),
             "graph_node_top_k": int(args.graph_node_top_k),
             "graph_edge_weight": float(args.graph_edge_weight),
             "graph_hard_prune": bool(args.graph_hard_prune),
@@ -791,6 +825,10 @@ def generate_one(
             "max_single_event_seconds": float(args.max_single_event_seconds),
             "calm_max_single_event_seconds": float(args.calm_max_single_event_seconds),
             "anti_static_weight": float(args.anti_static_weight),
+            "transition_diffusion": bool(args.transition_diffusion),
+            "transition_diffusion_ckpt": str(args.transition_diffusion_ckpt),
+            "transition_diffusion_blend": float(args.transition_diffusion_blend),
+            "transition_diffusion_steps": int(args.transition_diffusion_steps),
         },
     }
     for slot, part in enumerate(selected_state.parts):
@@ -816,8 +854,11 @@ def main() -> None:
     parser.add_argument("--v23_ckpt", required=True)
     parser.add_argument("--planner_ckpt", default="")
     parser.add_argument("--transition_ckpt", default="")
+    parser.add_argument("--transition_diffusion_ckpt", default="")
     parser.add_argument("--hierarchy_index_npz", default="")
+    parser.add_argument("--hyperbolic_ckpt", default="")
     parser.add_argument("--feature_dir", default="")
+    parser.add_argument("--deep_music_cache", default="")
     parser.add_argument("--start_pose", default="")
     parser.add_argument("--start_anchor_blend", type=int, default=8)
     parser.add_argument("--fps", type=float, default=30.0)
@@ -846,6 +887,9 @@ def main() -> None:
     parser.add_argument("--activity_weight", type=float, default=0.25)
     parser.add_argument("--hierarchical_retrieval", type=_bool_arg, default=True)
     parser.add_argument("--hierarchy_weight", type=float, default=0.55)
+    parser.add_argument("--deep_music_features", type=_bool_arg, default=False)
+    parser.add_argument("--deep_music_model", default="clap")
+    parser.add_argument("--deep_music_weight", type=float, default=0.25)
     parser.add_argument("--graph_scheduler", type=_bool_arg, default=True)
     parser.add_argument("--graph_node_top_k", type=int, default=96)
     parser.add_argument("--graph_edge_weight", type=float, default=0.45)
@@ -879,6 +923,9 @@ def main() -> None:
     parser.add_argument("--music_dominant_timing", type=_bool_arg, default=True)
     parser.add_argument("--transition_min_frames", type=int, default=12)
     parser.add_argument("--transition_max_frames", type=int, default=48)
+    parser.add_argument("--transition_diffusion", type=_bool_arg, default=False)
+    parser.add_argument("--transition_diffusion_blend", type=float, default=0.45)
+    parser.add_argument("--transition_diffusion_steps", type=int, default=12)
     parser.add_argument("--transition_yaw_limit_dps", type=float, default=220.0)
     parser.add_argument("--yaw_transition_safety_factor", type=float, default=1.90)
     parser.add_argument("--pose_jump_reference", type=float, default=0.120)
@@ -909,7 +956,7 @@ def main() -> None:
         raise RuntimeError(
             "duration_index_npz lacks natural_duration. Run tools/build_v26_duration_index.py first."
         )
-    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz)
+    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz, hyperbolic_ckpt=args.hyperbolic_ckpt)
     motions = [
         load_motion(Path(str(item.get("pkl", item.get("path", "")))))
         for item in items
@@ -917,6 +964,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     router = load_router_checkpoint(args.router_ckpt, device=device)
     transition_bundle = load_optional_transition(args.transition_ckpt, device)
+    args.transition_diffusion_bundle = load_transition_diffusion(args.transition_diffusion_ckpt, device) if args.transition_diffusion and args.transition_diffusion_ckpt else None
     v23_bundle = load_v23_checkpoint(args.v23_ckpt, device=device)
     planner_bundle = load_v26_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
 
