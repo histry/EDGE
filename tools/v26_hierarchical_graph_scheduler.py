@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Hierarchical Event-RAG features and graph scheduling costs for V26/V27.
+
+This module keeps the existing whole-song scheduler intact, but upgrades its
+candidate scoring from flat feature matching to:
+
+1. hierarchical retrieval: match coarse body-state first, then local event
+   details in a small Poincare-ball style embedding;
+2. graph scheduling: treat candidate events as nodes and transition feasibility
+   as edge cost, so beam search becomes explicit graph-path inference.
+
+The implementation is deliberately deterministic and index-compatible.  If a
+prebuilt hierarchy index is provided, it is used; otherwise features are derived
+from the existing V21/V26 duration index arrays.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
+
+import numpy as np
+
+
+EVENT_GROUPS = {
+    "pose_hold": 0,
+    "calm_flow": 1,
+    "release": 1,
+    "neutral_flow": 2,
+    "build_up": 3,
+    "high_tension": 3,
+    "arm_flourish": 4,
+    "support_shift": 5,
+}
+
+MUSIC_TO_GROUP = {
+    "calm_flow": 1,
+    "release": 1,
+    "neutral_flow": 2,
+    "build_up": 3,
+    "climax": 3,
+    "accent": 4,
+    "section_change": 5,
+}
+
+
+def _array_names(arrays: Any) -> set[str]:
+    return set(arrays.files) if hasattr(arrays, "files") else set(arrays.keys())
+
+
+def _get_array(arrays: Any, name: str, default: np.ndarray) -> np.ndarray:
+    names = _array_names(arrays)
+    if name in names:
+        return np.asarray(arrays[name])
+    return np.asarray(default)
+
+
+def _normalize01(x: np.ndarray, lo: float | None = None, hi: float | None = None) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32)
+    if lo is None:
+        lo = float(np.nanpercentile(arr, 5)) if arr.size else 0.0
+    if hi is None:
+        hi = float(np.nanpercentile(arr, 95)) if arr.size else 1.0
+    if hi <= lo + 1e-8:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _event_group(event_type: str) -> int:
+    return int(EVENT_GROUPS.get(str(event_type), 2))
+
+
+def _one_hot(indices: np.ndarray, depth: int) -> np.ndarray:
+    out = np.zeros((len(indices), depth), dtype=np.float32)
+    out[np.arange(len(indices)), np.clip(indices.astype(np.int64), 0, depth - 1)] = 1.0
+    return out
+
+
+def _safe_unit_ball(vectors: np.ndarray, radius: np.ndarray) -> np.ndarray:
+    vectors = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    unit = vectors / np.maximum(norms, 1e-8)
+    return unit * np.clip(radius, 0.05, 0.95).reshape(-1, 1)
+
+
+def poincare_distance_matrix(query: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Distance from one query point to many Poincare-ball points."""
+    q = np.asarray(query, dtype=np.float32).reshape(1, -1)
+    p = np.asarray(points, dtype=np.float32)
+    q_norm = np.sum(q * q, axis=1, keepdims=True)
+    p_norm = np.sum(p * p, axis=1, keepdims=True).T
+    diff = np.sum((p - q) * (p - q), axis=1)
+    denom = np.maximum((1.0 - q_norm.reshape(-1)[0]) * (1.0 - p_norm.reshape(-1)), 1e-6)
+    z = 1.0 + 2.0 * diff / denom
+    return np.arccosh(np.maximum(z, 1.0 + 1e-6)).astype(np.float32)
+
+
+def poincare_pair_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return float(poincare_distance_matrix(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)[None])[0])
+
+
+def build_hierarchy_features(arrays: Any, items: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarray]:
+    n = len(items)
+    natural = _get_array(arrays, "natural_duration", np.full((n,), 41.0, dtype=np.float32)).astype(np.float32)
+    style = _get_array(arrays, "style_score", np.full((n,), 0.5, dtype=np.float32)).astype(np.float32)
+    quality = _get_array(arrays, "quality_score", np.full((n,), 0.5, dtype=np.float32)).astype(np.float32)
+    safety = _get_array(arrays, "safety_score", np.full((n,), 0.5, dtype=np.float32)).astype(np.float32)
+    motion_desc = _get_array(arrays, "motion_desc", np.zeros((n, 4), dtype=np.float32)).astype(np.float32)
+    if motion_desc.ndim == 1:
+        motion_desc = motion_desc.reshape(n, 1)
+    activity = motion_desc[:, 0] if motion_desc.shape[1] else np.zeros((n,), dtype=np.float32)
+    activity01 = _normalize01(activity)
+
+    turn_peak = _get_array(arrays, "turn_peak_dps", np.zeros((n,), dtype=np.float32)).astype(np.float32)
+    turn_angle = _get_array(arrays, "turn_angle_deg", np.zeros((n,), dtype=np.float32)).astype(np.float32)
+    turn01 = np.clip(0.55 * _normalize01(turn_peak, 0.0, 720.0) + 0.45 * _normalize01(turn_angle, 0.0, 420.0), 0.0, 1.0)
+    duration01 = _normalize01(natural, 24.0, 96.0)
+
+    event_types = [str(item.get("event_type", "neutral_flow")) for item in items]
+    body_code = np.asarray([_event_group(x) for x in event_types], dtype=np.int32)
+    center_code = np.asarray(
+        [
+            2 if event_types[i] == "support_shift" else (1 if turn01[i] > 0.35 else 0)
+            for i in range(n)
+        ],
+        dtype=np.int32,
+    )
+    gesture_code = np.asarray(
+        [
+            2 if event_types[i] == "arm_flourish" else (1 if activity01[i] > 0.55 else 0)
+            for i in range(n)
+        ],
+        dtype=np.int32,
+    )
+
+    coarse = _one_hot(body_code, 6)
+    continuous = np.stack([activity01, turn01, duration01, style, quality, safety], axis=1).astype(np.float32)
+    raw = np.concatenate([coarse, continuous], axis=1)
+    specificity = np.clip(0.30 * activity01 + 0.28 * turn01 + 0.22 * style + 0.20 * duration01, 0.0, 1.0)
+    radius = 0.18 + 0.72 * specificity
+    embed = _safe_unit_ball(raw, radius)
+
+    return {
+        "hierarchy_embed": embed.astype(np.float32),
+        "body_code": body_code,
+        "center_code": center_code,
+        "gesture_code": gesture_code,
+        "activity01": activity01.astype(np.float32),
+        "turn01": turn01.astype(np.float32),
+        "duration01": duration01.astype(np.float32),
+        "specificity": specificity.astype(np.float32),
+    }
+
+
+def load_or_build_hierarchy(
+    arrays: Any,
+    items: Sequence[Mapping[str, Any]],
+    hierarchy_index_npz: str | Path | None = None,
+) -> Dict[str, np.ndarray]:
+    path = Path(str(hierarchy_index_npz)) if hierarchy_index_npz else None
+    if path and path.is_file():
+        loaded = np.load(path, allow_pickle=True)
+        required = {"hierarchy_embed", "body_code", "activity01", "turn01", "duration01"}
+        missing = required.difference(set(loaded.files))
+        if missing:
+            raise RuntimeError(f"Hierarchy index {path} is missing arrays: {sorted(missing)}")
+        out = {name: np.asarray(loaded[name]) for name in loaded.files}
+        if len(out["hierarchy_embed"]) != len(items):
+            raise RuntimeError(
+                f"Hierarchy index length {len(out['hierarchy_embed'])} does not match event index length {len(items)}"
+            )
+        return out
+    return build_hierarchy_features(arrays, items)
+
+
+def build_slot_query(
+    phrase: Any,
+    predicted_event: str,
+    target_natural: float,
+    desired_activity: float,
+) -> Dict[str, Any]:
+    music_event = str(getattr(phrase, "music_event", "neutral_flow"))
+    group = int(MUSIC_TO_GROUP.get(music_event, EVENT_GROUPS.get(str(predicted_event), 2)))
+    energy = float(getattr(phrase, "energy", 0.5))
+    onset = float(getattr(phrase, "onset", 0.0))
+    beat = float(getattr(phrase, "beat_density", 0.0))
+    tension = float(getattr(phrase, "tension", 0.0))
+    calm = float(getattr(phrase, "calmness", 0.0))
+    boundary = float(getattr(phrase, "boundary_accent_strength", 0.0))
+    activity = float(np.clip(0.45 * desired_activity + 0.25 * energy + 0.18 * beat + 0.12 * onset - 0.20 * calm, 0.0, 1.0))
+    turn = float(np.clip(0.45 * tension + 0.25 * boundary + 0.20 * beat + (0.22 if music_event in {"climax", "section_change"} else 0.0), 0.0, 1.0))
+    duration01 = float(np.clip((target_natural - 24.0) / 72.0, 0.0, 1.0))
+    coarse = np.zeros((6,), dtype=np.float32)
+    coarse[np.clip(group, 0, 5)] = 1.0
+    raw = np.concatenate(
+        [
+            coarse,
+            np.asarray([activity, turn, duration01, 0.72, 0.68, 0.70], dtype=np.float32),
+        ]
+    )
+    radius = 0.18 + 0.72 * np.clip(0.34 * activity + 0.30 * turn + 0.20 * duration01 + 0.16 * boundary, 0.0, 1.0)
+    embed = _safe_unit_ball(raw[None], np.asarray([radius], dtype=np.float32))[0]
+    return {
+        "music_event": music_event,
+        "group": group,
+        "activity": activity,
+        "turn": turn,
+        "duration01": duration01,
+        "boundary_strength": boundary,
+        "embed": embed.astype(np.float32),
+    }
+
+
+def hierarchical_node_scores(
+    hierarchy: Dict[str, np.ndarray],
+    query: Dict[str, Any],
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    embed = np.asarray(hierarchy["hierarchy_embed"], dtype=np.float32)
+    body = np.asarray(hierarchy["body_code"], dtype=np.int32)
+    activity = np.asarray(hierarchy["activity01"], dtype=np.float32)
+    turn = np.asarray(hierarchy["turn01"], dtype=np.float32)
+    duration = np.asarray(hierarchy["duration01"], dtype=np.float32)
+    dist = poincare_distance_matrix(np.asarray(query["embed"], dtype=np.float32), embed)
+    # Convert distance to a bounded positive score.  Very close hierarchical
+    # matches approach 1; distant points approach 0.
+    hyper_score = np.exp(-0.55 * dist).astype(np.float32)
+    group_gap = np.abs(body.astype(np.float32) - float(query["group"])) / 5.0
+    coarse_score = (1.0 - np.clip(group_gap, 0.0, 1.0)).astype(np.float32)
+    exact_group = (body == int(query["group"])).astype(np.float32)
+    activity_score = (1.0 - np.minimum(np.abs(activity - float(query["activity"])), 1.0)).astype(np.float32)
+    turn_score = (1.0 - np.minimum(np.abs(turn - float(query["turn"])), 1.0)).astype(np.float32)
+    duration_score = (1.0 - np.minimum(np.abs(duration - float(query["duration01"])), 1.0)).astype(np.float32)
+    score = (
+        0.34 * hyper_score
+        + 0.24 * coarse_score
+        + 0.14 * exact_group
+        + 0.12 * activity_score
+        + 0.10 * turn_score
+        + 0.06 * duration_score
+    ).astype(np.float32)
+    return score, {
+        "hierarchy_hyper_score": hyper_score,
+        "hierarchy_coarse_score": coarse_score,
+        "hierarchy_exact_group": exact_group,
+        "hierarchy_activity_score": activity_score,
+        "hierarchy_turn_score": turn_score,
+        "hierarchy_duration_score": duration_score,
+        "hierarchy_distance": dist.astype(np.float32),
+    }
+
+
+def graph_edge_penalty(
+    hierarchy: Dict[str, np.ndarray],
+    prev_idx: int,
+    idx: int,
+    phrase: Any,
+    prev_prev_idx: int | None = None,
+) -> Tuple[float, Dict[str, Any]]:
+    embed = np.asarray(hierarchy["hierarchy_embed"], dtype=np.float32)
+    body = np.asarray(hierarchy["body_code"], dtype=np.int32)
+    activity = np.asarray(hierarchy["activity01"], dtype=np.float32)
+    turn = np.asarray(hierarchy["turn01"], dtype=np.float32)
+
+    boundary_strength = float(getattr(phrase, "boundary_accent_strength", 0.0))
+    music_event = str(getattr(phrase, "music_event", "neutral_flow"))
+    tension = float(getattr(phrase, "tension", 0.0))
+    calm = float(getattr(phrase, "calmness", 0.0))
+    reset_allow = np.clip(0.22 + 0.55 * boundary_strength + (0.35 if music_event == "section_change" else 0.0), 0.0, 1.0)
+
+    hdist = poincare_pair_distance(embed[prev_idx], embed[idx])
+    coarse_jump = float(abs(int(body[idx]) - int(body[prev_idx])) / 5.0)
+    activity_jump = float(abs(float(activity[idx]) - float(activity[prev_idx])))
+    turn_jump = float(abs(float(turn[idx]) - float(turn[prev_idx])))
+
+    reset_penalty = max(0.0, coarse_jump - reset_allow)
+    activity_allow = np.clip(0.28 + 0.35 * boundary_strength + 0.22 * tension - 0.16 * calm, 0.12, 0.85)
+    activity_penalty = max(0.0, activity_jump - float(activity_allow))
+
+    trend_penalty = 0.0
+    if prev_prev_idx is not None:
+        prev_delta = float(activity[prev_idx] - activity[prev_prev_idx])
+        new_delta = float(activity[idx] - activity[prev_idx])
+        # Abrupt sign flips are acceptable near strong boundaries, but should
+        # be discouraged inside one smooth phrase.
+        sign_flip = 1.0 if prev_delta * new_delta < -0.035 else 0.0
+        trend_penalty = sign_flip * max(0.0, 0.55 - reset_allow)
+
+    # Normalize hdist into a soft 0-1 range.
+    hierarchy_jump_penalty = max(0.0, min(hdist / 4.5, 2.0) - 0.45 * reset_allow)
+    penalty = (
+        0.36 * hierarchy_jump_penalty
+        + 0.28 * reset_penalty
+        + 0.22 * activity_penalty
+        + 0.14 * trend_penalty
+        + 0.08 * turn_jump
+    )
+    meta = {
+        "graph_hierarchy_distance": float(hdist),
+        "graph_coarse_jump": float(coarse_jump),
+        "graph_activity_jump": float(activity_jump),
+        "graph_turn_jump": float(turn_jump),
+        "graph_reset_allow": float(reset_allow),
+        "graph_reset_penalty": float(reset_penalty),
+        "graph_activity_penalty": float(activity_penalty),
+        "graph_trend_penalty": float(trend_penalty),
+        "graph_hierarchy_jump_penalty": float(hierarchy_jump_penalty),
+        "graph_edge_penalty": float(penalty),
+    }
+    return float(penalty), meta

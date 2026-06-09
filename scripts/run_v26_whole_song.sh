@@ -36,6 +36,7 @@ python tools/schedule_v26_whole_song.py \
   --v23_ckpt "$V26_V23_CKPT" \
   --planner_ckpt "${V26_PLANNER_CKPT:-}" \
   --transition_ckpt "${V26_TRANSITION_CKPT:-}" \
+  --hierarchy_index_npz "${V26_HIERARCHY_INDEX_NPZ:-}" \
   --feature_dir "${V26_FEATURE_CACHE:-data/v26_music_features}" \
   --start_pose "${V26_START_POSE:-}" \
   --fps "${V26_FPS:-30}" \
@@ -68,6 +69,12 @@ python tools/schedule_v26_whole_song.py \
   --yaw_transition_safety_factor "${V26_YAW_TRANSITION_SAFETY_FACTOR:-1.90}" \
   --planner_duration_weight "${V26_PLANNER_DURATION_WEIGHT:-0.15}" \
   --activity_weight "${V26_ACTIVITY_WEIGHT:-0.25}" \
+  --hierarchical_retrieval "${V26_HIERARCHICAL_RETRIEVAL:-1}" \
+  --hierarchy_weight "${V26_HIERARCHY_WEIGHT:-0.55}" \
+  --graph_scheduler "${V26_GRAPH_SCHEDULER:-1}" \
+  --graph_edge_weight "${V26_GRAPH_EDGE_WEIGHT:-0.45}" \
+  --graph_hard_prune "${V26_GRAPH_HARD_PRUNE:-0}" \
+  --graph_hard_prune_threshold "${V26_GRAPH_HARD_PRUNE_THRESHOLD:-1.35}" \
   --anti_static_weight "${V26_ANTI_STATIC_WEIGHT:-0.45}" \
   --anti_static_activity_threshold "${V26_ANTI_STATIC_ACTIVITY_THRESHOLD:-0.030}" \
   --anti_static_min_content_frames "${V26_ANTI_STATIC_MIN_CONTENT_FRAMES:-60}" \

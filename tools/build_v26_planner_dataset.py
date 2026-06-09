@@ -25,6 +25,11 @@ from model.v21_music_router import load_router_checkpoint
 from model.v26_whole_song_planner import MUSIC_DOMINANT_TRANSITION_LENGTHS
 from tools.schedule_v21_multi_music import load_shared_index, precompute_music_similarity
 from tools.v21_common import EVENT_TO_ID, EVENT_TYPES, event_compatibility
+from tools.v26_hierarchical_graph_scheduler import (
+    build_slot_query,
+    hierarchical_node_scores,
+    load_or_build_hierarchy,
+)
 from tools.v26_music_phrase_segmentation import (
     segment_music_phrases,
     split_music_phrases_for_events,
@@ -52,11 +57,14 @@ def _music_transition_target(phrase) -> int:
 def choose_sequence(
     phrases,
     arrays,
+    hierarchy,
     items,
     router,
     device: torch.device,
     candidate_top_k: int,
     family_repeat_weight: float,
+    hierarchical_retrieval: bool,
+    hierarchy_weight: float,
 ) -> List[int]:
     motion_desc = np.asarray(arrays["motion_desc"], dtype=np.float32)
     style = np.asarray(arrays["style_score"], dtype=np.float32)
@@ -81,6 +89,15 @@ def choose_sequence(
         duration_match = 1.0 - np.minimum(np.abs(natural - target_natural) / max(target_natural, 1.0), 1.0)
         activity_target = float(np.clip(getattr(phrase, "arousal", 0.5), 0.0, 1.0))
         activity_match = 1.0 - np.minimum(np.abs(motion_desc[:, 0] - activity_target), 1.0)
+        hierarchy_score = np.zeros_like(style, dtype=np.float32)
+        if hierarchical_retrieval:
+            query = build_slot_query(
+                phrase,
+                predicted_event=str(getattr(phrase, "music_event", "neutral_flow")),
+                target_natural=target_natural,
+                desired_activity=activity_target,
+            )
+            hierarchy_score, _ = hierarchical_node_scores(hierarchy, query)
         base = (
             1.35 * style
             + 0.65 * quality
@@ -89,6 +106,7 @@ def choose_sequence(
             + 0.70 * compat
             + 0.45 * duration_match
             + 0.20 * activity_match
+            + float(hierarchy_weight) * hierarchy_score
         )
         shortlist = np.argsort(base)[::-1][: min(candidate_top_k, len(items))]
         best_idx = None
@@ -112,6 +130,7 @@ def main() -> None:
     parser.add_argument("--index_json", required=True)
     parser.add_argument("--duration_index_npz", required=True)
     parser.add_argument("--router_ckpt", required=True)
+    parser.add_argument("--hierarchy_index_npz", default="")
     parser.add_argument("--out_npz", required=True)
     parser.add_argument("--cache_dir", default="")
     parser.add_argument("--fps", type=float, default=30.0)
@@ -127,6 +146,8 @@ def main() -> None:
     parser.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
     parser.add_argument("--candidate_top_k", type=int, default=1200)
     parser.add_argument("--family_repeat_weight", type=float, default=0.55)
+    parser.add_argument("--hierarchical_retrieval", type=int, default=1)
+    parser.add_argument("--hierarchy_weight", type=float, default=0.55)
     parser.add_argument("--max_songs", type=int, default=0)
     args = parser.parse_args()
 
@@ -141,6 +162,7 @@ def main() -> None:
     missing = required.difference(arrays.files)
     if missing:
         raise RuntimeError(f"Duration index is missing arrays: {sorted(missing)}")
+    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     router = load_router_checkpoint(args.router_ckpt, device=device)
@@ -182,11 +204,14 @@ def main() -> None:
         selected = choose_sequence(
             phrases,
             arrays,
+            hierarchy,
             items,
             router,
             device,
             candidate_top_k=args.candidate_top_k,
             family_repeat_weight=args.family_repeat_weight,
+            hierarchical_retrieval=bool(args.hierarchical_retrieval),
+            hierarchy_weight=args.hierarchy_weight,
         )
         feat = np.stack([np.asarray(p.planner_feature, dtype=np.float32) for p in phrases])
         labels = np.asarray(

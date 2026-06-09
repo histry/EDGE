@@ -51,6 +51,12 @@ from tools.v21_common import (
 )
 from tools.v26_event_resampling import resample_event_with_v23
 from tools.v26_global_duration_alignment import allocate_whole_song_durations
+from tools.v26_hierarchical_graph_scheduler import (
+    build_slot_query,
+    graph_edge_penalty as hierarchical_graph_edge_penalty,
+    hierarchical_node_scores,
+    load_or_build_hierarchy,
+)
 from tools.v26_music_phrase_segmentation import (
     MusicPhrase,
     segment_music_phrases,
@@ -324,6 +330,7 @@ def choose_events(
     phrases: Sequence[MusicPhrase],
     predictions: Dict[str, np.ndarray],
     arrays,
+    hierarchy,
     items: List[Dict[str, Any]],
     router,
     motions: Sequence[np.ndarray],
@@ -416,6 +423,17 @@ def choose_events(
         turn_over = np.clip((turn_peak_dps - turn_soft) / (turn_hard - turn_soft), 0.0, 1.0)
         turn_angle_over = np.clip((turn_angle_deg - args.turn_angle_soft_deg) / max(args.turn_angle_hard_deg - args.turn_angle_soft_deg, 1.0), 0.0, 1.0)
         turn_penalty = 0.75 * turn_over + 0.25 * turn_angle_over
+        hierarchy_score = np.zeros_like(style, dtype=np.float32)
+        hierarchy_components: Dict[str, np.ndarray] = {}
+        hierarchy_query: Dict[str, Any] = {}
+        if args.hierarchical_retrieval:
+            hierarchy_query = build_slot_query(
+                phrase,
+                predicted_event=predicted_event,
+                target_natural=target_natural,
+                desired_activity=desired_activity,
+            )
+            hierarchy_score, hierarchy_components = hierarchical_node_scores(hierarchy, hierarchy_query)
         base = (
             args.style_weight * style
             + args.quality_weight * quality
@@ -425,6 +443,7 @@ def choose_events(
             + args.duration_weight * duration_match
             + args.planner_duration_weight * planner_duration_match
             + args.activity_weight * activity_match
+            + args.hierarchy_weight * hierarchy_score
             - args.anti_static_weight * anti_static_penalty
             - args.turn_peak_penalty_weight * turn_penalty
         )
@@ -449,6 +468,8 @@ def choose_events(
                 transition_cost = 0.0
                 boundary_velocity_penalty = 0.0
                 boundary_acceleration_penalty = 0.0
+                graph_edge_cost = 0.0
+                graph_edge_meta: Dict[str, Any] = {}
                 transition_meta: Dict[str, Any] = {}
                 if state.selected:
                     previous = state.selected[-1]
@@ -479,6 +500,17 @@ def choose_events(
                         class_index = int(predictions["transition_class"][slot])
                         transition_len = int(transition_choices[min(class_index, len(transition_choices) - 1)])
                         transition_meta = {"chosen_transition_frames": transition_len, "dominant_reason": "planner_class"}
+                    if args.graph_scheduler:
+                        prev_prev = state.selected[-2] if len(state.selected) >= 2 else None
+                        graph_edge_cost, graph_edge_meta = hierarchical_graph_edge_penalty(
+                            hierarchy,
+                            previous,
+                            idx,
+                            phrase,
+                            prev_prev_idx=prev_prev,
+                        )
+                        if args.graph_hard_prune and graph_edge_cost > args.graph_hard_prune_threshold:
+                            continue
                 mmr = 0.0
                 if state.selected:
                     mmr = max(float(mmr_embed[idx] @ mmr_embed[previous]) for previous in state.selected)
@@ -488,6 +520,7 @@ def choose_events(
                     - args.transition_weight * transition_cost
                     - args.boundary_velocity_penalty_weight * boundary_velocity_penalty
                     - args.boundary_acceleration_penalty_weight * boundary_acceleration_penalty
+                    - args.graph_edge_weight * graph_edge_cost
                     - args.mmr_weight * mmr
                     - args.family_repeat_weight * same_family
                     - args.source_repeat_weight * same_source
@@ -524,9 +557,19 @@ def choose_events(
                     "turn_peak_dps": float(turn_peak_dps[idx]),
                     "turn_angle_deg": float(turn_angle_deg[idx]),
                     "turn_penalty": float(turn_penalty[idx]),
+                    "hierarchy_enabled": bool(args.hierarchical_retrieval),
+                    "hierarchy_query_group": int(hierarchy_query.get("group", -1)) if hierarchy_query else -1,
+                    "hierarchy_score": float(hierarchy_score[idx]) if args.hierarchical_retrieval else 0.0,
+                    "hierarchy_hyper_score": float(hierarchy_components.get("hierarchy_hyper_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
+                    "hierarchy_coarse_score": float(hierarchy_components.get("hierarchy_coarse_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
+                    "hierarchy_activity_score": float(hierarchy_components.get("hierarchy_activity_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
+                    "hierarchy_turn_score": float(hierarchy_components.get("hierarchy_turn_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
                     "transition_cost": float(transition_cost),
                     "boundary_velocity_penalty": float(boundary_velocity_penalty),
                     "boundary_acceleration_penalty": float(boundary_acceleration_penalty),
+                    "graph_scheduler_enabled": bool(args.graph_scheduler),
+                    "graph_edge_cost": float(graph_edge_cost),
+                    "graph_edge_meta": graph_edge_meta,
                     "mmr_penalty": float(mmr),
                     "score": float(score),
                 }
@@ -550,6 +593,7 @@ def choose_events(
 def generate_one(
     audio_path: Path,
     arrays,
+    hierarchy,
     items,
     motions,
     router,
@@ -594,6 +638,7 @@ def generate_one(
         phrases,
         predictions,
         arrays,
+        hierarchy,
         items,
         router,
         motions,
@@ -717,6 +762,13 @@ def generate_one(
         "schedule": [],
         "boundary_metrics": boundary_reports,
         "timing_policy": {
+            "hierarchical_retrieval": bool(args.hierarchical_retrieval),
+            "graph_scheduler": bool(args.graph_scheduler),
+            "hierarchy_index_npz": str(args.hierarchy_index_npz),
+            "hierarchy_weight": float(args.hierarchy_weight),
+            "graph_edge_weight": float(args.graph_edge_weight),
+            "graph_hard_prune": bool(args.graph_hard_prune),
+            "graph_hard_prune_threshold": float(args.graph_hard_prune_threshold),
             "music_dominant_timing": bool(args.music_dominant_timing),
             "transition_min_frames": int(args.transition_min_frames),
             "transition_max_frames": int(args.transition_max_frames),
@@ -758,6 +810,7 @@ def main() -> None:
     parser.add_argument("--v23_ckpt", required=True)
     parser.add_argument("--planner_ckpt", default="")
     parser.add_argument("--transition_ckpt", default="")
+    parser.add_argument("--hierarchy_index_npz", default="")
     parser.add_argument("--feature_dir", default="")
     parser.add_argument("--start_pose", default="")
     parser.add_argument("--start_anchor_blend", type=int, default=8)
@@ -785,6 +838,12 @@ def main() -> None:
     parser.add_argument("--duration_weight", type=float, default=0.45)
     parser.add_argument("--planner_duration_weight", type=float, default=0.15)
     parser.add_argument("--activity_weight", type=float, default=0.25)
+    parser.add_argument("--hierarchical_retrieval", type=_bool_arg, default=True)
+    parser.add_argument("--hierarchy_weight", type=float, default=0.55)
+    parser.add_argument("--graph_scheduler", type=_bool_arg, default=True)
+    parser.add_argument("--graph_edge_weight", type=float, default=0.45)
+    parser.add_argument("--graph_hard_prune", type=_bool_arg, default=False)
+    parser.add_argument("--graph_hard_prune_threshold", type=float, default=1.35)
     parser.add_argument("--anti_static_weight", type=float, default=0.45)
     parser.add_argument("--anti_static_activity_threshold", type=float, default=0.030)
     parser.add_argument("--anti_static_min_content_frames", type=int, default=60)
@@ -843,6 +902,7 @@ def main() -> None:
         raise RuntimeError(
             "duration_index_npz lacks natural_duration. Run tools/build_v26_duration_index.py first."
         )
+    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz)
     motions = [
         load_motion(Path(str(item.get("pkl", item.get("path", "")))))
         for item in items
@@ -865,6 +925,7 @@ def main() -> None:
         motion, report = generate_one(
             path,
             arrays,
+            hierarchy,
             items,
             motions,
             router,
