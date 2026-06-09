@@ -447,7 +447,10 @@ def choose_events(
             - args.anti_static_weight * anti_static_penalty
             - args.turn_peak_penalty_weight * turn_penalty
         )
-        shortlist = np.argsort(base)[::-1][: min(args.candidate_top_k, len(items))]
+        node_top_k = int(args.candidate_top_k)
+        if args.graph_scheduler and int(args.graph_node_top_k) > 0:
+            node_top_k = min(node_top_k, int(args.graph_node_top_k))
+        shortlist = np.argsort(base)[::-1][: min(node_top_k, len(items))]
         expanded: List[CandidateState] = []
         for state in beam:
             for raw_idx in shortlist:
@@ -557,6 +560,8 @@ def choose_events(
                     "turn_peak_dps": float(turn_peak_dps[idx]),
                     "turn_angle_deg": float(turn_angle_deg[idx]),
                     "turn_penalty": float(turn_penalty[idx]),
+                    "candidate_top_k": int(args.candidate_top_k),
+                    "graph_node_top_k": int(node_top_k),
                     "hierarchy_enabled": bool(args.hierarchical_retrieval),
                     "hierarchy_query_group": int(hierarchy_query.get("group", -1)) if hierarchy_query else -1,
                     "hierarchy_score": float(hierarchy_score[idx]) if args.hierarchical_retrieval else 0.0,
@@ -583,7 +588,7 @@ def choose_events(
                 )
         if not expanded:
             raise RuntimeError(
-                f"No V26 candidate for phrase {slot}. Increase candidate_top_k or relax hard family uniqueness."
+                f"No V26 candidate for phrase {slot}. Increase candidate_top_k/graph_node_top_k or relax hard pruning."
             )
         expanded.sort(key=lambda state: state.score, reverse=True)
         beam = expanded[: args.beam_size]
@@ -766,6 +771,7 @@ def generate_one(
             "graph_scheduler": bool(args.graph_scheduler),
             "hierarchy_index_npz": str(args.hierarchy_index_npz),
             "hierarchy_weight": float(args.hierarchy_weight),
+            "graph_node_top_k": int(args.graph_node_top_k),
             "graph_edge_weight": float(args.graph_edge_weight),
             "graph_hard_prune": bool(args.graph_hard_prune),
             "graph_hard_prune_threshold": float(args.graph_hard_prune_threshold),
@@ -841,6 +847,7 @@ def main() -> None:
     parser.add_argument("--hierarchical_retrieval", type=_bool_arg, default=True)
     parser.add_argument("--hierarchy_weight", type=float, default=0.55)
     parser.add_argument("--graph_scheduler", type=_bool_arg, default=True)
+    parser.add_argument("--graph_node_top_k", type=int, default=96)
     parser.add_argument("--graph_edge_weight", type=float, default=0.45)
     parser.add_argument("--graph_hard_prune", type=_bool_arg, default=False)
     parser.add_argument("--graph_hard_prune_threshold", type=float, default=1.35)

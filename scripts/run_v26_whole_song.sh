@@ -72,6 +72,7 @@ python tools/schedule_v26_whole_song.py \
   --hierarchical_retrieval "${V26_HIERARCHICAL_RETRIEVAL:-1}" \
   --hierarchy_weight "${V26_HIERARCHY_WEIGHT:-0.55}" \
   --graph_scheduler "${V26_GRAPH_SCHEDULER:-1}" \
+  --graph_node_top_k "${V26_GRAPH_NODE_TOP_K:-96}" \
   --graph_edge_weight "${V26_GRAPH_EDGE_WEIGHT:-0.45}" \
   --graph_hard_prune "${V26_GRAPH_HARD_PRUNE:-0}" \
   --graph_hard_prune_threshold "${V26_GRAPH_HARD_PRUNE_THRESHOLD:-1.35}" \

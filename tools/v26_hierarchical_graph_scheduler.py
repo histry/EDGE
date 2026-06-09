@@ -76,27 +76,84 @@ def _one_hot(indices: np.ndarray, depth: int) -> np.ndarray:
     return out
 
 
-def _safe_unit_ball(vectors: np.ndarray, radius: np.ndarray) -> np.ndarray:
+def _l2_unit(vectors: np.ndarray) -> np.ndarray:
     vectors = np.asarray(vectors, dtype=np.float32)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    unit = vectors / np.maximum(norms, 1e-8)
-    return unit * np.clip(radius, 0.05, 0.95).reshape(-1, 1)
+    return vectors / np.maximum(norms, 1e-8)
 
 
-def poincare_distance_matrix(query: np.ndarray, points: np.ndarray) -> np.ndarray:
+def expmap0(tangent: np.ndarray, curvature: float = 1.0) -> np.ndarray:
+    """Map Euclidean tangent vectors at the origin into a Poincare ball.
+
+    exp_0^c(v) = tanh(sqrt(c)||v||) v / (sqrt(c)||v||)
+    """
+    c = max(float(curvature), 1e-6)
+    sqrt_c = float(np.sqrt(c))
+    tangent = np.asarray(tangent, dtype=np.float32)
+    norms = np.linalg.norm(tangent, axis=1, keepdims=True)
+    norms_safe = np.maximum(norms, 1e-8)
+    scale = np.tanh(sqrt_c * norms_safe) / (sqrt_c * norms_safe)
+    mapped = scale * tangent
+    max_norm = (1.0 - 1e-5) / sqrt_c
+    mapped_norms = np.linalg.norm(mapped, axis=1, keepdims=True)
+    shrink = np.minimum(1.0, max_norm / np.maximum(mapped_norms, 1e-8))
+    return (mapped * shrink).astype(np.float32)
+
+
+def tangent_to_poincare(
+    raw_vectors: np.ndarray,
+    radius_ratio: np.ndarray,
+    curvature: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Project Euclidean hierarchy features through tangent space.
+
+    ``radius_ratio`` is in [0, 1).  Small radii encode coarse/global body states
+    near the origin; large radii encode specific local gestures near the ball
+    boundary.  This keeps the hierarchy interpretation explicit instead of only
+    rescaling Euclidean vectors inside a unit ball.
+    """
+    c = max(float(curvature), 1e-6)
+    sqrt_c = float(np.sqrt(c))
+    unit = _l2_unit(raw_vectors)
+    radius_ratio = np.clip(np.asarray(radius_ratio, dtype=np.float32), 0.05, 0.95).reshape(-1, 1)
+    tangent_norm = np.arctanh(radius_ratio) / sqrt_c
+    tangent = unit * tangent_norm
+    embed = expmap0(tangent, curvature=c)
+    return embed.astype(np.float32), tangent.astype(np.float32)
+
+
+def _hierarchy_curvature(hierarchy: Mapping[str, np.ndarray] | None = None) -> float:
+    if not hierarchy:
+        return 1.0
+    value = hierarchy.get("hierarchy_curvature")
+    if value is None:
+        return 1.0
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    return float(arr[0]) if arr.size else 1.0
+
+
+def poincare_distance_matrix(query: np.ndarray, points: np.ndarray, curvature: float = 1.0) -> np.ndarray:
     """Distance from one query point to many Poincare-ball points."""
+    c = max(float(curvature), 1e-6)
+    sqrt_c = float(np.sqrt(c))
     q = np.asarray(query, dtype=np.float32).reshape(1, -1)
     p = np.asarray(points, dtype=np.float32)
-    q_norm = np.sum(q * q, axis=1, keepdims=True)
-    p_norm = np.sum(p * p, axis=1, keepdims=True).T
+    q_norm = np.sum(q * q, axis=1).reshape(-1)[0]
+    p_norm = np.sum(p * p, axis=1)
     diff = np.sum((p - q) * (p - q), axis=1)
-    denom = np.maximum((1.0 - q_norm.reshape(-1)[0]) * (1.0 - p_norm.reshape(-1)), 1e-6)
-    z = 1.0 + 2.0 * diff / denom
-    return np.arccosh(np.maximum(z, 1.0 + 1e-6)).astype(np.float32)
+    denom = np.maximum((1.0 - c * q_norm) * (1.0 - c * p_norm), 1e-6)
+    z = 1.0 + 2.0 * c * diff / denom
+    return (np.arccosh(np.maximum(z, 1.0 + 1e-6)) / sqrt_c).astype(np.float32)
 
 
-def poincare_pair_distance(a: np.ndarray, b: np.ndarray) -> float:
-    return float(poincare_distance_matrix(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)[None])[0])
+def poincare_pair_distance(a: np.ndarray, b: np.ndarray, curvature: float = 1.0) -> float:
+    return float(
+        poincare_distance_matrix(
+            np.asarray(a, dtype=np.float32),
+            np.asarray(b, dtype=np.float32)[None],
+            curvature=curvature,
+        )[0]
+    )
 
 
 def build_hierarchy_features(arrays: Any, items: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarray]:
@@ -138,10 +195,14 @@ def build_hierarchy_features(arrays: Any, items: Sequence[Mapping[str, Any]]) ->
     raw = np.concatenate([coarse, continuous], axis=1)
     specificity = np.clip(0.30 * activity01 + 0.28 * turn01 + 0.22 * style + 0.20 * duration01, 0.0, 1.0)
     radius = 0.18 + 0.72 * specificity
-    embed = _safe_unit_ball(raw, radius)
+    curvature = 1.0
+    embed, tangent = tangent_to_poincare(raw, radius, curvature=curvature)
 
     return {
         "hierarchy_embed": embed.astype(np.float32),
+        "hierarchy_tangent": tangent.astype(np.float32),
+        "hierarchy_radius": radius.astype(np.float32),
+        "hierarchy_curvature": np.asarray([curvature], dtype=np.float32),
         "body_code": body_code,
         "center_code": center_code,
         "gesture_code": gesture_code,
@@ -199,7 +260,8 @@ def build_slot_query(
         ]
     )
     radius = 0.18 + 0.72 * np.clip(0.34 * activity + 0.30 * turn + 0.20 * duration01 + 0.16 * boundary, 0.0, 1.0)
-    embed = _safe_unit_ball(raw[None], np.asarray([radius], dtype=np.float32))[0]
+    curvature = 1.0
+    embed, tangent = tangent_to_poincare(raw[None], np.asarray([radius], dtype=np.float32), curvature=curvature)
     return {
         "music_event": music_event,
         "group": group,
@@ -207,7 +269,10 @@ def build_slot_query(
         "turn": turn,
         "duration01": duration01,
         "boundary_strength": boundary,
-        "embed": embed.astype(np.float32),
+        "embed": embed[0].astype(np.float32),
+        "tangent": tangent[0].astype(np.float32),
+        "radius": float(radius),
+        "curvature": float(curvature),
     }
 
 
@@ -220,7 +285,8 @@ def hierarchical_node_scores(
     activity = np.asarray(hierarchy["activity01"], dtype=np.float32)
     turn = np.asarray(hierarchy["turn01"], dtype=np.float32)
     duration = np.asarray(hierarchy["duration01"], dtype=np.float32)
-    dist = poincare_distance_matrix(np.asarray(query["embed"], dtype=np.float32), embed)
+    curvature = _hierarchy_curvature(hierarchy)
+    dist = poincare_distance_matrix(np.asarray(query["embed"], dtype=np.float32), embed, curvature=curvature)
     # Convert distance to a bounded positive score.  Very close hierarchical
     # matches approach 1; distant points approach 0.
     hyper_score = np.exp(-0.55 * dist).astype(np.float32)
@@ -267,7 +333,8 @@ def graph_edge_penalty(
     calm = float(getattr(phrase, "calmness", 0.0))
     reset_allow = np.clip(0.22 + 0.55 * boundary_strength + (0.35 if music_event == "section_change" else 0.0), 0.0, 1.0)
 
-    hdist = poincare_pair_distance(embed[prev_idx], embed[idx])
+    curvature = _hierarchy_curvature(hierarchy)
+    hdist = poincare_pair_distance(embed[prev_idx], embed[idx], curvature=curvature)
     coarse_jump = float(abs(int(body[idx]) - int(body[prev_idx])) / 5.0)
     activity_jump = float(abs(float(activity[idx]) - float(activity[prev_idx])))
     turn_jump = float(abs(float(turn[idx]) - float(turn[prev_idx])))

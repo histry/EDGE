@@ -62,6 +62,7 @@ def choose_sequence(
     router,
     device: torch.device,
     candidate_top_k: int,
+    graph_node_top_k: int,
     family_repeat_weight: float,
     hierarchical_retrieval: bool,
     hierarchy_weight: float,
@@ -108,7 +109,10 @@ def choose_sequence(
             + 0.20 * activity_match
             + float(hierarchy_weight) * hierarchy_score
         )
-        shortlist = np.argsort(base)[::-1][: min(candidate_top_k, len(items))]
+        node_top_k = int(candidate_top_k)
+        if hierarchical_retrieval and int(graph_node_top_k) > 0:
+            node_top_k = min(node_top_k, int(graph_node_top_k))
+        shortlist = np.argsort(base)[::-1][: min(node_top_k, len(items))]
         best_idx = None
         best_score = -1e30
         for raw_idx in shortlist:
@@ -145,6 +149,7 @@ def main() -> None:
     parser.add_argument("--max_events_per_phrase", type=int, default=4)
     parser.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
     parser.add_argument("--candidate_top_k", type=int, default=1200)
+    parser.add_argument("--graph_node_top_k", type=int, default=0)
     parser.add_argument("--family_repeat_weight", type=float, default=0.55)
     parser.add_argument("--hierarchical_retrieval", type=int, default=1)
     parser.add_argument("--hierarchy_weight", type=float, default=0.55)
@@ -209,6 +214,7 @@ def main() -> None:
             router,
             device,
             candidate_top_k=args.candidate_top_k,
+            graph_node_top_k=args.graph_node_top_k,
             family_repeat_weight=args.family_repeat_weight,
             hierarchical_retrieval=bool(args.hierarchical_retrieval),
             hierarchy_weight=args.hierarchy_weight,

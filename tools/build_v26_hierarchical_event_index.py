@@ -56,6 +56,16 @@ def main() -> None:
         "activity01_percentiles": np.percentile(hierarchy["activity01"], [0, 25, 50, 75, 100]).round(6).tolist(),
         "turn01_percentiles": np.percentile(hierarchy["turn01"], [0, 25, 50, 75, 100]).round(6).tolist(),
         "duration01_percentiles": np.percentile(hierarchy["duration01"], [0, 25, 50, 75, 100]).round(6).tolist(),
+        "hierarchy_radius_percentiles": np.percentile(hierarchy["hierarchy_radius"], [0, 25, 50, 75, 100]).round(6).tolist(),
+        "hierarchy_embed_norm_percentiles": np.percentile(
+            np.linalg.norm(hierarchy["hierarchy_embed"], axis=1),
+            [0, 25, 50, 75, 100],
+        ).round(6).tolist(),
+        "hierarchy_tangent_norm_percentiles": np.percentile(
+            np.linalg.norm(hierarchy["hierarchy_tangent"], axis=1),
+            [0, 25, 50, 75, 100],
+        ).round(6).tolist(),
+        "hierarchy_curvature": float(np.asarray(hierarchy["hierarchy_curvature"]).reshape(-1)[0]),
     }
     if args.out_json:
         out_json = Path(args.out_json)
