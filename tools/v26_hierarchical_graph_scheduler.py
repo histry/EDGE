@@ -142,7 +142,7 @@ def learned_tangent_to_poincare(
     import torch
 
     ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-    state = ckpt.get("model", ckpt)
+    state = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
     config = ckpt.get("config", {})
     in_dim = int(config.get("in_dim", raw_vectors.shape[1]))
     hidden_dim = int(config.get("hidden_dim", 128))
@@ -157,6 +157,8 @@ def learned_tangent_to_poincare(
         torch.nn.GELU(),
         torch.nn.Linear(hidden_dim, out_dim),
     )
+    if any(str(k).startswith("net.") for k in state.keys()):
+        state = {str(k)[4:]: v for k, v in state.items() if str(k).startswith("net.")}
     model.load_state_dict(state)
     model.eval()
     with torch.no_grad():

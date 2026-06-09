@@ -650,6 +650,8 @@ def generate_one(
         enabled=bool(args.deep_music_features),
         model_name=str(args.deep_music_model),
         cache_dir=args.deep_music_cache or args.feature_dir,
+        require_deep=bool(args.require_deep_music),
+        min_deep_success=float(args.deep_music_min_success),
     )
     predictions = planner_predictions(phrases, planner_bundle, device)
     selected_state = choose_events(
@@ -805,6 +807,8 @@ def generate_one(
             "deep_music_features": bool(args.deep_music_features),
             "deep_music_model": str(args.deep_music_model),
             "deep_music_weight": float(args.deep_music_weight),
+            "require_deep_music": bool(args.require_deep_music),
+            "deep_music_min_success": float(args.deep_music_min_success),
             "graph_node_top_k": int(args.graph_node_top_k),
             "graph_edge_weight": float(args.graph_edge_weight),
             "graph_hard_prune": bool(args.graph_hard_prune),
@@ -890,6 +894,8 @@ def main() -> None:
     parser.add_argument("--deep_music_features", type=_bool_arg, default=False)
     parser.add_argument("--deep_music_model", default="clap")
     parser.add_argument("--deep_music_weight", type=float, default=0.25)
+    parser.add_argument("--require_deep_music", type=_bool_arg, default=False)
+    parser.add_argument("--deep_music_min_success", type=float, default=0.80)
     parser.add_argument("--graph_scheduler", type=_bool_arg, default=True)
     parser.add_argument("--graph_node_top_k", type=int, default=96)
     parser.add_argument("--graph_edge_weight", type=float, default=0.45)

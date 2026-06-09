@@ -80,6 +80,8 @@ python tools/schedule_v26_whole_song.py \
   --deep_music_features "${V27_DEEP_MUSIC_FEATURES:-0}" \
   --deep_music_model "${V27_DEEP_MUSIC_MODEL:-clap}" \
   --deep_music_weight "${V27_DEEP_MUSIC_WEIGHT:-0.25}" \
+  --require_deep_music "${V27_REQUIRE_DEEP_MUSIC:-0}" \
+  --deep_music_min_success "${V27_DEEP_MUSIC_MIN_SUCCESS:-0.80}" \
   --graph_scheduler "${V26_GRAPH_SCHEDULER:-1}" \
   --graph_node_top_k "${V26_GRAPH_NODE_TOP_K:-96}" \
   --graph_edge_weight "${V26_GRAPH_EDGE_WEIGHT:-0.45}" \

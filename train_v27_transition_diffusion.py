@@ -22,6 +22,12 @@ class TransitionDataset(torch.utils.data.Dataset):
         self.end = np.asarray(data["end"], dtype=np.float32)
         self.music = np.asarray(data["music"], dtype=np.float32)
         self.length = np.asarray(data["length"], dtype=np.float32)
+        self.sample_weight = (
+            np.asarray(data["sample_weight"], dtype=np.float32)
+            if "sample_weight" in data.files
+            else np.ones((len(self.target),), dtype=np.float32)
+        )
+        self.meta = json.loads(str(data["meta"].item())) if "meta" in data.files else {}
 
     def __len__(self) -> int:
         return int(len(self.target))
@@ -34,7 +40,14 @@ class TransitionDataset(torch.utils.data.Dataset):
             "end": self.end[idx],
             "music": self.music[idx],
             "length": self.length[idx],
+            "sample_weight": self.sample_weight[idx],
         }
+
+
+def masked_weighted_mse(pred: torch.Tensor, noise: torch.Tensor, mask: torch.Tensor, sample_weight: torch.Tensor) -> torch.Tensor:
+    per_sample = (((pred - noise) ** 2) * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+    weight = sample_weight.reshape(-1).clamp_min(1e-4)
+    return (per_sample * weight).sum() / weight.sum().clamp_min(1e-4)
 
 
 def train_epoch(model, loader, opt, device, diffusion_steps: int) -> float:
@@ -48,6 +61,7 @@ def train_epoch(model, loader, opt, device, diffusion_steps: int) -> float:
         end = batch["end"].to(device)
         music = batch["music"].to(device)
         length = batch["length"].to(device).reshape(-1, 1)
+        sample_weight = batch["sample_weight"].to(device).reshape(-1)
         b, k, _ = target.shape
         idx = torch.randint(0, diffusion_steps, (b,), device=device)
         noise = torch.randn_like(target)
@@ -56,7 +70,7 @@ def train_epoch(model, loader, opt, device, diffusion_steps: int) -> float:
         t = idx.float() / max(diffusion_steps - 1, 1)
         pos = torch.linspace(1.0 / (k + 1), k / (k + 1), k, device=device).reshape(1, k, 1).expand(b, -1, -1)
         pred = model(noisy, t, start, end, music, (length / 120.0).clamp(0, 1), pos)
-        loss = (((pred - noise) ** 2) * mask).sum() / mask.sum().clamp_min(1.0)
+        loss = masked_weighted_mse(pred, noise, mask, sample_weight)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -77,6 +91,7 @@ def eval_epoch(model, loader, device, diffusion_steps: int) -> float:
             end = batch["end"].to(device)
             music = batch["music"].to(device)
             length = batch["length"].to(device).reshape(-1, 1)
+            sample_weight = batch["sample_weight"].to(device).reshape(-1)
             b, k, _ = target.shape
             idx = torch.randint(0, diffusion_steps, (b,), device=device)
             noise = torch.randn_like(target)
@@ -85,7 +100,7 @@ def eval_epoch(model, loader, device, diffusion_steps: int) -> float:
             t = idx.float() / max(diffusion_steps - 1, 1)
             pos = torch.linspace(1.0 / (k + 1), k / (k + 1), k, device=device).reshape(1, k, 1).expand(b, -1, -1)
             pred = model(noisy, t, start, end, music, (length / 120.0).clamp(0, 1), pos)
-            loss = (((pred - noise) ** 2) * mask).sum() / mask.sum().clamp_min(1.0)
+            loss = masked_weighted_mse(pred, noise, mask, sample_weight)
             losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else 0.0
 
@@ -145,6 +160,7 @@ def main() -> None:
                         "music_dim": int(ds.music.shape[-1]),
                         "hidden_dim": int(args.hidden_dim),
                         "diffusion_steps": int(args.diffusion_steps),
+                        "dataset_meta": ds.meta,
                     },
                     "best_val_loss": float(best),
                     "epoch": int(epoch),
