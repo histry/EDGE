@@ -358,15 +358,13 @@ def dampen_event_edges_so3(
     positions = np.arange(len(x), dtype=np.float32)
 
     left_u = np.arange(n + 1, dtype=np.float32) / float(n)
-    # f'(0)=0 and f'(1)=1: ease out of the event start without
-    # unnecessarily slowing the untouched event center.
+    # f'(0)=0 and f'(1)=1: only ease the event start.
     left_eased = 2.0 * left_u**2 - left_u**3
     left_map = (1.0 - s) * np.arange(n + 1, dtype=np.float32) + s * n * left_eased
     positions[: n + 1] = left_map
 
     right_u = np.arange(n + 1, dtype=np.float32) / float(n)
-    # f'(0)=1 and f'(1)=0: retain the center velocity and ease into
-    # the event endpoint.
+    # f'(0)=1 and f'(1)=0: only ease into the event endpoint.
     right_eased = right_u + right_u**2 - right_u**3
     start = len(x) - n - 1
     right_map = start + (1.0 - s) * np.arange(n + 1, dtype=np.float32) + s * n * right_eased

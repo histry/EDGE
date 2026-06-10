@@ -1,40 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Train the V29 temporal transition diffusion model.
+"""Train EDGE V30 continuous SO(3) INR and latent diffusion.
 
-The historical filename is retained so existing experiment scripts can be
-upgraded by replacement.  V29 adds:
-  * source-group-disjoint train/validation splits;
-  * EMA inference weights;
-  * temporal dilated attention denoising;
-  * SO(3), velocity, acceleration, jerk, FK and endpoint losses;
-  * deterministic validation noise for meaningful checkpoint selection.
+The historical filename is retained for existing automation.  Training has two
+explicit stages:
+
+A. continuous transition autoencoding: encode a variable-length real/synthetic
+   interval into a compact latent and reconstruct it through an arbitrary-time
+   SO(3) residual INR;
+B. conditional latent diffusion: freeze the INR autoencoder and learn the
+   distribution of transition latents conditioned on endpoints, endpoint
+   velocities, music/event semantics and requested duration.
+
+Source-group-disjoint validation, deterministic validation noise, EMA weights,
+FK dynamics, angular dynamics and spectral losses are included by default.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from tools.v27_transition_diffusion import (
-    TemporalTransitionDenoiser,
-    _linear_beta_schedule,
-)
 from tools.v29_motion_geometry import (
     CONTACT,
     ROOT,
-    ROOT_Y,
-    ROT,
     angular_velocity_torch,
     geodesic_rotation_error_torch,
     motion_to_joint_positions_torch,
     project_motion_rotations_torch,
+)
+from tools.v30_continuous_inr import (
+    V30ContinuousTransitionSystem,
+    V30INRConfig,
+    linear_beta_schedule,
 )
 
 
@@ -47,149 +52,132 @@ class TransitionDataset(torch.utils.data.Dataset):
         self.end = np.asarray(data["end"], dtype=np.float32)
         self.music = np.asarray(data["music"], dtype=np.float32)
         self.length = np.asarray(data["length"], dtype=np.float32)
-        self.sample_weight = (
-            np.asarray(data["sample_weight"], dtype=np.float32)
-            if "sample_weight" in data.files
-            else np.ones((len(self.target),), dtype=np.float32)
+        self.sample_weight = np.asarray(
+            data["sample_weight"] if "sample_weight" in data.files else np.ones((len(self.target),)),
+            dtype=np.float32,
         )
-        self.sample_kind = (
-            np.asarray(data["sample_kind"], dtype=object)
-            if "sample_kind" in data.files
-            else np.asarray(["unknown"] * len(self.target), dtype=object)
+        self.sample_kind = np.asarray(
+            data["sample_kind"] if "sample_kind" in data.files else ["unknown"] * len(self.target),
+            dtype=object,
         )
-        self.start_group = (
-            np.asarray(data["start_group"], dtype=object)
-            if "start_group" in data.files
-            else np.asarray([f"sample:{i}" for i in range(len(self.target))], dtype=object)
+        self.start_group = np.asarray(
+            data["start_group"] if "start_group" in data.files else [f"sample:{i}" for i in range(len(self.target))],
+            dtype=object,
         )
-        self.end_group = (
-            np.asarray(data["end_group"], dtype=object)
-            if "end_group" in data.files
-            else self.start_group.copy()
+        self.end_group = np.asarray(
+            data["end_group"] if "end_group" in data.files else self.start_group,
+            dtype=object,
+        )
+        self.real_target = np.asarray(
+            data["real_target"] if "real_target" in data.files else np.ones((len(self.target),), dtype=np.bool_),
+            dtype=np.bool_,
         )
         self.meta = json.loads(str(data["meta"].item())) if "meta" in data.files else {}
 
     def __len__(self) -> int:
-        return int(len(self.target))
+        return len(self.target)
 
-    def __getitem__(self, idx: int):
-        length = int(self.length[idx])
-        start_velocity = (
-            self.target[idx, 0] - self.start[idx]
-            if length > 0 else np.zeros_like(self.start[idx])
-        )
-        end_velocity = (
-            self.end[idx] - self.target[idx, length - 1]
-            if length > 0 else np.zeros_like(self.end[idx])
-        )
+    def __getitem__(self, index: int) -> Dict[str, np.ndarray | float | int]:
+        length = max(1, int(self.length[index]))
+        start_velocity = self.target[index, 0] - self.start[index]
+        end_velocity = self.end[index] - self.target[index, length - 1]
         return {
-            "target": self.target[idx],
-            "mask": self.mask[idx],
-            "start": self.start[idx],
-            "end": self.end[idx],
-            "music": self.music[idx],
-            "length": self.length[idx],
-            "sample_weight": self.sample_weight[idx],
+            "target": self.target[index],
+            "mask": self.mask[index],
+            "start": self.start[index],
+            "end": self.end[index],
+            "music": self.music[index],
+            "length": self.length[index],
+            "sample_weight": self.sample_weight[index],
             "start_velocity": start_velocity.astype(np.float32),
             "end_velocity": end_velocity.astype(np.float32),
-            "index": idx,
+            "real_target": float(self.real_target[index]),
+            "index": int(index),
         }
 
 
 def source_disjoint_split(
     dataset: TransitionDataset,
-    val_ratio: float,
+    validation_ratio: float,
     seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
-    all_groups = sorted(
-        set(str(v) for v in dataset.start_group)
-        | set(str(v) for v in dataset.end_group)
+    groups = sorted(
+        set(str(value) for value in dataset.start_group)
+        | set(str(value) for value in dataset.end_group)
     )
     rng = np.random.default_rng(seed)
-    rng.shuffle(all_groups)
-    n_val_groups = max(1, int(round(len(all_groups) * val_ratio)))
-    val_groups = set(all_groups[:n_val_groups])
-    train_groups = set(all_groups[n_val_groups:])
-
-    train_indices = []
-    val_indices = []
-    dropped_cross = []
-    for i, (a, b) in enumerate(zip(dataset.start_group, dataset.end_group)):
-        a, b = str(a), str(b)
-        if a in val_groups and b in val_groups:
-            val_indices.append(i)
-        elif a in train_groups and b in train_groups:
-            train_indices.append(i)
+    rng.shuffle(groups)
+    validation_count = max(1, int(round(len(groups) * validation_ratio)))
+    validation_groups = set(groups[:validation_count])
+    training_groups = set(groups[validation_count:])
+    train, validation, cross = [], [], []
+    for index, (left, right) in enumerate(zip(dataset.start_group, dataset.end_group)):
+        left, right = str(left), str(right)
+        if left in validation_groups and right in validation_groups:
+            validation.append(index)
+        elif left in training_groups and right in training_groups:
+            train.append(index)
         else:
-            dropped_cross.append(i)
-
-    if len(train_indices) == 0 or len(val_indices) == 0:
-        # Conservative fallback: split by primary group while still keeping
-        # every identical primary group on one side.
-        train_indices, val_indices = [], []
-        for i, a in enumerate(dataset.start_group):
-            (val_indices if str(a) in val_groups else train_indices).append(i)
-        dropped_cross = []
-
-    if len(train_indices) == 0 or len(val_indices) == 0:
+            cross.append(index)
+    if not train or not validation:
         raise RuntimeError(
-            "Unable to form a non-empty source-disjoint split. "
-            "Increase dataset size or reduce --val_ratio."
+            "Unable to form non-empty source-disjoint train/validation sets. "
+            "Check source_group metadata or reduce --val_ratio."
         )
     meta = {
-        "num_groups": len(all_groups),
-        "num_train_groups": len(train_groups),
-        "num_val_groups": len(val_groups),
-        "num_train_samples": len(train_indices),
-        "num_val_samples": len(val_indices),
-        "num_cross_group_dropped": len(dropped_cross),
-        "val_groups": sorted(val_groups),
+        "num_groups": len(groups),
+        "num_train_groups": len(training_groups),
+        "num_val_groups": len(validation_groups),
+        "num_train_samples": len(train),
+        "num_val_samples": len(validation),
+        "num_cross_group_dropped": len(cross),
+        "validation_groups": sorted(validation_groups),
     }
-    return (
-        np.asarray(train_indices, dtype=np.int64),
-        np.asarray(val_indices, dtype=np.int64),
-        meta,
-    )
+    return np.asarray(train, np.int64), np.asarray(validation, np.int64), meta
 
 
 class EMA:
-    def __init__(self, model: torch.nn.Module, decay: float) -> None:
+    def __init__(self, module: torch.nn.Module, decay: float) -> None:
         self.decay = float(decay)
         self.shadow = {
             key: value.detach().clone()
-            for key, value in model.state_dict().items()
+            for key, value in module.state_dict().items()
         }
 
     @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
-        state = model.state_dict()
-        for key, value in state.items():
-            if not torch.is_floating_point(value):
-                self.shadow[key].copy_(value)
-            else:
+    def update(self, module: torch.nn.Module) -> None:
+        for key, value in module.state_dict().items():
+            if torch.is_floating_point(value):
                 self.shadow[key].lerp_(value.detach(), 1.0 - self.decay)
+            else:
+                self.shadow[key].copy_(value)
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
         return {key: value.clone() for key, value in self.shadow.items()}
 
 
-def _masked_per_sample(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    while mask.ndim < values.ndim:
-        mask = mask.unsqueeze(-1)
-    expanded = mask.expand_as(values).to(values.dtype)
-    dims = tuple(range(1, values.ndim))
-    return (values * expanded).sum(dim=dims) / expanded.sum(dim=dims).clamp_min(1.0)
+def _masked_per_sample(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    expanded = mask
+    while expanded.ndim < values.ndim:
+        expanded = expanded.unsqueeze(-1)
+    expanded = expanded.expand_as(values).to(values.dtype)
+    dimensions = tuple(range(1, values.ndim))
+    return (
+        (values * expanded).sum(dim=dimensions)
+        / expanded.sum(dim=dimensions).clamp_min(1.0)
+    )
 
 
-def _weighted_mean(
-    per_sample: torch.Tensor,
-    sample_weight: torch.Tensor,
-) -> torch.Tensor:
-    weight = sample_weight.reshape(-1).clamp_min(1e-4)
-    return (per_sample * weight).sum() / weight.sum().clamp_min(1e-4)
+def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.reshape(-1).clamp_min(1e-4)
+    return (values * weights).sum() / weights.sum().clamp_min(1e-4)
+
+
+def _difference(values: torch.Tensor, order: int) -> torch.Tensor:
+    result = values
+    for _ in range(order):
+        result = result[:, 1:] - result[:, :-1]
+    return result
 
 
 def _difference_mask(mask: torch.Tensor, order: int) -> torch.Tensor:
@@ -199,20 +187,56 @@ def _difference_mask(mask: torch.Tensor, order: int) -> torch.Tensor:
     return result
 
 
-def _diff(x: torch.Tensor, order: int) -> torch.Tensor:
-    result = x
-    for _ in range(order):
-        result = result[:, 1:] - result[:, :-1]
-    return result
+def _coordinates(length: torch.Tensor, maximum_length: int) -> torch.Tensor:
+    positions = torch.arange(
+        1, maximum_length + 1,
+        device=length.device,
+        dtype=length.dtype,
+    ).reshape(1, -1)
+    return (positions / (length.reshape(-1, 1) + 1.0)).clamp(0.0, 1.0)[..., None]
 
 
-def composite_loss(
-    model: torch.nn.Module,
+def _spectral_loss(
+    predicted_positions: torch.Tensor,
+    target_positions: torch.Tensor,
+    lengths: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Variable-length log-spectrum and high-frequency excess losses."""
+    spectral: List[torch.Tensor] = []
+    high_excess: List[torch.Tensor] = []
+    for batch_index in range(predicted_positions.shape[0]):
+        length = int(lengths[batch_index].item())
+        if length < 6:
+            continue
+        pred_velocity = torch.diff(
+            predicted_positions[batch_index, :length], dim=0
+        ).reshape(length - 1, -1)
+        target_velocity = torch.diff(
+            target_positions[batch_index, :length], dim=0
+        ).reshape(length - 1, -1)
+        pred_spectrum = torch.fft.rfft(pred_velocity, dim=0).abs()
+        target_spectrum = torch.fft.rfft(target_velocity, dim=0).abs()
+        spectral.append(F.smooth_l1_loss(
+            torch.log1p(pred_spectrum),
+            torch.log1p(target_spectrum),
+        ))
+        frequency_count = pred_spectrum.shape[0]
+        high_start = max(1, int(math.floor(0.55 * frequency_count)))
+        pred_high = pred_spectrum[high_start:].square().mean()
+        target_high = target_spectrum[high_start:].square().mean()
+        high_excess.append(F.relu(pred_high - 1.10 * target_high))
+    if not spectral:
+        zero = predicted_positions.new_tensor(0.0)
+        return zero, zero
+    return torch.stack(spectral).mean(), torch.stack(high_excess).mean()
+
+
+def autoencoder_loss(
+    system: V30ContinuousTransitionSystem,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
-    diffusion_steps: int,
     weights: Dict[str, float],
-    generator: torch.Generator | None = None,
+    deterministic_latent: bool,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     target = batch["target"].to(device)
     mask = batch["mask"].to(device)
@@ -223,125 +247,126 @@ def composite_loss(
     sample_weight = batch["sample_weight"].to(device).reshape(-1)
     start_velocity = batch["start_velocity"].to(device)
     end_velocity = batch["end_velocity"].to(device)
-    b, k, _ = target.shape
+    real_target = batch["real_target"].to(device).reshape(-1)
+    # Real samples receive a modest extra weight without erasing synthetic
+    # regularisation examples.
+    sample_weight = sample_weight * (1.0 + 0.35 * real_target)
 
-    _, _, alpha_bar = _linear_beta_schedule(diffusion_steps, device)
-    idx = torch.randint(
-        0, diffusion_steps, (b,), device=device, generator=generator
-    )
-    noise = torch.randn(
-        target.shape,
-        device=device,
-        dtype=target.dtype,
-        generator=generator,
-    )
-    ab = alpha_bar[idx].reshape(b, 1, 1)
-    noisy = torch.sqrt(ab) * target + torch.sqrt(1.0 - ab) * noise
-    t = idx.float() / max(diffusion_steps - 1, 1)
-    pos = torch.linspace(
-        1.0 / (k + 1), k / (k + 1), k, device=device
-    ).reshape(1, k, 1).expand(b, -1, -1)
-
-    pred_noise = model(
-        noisy,
-        t,
+    condition = system.condition(
         start,
         end,
+        start_velocity,
+        end_velocity,
         music,
-        (length / float(k)).clamp(0.0, 1.0),
-        pos,
-        mask=mask,
-        start_velocity=start_velocity,
-        end_velocity=end_velocity,
+        length,
     )
-    noise_per = _masked_per_sample((pred_noise - noise) ** 2, mask)
-    losses = {"noise": _weighted_mean(noise_per, sample_weight)}
+    mean, logvar = system.encode(target, mask, condition)
+    latent = system.reparameterize(
+        mean, logvar, deterministic=deterministic_latent
+    )
+    coordinate = _coordinates(length, target.shape[1])
+    predicted = system.decode(
+        latent,
+        start,
+        end,
+        start_velocity,
+        end_velocity,
+        condition,
+        coordinate,
+        length,
+    )
+    predicted = project_motion_rotations_torch(predicted)
+    target = project_motion_rotations_torch(target)
 
-    pred_x0 = (
-        noisy - torch.sqrt(1.0 - ab) * pred_noise
-    ) / torch.sqrt(ab).clamp_min(1e-6)
-    pred_x0 = project_motion_rotations_torch(pred_x0)
-    target_valid = project_motion_rotations_torch(target)
-
-    geo = geodesic_rotation_error_torch(pred_x0, target_valid) ** 2
+    losses: Dict[str, torch.Tensor] = {}
+    rotation = geodesic_rotation_error_torch(predicted, target).square()
     losses["rotation"] = _weighted_mean(
-        _masked_per_sample(geo, mask), sample_weight
+        _masked_per_sample(rotation, mask), sample_weight
     )
-
-    root_values = (pred_x0[..., ROOT] - target_valid[..., ROOT]) ** 2
     losses["root"] = _weighted_mean(
-        _masked_per_sample(root_values, mask), sample_weight
+        _masked_per_sample((predicted[..., ROOT] - target[..., ROOT]).square(), mask),
+        sample_weight,
     )
-
-    contact_values = (pred_x0[..., CONTACT] - target_valid[..., CONTACT]) ** 2
     losses["contact"] = _weighted_mean(
-        _masked_per_sample(contact_values, mask), sample_weight
-    )
-
-    pred_pos = motion_to_joint_positions_torch(pred_x0)
-    target_pos = motion_to_joint_positions_torch(target_valid)
-    losses["fk"] = _weighted_mean(
-        _masked_per_sample((pred_pos - target_pos) ** 2, mask),
+        _masked_per_sample((predicted[..., CONTACT] - target[..., CONTACT]).square(), mask),
         sample_weight,
     )
 
+    predicted_position = motion_to_joint_positions_torch(predicted)
+    target_position = motion_to_joint_positions_torch(target)
+    losses["fk"] = _weighted_mean(
+        _masked_per_sample((predicted_position - target_position).square(), mask),
+        sample_weight,
+    )
     for name, order in (("velocity", 1), ("acceleration", 2), ("jerk", 3)):
-        if k <= order:
-            losses[name] = pred_x0.new_tensor(0.0)
+        if target.shape[1] <= order:
+            losses[name] = target.new_tensor(0.0)
             continue
-        dmask = _difference_mask(mask, order)
-        pred_d = _diff(pred_pos, order)
-        target_d = _diff(target_pos, order)
+        difference_mask = _difference_mask(mask, order)
         losses[name] = _weighted_mean(
             _masked_per_sample(
-                F.smooth_l1_loss(pred_d, target_d, reduction="none"),
-                dmask,
+                F.smooth_l1_loss(
+                    _difference(predicted_position, order),
+                    _difference(target_position, order),
+                    reduction="none",
+                ),
+                difference_mask,
             ),
             sample_weight,
         )
 
-    angular_pred = angular_velocity_torch(pred_x0)
-    angular_target = angular_velocity_torch(target_valid)
-    if angular_pred.shape[-3] > 0:
-        angular_mask = _difference_mask(mask, 1)
-        losses["angular_velocity"] = _weighted_mean(
-            _masked_per_sample(
-                F.smooth_l1_loss(
-                    angular_pred, angular_target, reduction="none"
-                ),
-                angular_mask,
+    predicted_angular = angular_velocity_torch(predicted)
+    target_angular = angular_velocity_torch(target)
+    losses["angular_velocity"] = _weighted_mean(
+        _masked_per_sample(
+            F.smooth_l1_loss(
+                predicted_angular,
+                target_angular,
+                reduction="none",
             ),
-            sample_weight,
-        )
-    else:
-        losses["angular_velocity"] = pred_x0.new_tensor(0.0)
+            _difference_mask(mask, 1),
+        ),
+        sample_weight,
+    )
 
     lengths = mask.sum(dim=1).long().clamp_min(1)
-    batch_indices = torch.arange(b, device=device)
-    last_indices = lengths - 1
-    first_pred = pred_x0[:, 0]
-    last_pred = pred_x0[batch_indices, last_indices]
+    batch_indices = torch.arange(len(target), device=device)
+    last = lengths - 1
+    predicted_first = predicted[:, 0]
+    predicted_last = predicted[batch_indices, last]
+    target_first = target[:, 0]
+    target_last = target[batch_indices, last]
     endpoint_pose = (
-        F.smooth_l1_loss(first_pred, target_valid[:, 0], reduction="none").mean(dim=-1)
-        + F.smooth_l1_loss(
-            last_pred, target_valid[batch_indices, last_indices], reduction="none"
-        ).mean(dim=-1)
+        F.smooth_l1_loss(predicted_first, target_first, reduction="none").mean(dim=-1)
+        + F.smooth_l1_loss(predicted_last, target_last, reduction="none").mean(dim=-1)
     )
-    pred_start_vel = first_pred - start
-    pred_end_vel = end - last_pred
     endpoint_velocity = (
         F.smooth_l1_loss(
-            pred_start_vel, start_velocity, reduction="none"
+            predicted_first - start,
+            start_velocity,
+            reduction="none",
         ).mean(dim=-1)
         + F.smooth_l1_loss(
-            pred_end_vel, end_velocity, reduction="none"
+            end - predicted_last,
+            end_velocity,
+            reduction="none",
         ).mean(dim=-1)
     )
     losses["endpoint"] = _weighted_mean(
         endpoint_pose + endpoint_velocity, sample_weight
     )
 
-    total = pred_x0.new_tensor(0.0)
+    spectral, high_excess = _spectral_loss(
+        predicted_position, target_position, lengths
+    )
+    losses["spectral"] = spectral
+    losses["high_frequency"] = high_excess
+    losses["kl"] = 0.5 * torch.mean(
+        torch.exp(logvar) + mean.square() - 1.0 - logvar
+    )
+    losses["latent"] = mean.square().mean()
+
+    total = target.new_tensor(0.0)
     for name, value in losses.items():
         total = total + float(weights.get(name, 0.0)) * value
     metrics = {name: float(value.detach().cpu()) for name, value in losses.items()}
@@ -349,27 +374,26 @@ def composite_loss(
     return total, metrics
 
 
-def run_epoch(
-    model: torch.nn.Module,
+def _make_grad_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def run_autoencoder_epoch(
+    system: V30ContinuousTransitionSystem,
     loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer | None,
-    ema: EMA | None,
     device: torch.device,
-    diffusion_steps: int,
     weights: Dict[str, float],
     amp: bool,
     grad_clip: float,
-    eval_seed: int | None = None,
 ) -> Dict[str, float]:
     training = optimizer is not None
-    model.train(training)
-    totals: Dict[str, list[float]] = {}
-    scaler = torch.cuda.amp.GradScaler(enabled=amp and training and device.type == "cuda")
-    generator = None
-    if eval_seed is not None:
-        generator = torch.Generator(device=device)
-        generator.manual_seed(eval_seed)
-
+    system.train(training)
+    totals: Dict[str, List[float]] = {}
+    scaler = _make_grad_scaler(amp and training and device.type == "cuda")
     context = torch.enable_grad if training else torch.no_grad
     with context():
         for batch in loader:
@@ -380,22 +404,19 @@ def run_epoch(
                 dtype=torch.float16,
                 enabled=amp and device.type == "cuda",
             ):
-                loss, metrics = composite_loss(
-                    model,
+                loss, metrics = autoencoder_loss(
+                    system,
                     batch,
                     device,
-                    diffusion_steps,
                     weights,
-                    generator=generator,
+                    deterministic_latent=not training,
                 )
             if training:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                torch.nn.utils.clip_grad_norm_(system.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
-                if ema is not None:
-                    ema.update(model)
             for name, value in metrics.items():
                 totals.setdefault(name, []).append(value)
     return {
@@ -404,37 +425,199 @@ def run_epoch(
     }
 
 
+@torch.no_grad()
+def encode_subset(
+    system: V30ContinuousTransitionSystem,
+    dataset: TransitionDataset,
+    indices: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+    workers: int,
+) -> Dict[str, torch.Tensor]:
+    subset = torch.utils.data.Subset(dataset, indices.tolist())
+    loader = torch.utils.data.DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=True,
+    )
+    system.eval()
+    rows: Dict[str, List[torch.Tensor]] = {
+        "latent": [], "condition": [], "weight": [],
+    }
+    for batch in loader:
+        target = batch["target"].to(device)
+        mask = batch["mask"].to(device)
+        start = batch["start"].to(device)
+        end = batch["end"].to(device)
+        music = batch["music"].to(device)
+        length = batch["length"].to(device).reshape(-1, 1)
+        start_velocity = batch["start_velocity"].to(device)
+        end_velocity = batch["end_velocity"].to(device)
+        condition = system.condition(
+            start, end, start_velocity, end_velocity, music, length
+        )
+        mean, _ = system.encode(target, mask, condition)
+        rows["latent"].append(mean.cpu())
+        rows["condition"].append(condition.cpu())
+        rows["weight"].append(batch["sample_weight"].reshape(-1).float())
+    return {key: torch.cat(value, dim=0) for key, value in rows.items()}
+
+
+class LatentDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        latent: torch.Tensor,
+        condition: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        self.latent = latent.float()
+        self.condition = condition.float()
+        self.weight = weight.float()
+
+    def __len__(self) -> int:
+        return len(self.latent)
+
+    def __getitem__(self, index: int):
+        return self.latent[index], self.condition[index], self.weight[index]
+
+
+def latent_diffusion_epoch(
+    system: V30ContinuousTransitionSystem,
+    loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    ema: EMA | None,
+    latent_mean: torch.Tensor,
+    latent_std: torch.Tensor,
+    diffusion_steps: int,
+    condition_dropout: float,
+    device: torch.device,
+    amp: bool,
+    grad_clip: float,
+    seed: int | None = None,
+) -> Dict[str, float]:
+    training = optimizer is not None
+    system.diffusion.train(training)
+    scaler = _make_grad_scaler(amp and training and device.type == "cuda")
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+    _, _, alpha_bar = linear_beta_schedule(diffusion_steps, device)
+    losses: List[float] = []
+    x0_losses: List[float] = []
+    context = torch.enable_grad if training else torch.no_grad
+    with context():
+        for latent, condition, weight in loader:
+            latent = latent.to(device)
+            condition = condition.to(device)
+            weight = weight.to(device).reshape(-1).clamp_min(1e-4)
+            normalised = (latent - latent_mean) / latent_std
+            timestep = torch.randint(
+                0,
+                diffusion_steps,
+                (len(latent),),
+                device=device,
+                generator=generator,
+            )
+            noise = torch.randn(
+                normalised.shape,
+                device=device,
+                dtype=normalised.dtype,
+                generator=generator,
+            )
+            alpha = alpha_bar[timestep].reshape(-1, 1)
+            noisy = torch.sqrt(alpha) * normalised + torch.sqrt(1.0 - alpha) * noise
+            if training and condition_dropout > 0.0:
+                keep = (
+                    torch.rand((len(condition), 1), device=device) >= condition_dropout
+                ).to(condition.dtype)
+                model_condition = condition * keep
+            else:
+                model_condition = condition
+            time = timestep.float() / max(diffusion_steps - 1, 1)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp and device.type == "cuda",
+            ):
+                predicted_noise = system.diffusion(noisy, time, model_condition)
+                per_sample = (predicted_noise - noise).square().mean(dim=-1)
+                noise_loss = (per_sample * weight).sum() / weight.sum()
+                predicted_x0 = (
+                    noisy - torch.sqrt(1.0 - alpha) * predicted_noise
+                ) / torch.sqrt(alpha).clamp_min(1e-6)
+                x0_per_sample = F.smooth_l1_loss(
+                    predicted_x0, normalised, reduction="none"
+                ).mean(dim=-1)
+                x0_loss = (x0_per_sample * weight).sum() / weight.sum()
+                loss = noise_loss + 0.10 * x0_loss
+            if training:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(system.diffusion.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                if ema is not None:
+                    ema.update(system.diffusion)
+            losses.append(float(noise_loss.detach().cpu()))
+            x0_losses.append(float(x0_loss.detach().cpu()))
+    return {
+        "noise": float(np.mean(losses)) if losses else 0.0,
+        "x0": float(np.mean(x0_losses)) if x0_losses else 0.0,
+        "total": float(np.mean(losses) + 0.10 * np.mean(x0_losses)) if losses else 0.0,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--epochs", type=int, default=420)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--stage", choices=["all", "autoencoder", "diffusion"], default="all")
+    parser.add_argument("--autoencoder_ckpt", default="")
+    parser.add_argument("--ae_epochs", type=int, default=220)
+    parser.add_argument("--diffusion_epochs", type=int, default=320)
+    parser.add_argument("--batch_size", type=int, default=48)
+    parser.add_argument("--latent_batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1.5e-4)
+    parser.add_argument("--diffusion_lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--hidden_dim", type=int, default=384)
-    parser.add_argument("--num_blocks", type=int, default=10)
-    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--latent_dim", type=int, default=128)
+    parser.add_argument("--condition_dim", type=int, default=256)
+    parser.add_argument("--encoder_hidden", type=int, default=320)
+    parser.add_argument("--inr_hidden", type=int, default=320)
+    parser.add_argument("--inr_layers", type=int, default=5)
+    parser.add_argument("--fourier_bands", type=int, default=10)
+    parser.add_argument("--diffusion_hidden", type=int, default=512)
+    parser.add_argument("--diffusion_blocks", type=int, default=6)
     parser.add_argument("--dropout", type=float, default=0.08)
     parser.add_argument("--diffusion_steps", type=int, default=100)
+    parser.add_argument("--condition_dropout", type=float, default=0.10)
     parser.add_argument("--val_ratio", type=float, default=0.12)
-    parser.add_argument("--patience", type=int, default=70)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--ae_patience", type=int, default=55)
+    parser.add_argument("--diffusion_patience", type=int, default=70)
     parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--amp", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260610)
 
-    parser.add_argument("--w_noise", type=float, default=1.0)
-    parser.add_argument("--w_rotation", type=float, default=0.30)
+    parser.add_argument("--w_rotation", type=float, default=0.35)
     parser.add_argument("--w_root", type=float, default=0.20)
-    parser.add_argument("--w_contact", type=float, default=0.08)
-    parser.add_argument("--w_fk", type=float, default=0.35)
-    parser.add_argument("--w_velocity", type=float, default=0.45)
-    parser.add_argument("--w_acceleration", type=float, default=0.22)
-    parser.add_argument("--w_jerk", type=float, default=0.06)
-    parser.add_argument("--w_angular_velocity", type=float, default=0.18)
-    parser.add_argument("--w_endpoint", type=float, default=0.55)
+    parser.add_argument("--w_contact", type=float, default=0.06)
+    parser.add_argument("--w_fk", type=float, default=0.40)
+    parser.add_argument("--w_velocity", type=float, default=0.48)
+    parser.add_argument("--w_acceleration", type=float, default=0.24)
+    parser.add_argument("--w_jerk", type=float, default=0.08)
+    parser.add_argument("--w_angular_velocity", type=float, default=0.20)
+    parser.add_argument("--w_endpoint", type=float, default=0.75)
+    parser.add_argument("--w_spectral", type=float, default=0.16)
+    parser.add_argument("--w_high_frequency", type=float, default=0.08)
+    parser.add_argument("--w_kl", type=float, default=2e-4)
+    parser.add_argument("--w_latent", type=float, default=1e-4)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -442,52 +625,44 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    out_dir = Path(args.out_dir)
-    checkpoint_dir = out_dir / "checkpoints"
+    output = Path(args.out_dir)
+    checkpoint_dir = output / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     dataset = TransitionDataset(args.data)
-    train_indices, val_indices, split_meta = source_disjoint_split(
+    train_indices, validation_indices, split_meta = source_disjoint_split(
         dataset, args.val_ratio, args.seed
     )
-    train_ds = torch.utils.data.Subset(dataset, train_indices.tolist())
-    val_ds = torch.utils.data.Subset(dataset, val_indices.tolist())
     train_loader = torch.utils.data.DataLoader(
-        train_ds,
+        torch.utils.data.Subset(dataset, train_indices.tolist()),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=False,
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds,
+    validation_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(dataset, validation_indices.tolist()),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=False,
     )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TemporalTransitionDenoiser(
-        motion_dim=dataset.target.shape[-1],
-        music_dim=dataset.music.shape[-1],
-        hidden_dim=args.hidden_dim,
-        num_blocks=args.num_blocks,
-        num_heads=args.num_heads,
+    config = V30INRConfig(
+        motion_dim=int(dataset.target.shape[-1]),
+        music_dim=int(dataset.music.shape[-1]),
+        latent_dim=args.latent_dim,
+        condition_dim=args.condition_dim,
+        encoder_hidden=args.encoder_hidden,
+        inr_hidden=args.inr_hidden,
+        inr_layers=args.inr_layers,
+        fourier_bands=args.fourier_bands,
+        diffusion_hidden=args.diffusion_hidden,
+        diffusion_blocks=args.diffusion_blocks,
+        max_len=int(dataset.target.shape[1]),
         dropout=args.dropout,
-    ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.08
-    )
-    ema = EMA(model, decay=args.ema_decay)
-
+    system = V30ContinuousTransitionSystem(config).to(device)
     weights = {
-        "noise": args.w_noise,
         "rotation": args.w_rotation,
         "root": args.w_root,
         "contact": args.w_contact,
@@ -497,92 +672,234 @@ def main() -> None:
         "jerk": args.w_jerk,
         "angular_velocity": args.w_angular_velocity,
         "endpoint": args.w_endpoint,
+        "spectral": args.w_spectral,
+        "high_frequency": args.w_high_frequency,
+        "kl": args.w_kl,
+        "latent": args.w_latent,
     }
 
+    ae_best_path = checkpoint_dir / "best_autoencoder.pt"
+    ae_history: List[Dict[str, object]] = []
+    if args.stage in {"all", "autoencoder"}:
+        ae_parameters = list(system.condition_encoder.parameters()) + list(system.encoder.parameters()) + list(system.inr.parameters())
+        optimizer = torch.optim.AdamW(
+            ae_parameters, lr=args.lr, weight_decay=args.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(args.ae_epochs, 1), eta_min=args.lr * 0.08
+        )
+        best = float("inf")
+        bad_epochs = 0
+        for epoch in range(1, args.ae_epochs + 1):
+            train_metrics = run_autoencoder_epoch(
+                system, train_loader, optimizer, device, weights,
+                bool(args.amp), args.grad_clip,
+            )
+            validation_metrics = run_autoencoder_epoch(
+                system, validation_loader, None, device, weights,
+                False, args.grad_clip,
+            )
+            scheduler.step()
+            row = {
+                "epoch": epoch,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "train": train_metrics,
+                "val": validation_metrics,
+                "train_loss": train_metrics.get("total", 0.0),
+                "val_loss": validation_metrics.get("total", 0.0),
+            }
+            ae_history.append(row)
+            print(
+                f"[V30 INR-AE] epoch={epoch:04d} "
+                f"train={row['train_loss']:.6f} val={row['val_loss']:.6f} "
+                f"val_fk={validation_metrics.get('fk', 0.0):.6f} "
+                f"val_jerk={validation_metrics.get('jerk', 0.0):.6f} "
+                f"val_spectral={validation_metrics.get('spectral', 0.0):.6f}",
+                flush=True,
+            )
+            if float(row["val_loss"]) < best:
+                best = float(row["val_loss"])
+                bad_epochs = 0
+                torch.save(
+                    {
+                        "system": system.state_dict(),
+                        "config": asdict(config),
+                        "loss_weights": weights,
+                        "best_val_loss": best,
+                        "epoch": epoch,
+                        "split_meta": split_meta,
+                        "dataset_meta": dataset.meta,
+                    },
+                    ae_best_path,
+                )
+            else:
+                bad_epochs += 1
+                if bad_epochs >= args.ae_patience:
+                    print(f"[V30 INR-AE EARLY STOP] patience={args.ae_patience}")
+                    break
+        (output / "autoencoder_history.json").write_text(
+            json.dumps(ae_history, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    else:
+        ae_best_path = Path(args.autoencoder_ckpt)
+        if not ae_best_path.is_file():
+            raise FileNotFoundError("--autoencoder_ckpt is required for diffusion-only stage")
+
+    ae_checkpoint = torch.load(ae_best_path, map_location=device, weights_only=False)
+    system.load_state_dict(ae_checkpoint["system"])
+
+    if args.stage == "autoencoder":
+        (output / "BEST_V30_INR_AUTOENCODER_CKPT.txt").write_text(
+            str(ae_best_path), encoding="utf-8"
+        )
+        print(f"[SAVED] {ae_best_path}")
+        return
+
+    # Freeze the continuous representation before latent diffusion training.
+    for module in (system.condition_encoder, system.encoder, system.inr):
+        module.eval()
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+
+    train_encoded = encode_subset(
+        system, dataset, train_indices, args.batch_size,
+        device, args.num_workers,
+    )
+    validation_encoded = encode_subset(
+        system, dataset, validation_indices, args.batch_size,
+        device, args.num_workers,
+    )
+    latent_mean = train_encoded["latent"].mean(dim=0, keepdim=True).to(device)
+    latent_std = train_encoded["latent"].std(dim=0, keepdim=True).clamp_min(1e-3).to(device)
+    train_latent_dataset = LatentDataset(**train_encoded)
+    validation_latent_dataset = LatentDataset(**validation_encoded)
+    train_latent_loader = torch.utils.data.DataLoader(
+        train_latent_dataset,
+        batch_size=args.latent_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    validation_latent_loader = torch.utils.data.DataLoader(
+        validation_latent_dataset,
+        batch_size=args.latent_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    diffusion_optimizer = torch.optim.AdamW(
+        system.diffusion.parameters(),
+        lr=args.diffusion_lr,
+        weight_decay=args.weight_decay,
+    )
+    diffusion_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        diffusion_optimizer,
+        T_max=max(args.diffusion_epochs, 1),
+        eta_min=args.diffusion_lr * 0.08,
+    )
+    ema = EMA(system.diffusion, args.ema_decay)
+    best_path = checkpoint_dir / "best.pt"
     best = float("inf")
     bad_epochs = 0
-    history = []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(
-            model, train_loader, optimizer, ema, device,
-            args.diffusion_steps, weights, bool(args.amp),
+    diffusion_history: List[Dict[str, object]] = []
+    for epoch in range(1, args.diffusion_epochs + 1):
+        train_metrics = latent_diffusion_epoch(
+            system,
+            train_latent_loader,
+            diffusion_optimizer,
+            ema,
+            latent_mean,
+            latent_std,
+            args.diffusion_steps,
+            args.condition_dropout,
+            device,
+            bool(args.amp),
             args.grad_clip,
         )
-        val_metrics = run_epoch(
-            model, val_loader, None, None, device,
-            args.diffusion_steps, weights, False,
+        validation_metrics = latent_diffusion_epoch(
+            system,
+            validation_latent_loader,
+            None,
+            None,
+            latent_mean,
+            latent_std,
+            args.diffusion_steps,
+            0.0,
+            device,
+            False,
             args.grad_clip,
-            eval_seed=args.seed + 9173,
+            seed=args.seed + 9173,
         )
-        scheduler.step()
+        diffusion_scheduler.step()
         row = {
             "epoch": epoch,
-            "lr": float(optimizer.param_groups[0]["lr"]),
+            "lr": float(diffusion_optimizer.param_groups[0]["lr"]),
             "train": train_metrics,
-            "val": val_metrics,
-            # Backward-compatible scalar fields.
-            "train_loss": train_metrics.get("total", 0.0),
-            "val_loss": val_metrics.get("total", 0.0),
+            "val": validation_metrics,
+            "train_loss": train_metrics["total"],
+            "val_loss": validation_metrics["total"],
         }
-        history.append(row)
+        diffusion_history.append(row)
         print(
-            f"[V29 transition] epoch={epoch:04d} "
+            f"[V30 latent diffusion] epoch={epoch:04d} "
             f"train={row['train_loss']:.6f} val={row['val_loss']:.6f} "
-            f"val_noise={val_metrics.get('noise', 0.0):.6f} "
-            f"val_jerk={val_metrics.get('jerk', 0.0):.6f}",
+            f"val_noise={validation_metrics['noise']:.6f}",
             flush=True,
         )
-
-        score = float(row["val_loss"])
-        if score < best:
-            best = score
+        if float(row["val_loss"]) < best:
+            best = float(row["val_loss"])
             bad_epochs = 0
-            config = {
-                "architecture": "v29_temporal_dilated_attention",
-                "motion_dim": int(dataset.target.shape[-1]),
-                "music_dim": int(dataset.music.shape[-1]),
-                "hidden_dim": args.hidden_dim,
-                "num_blocks": args.num_blocks,
-                "num_heads": args.num_heads,
-                "dropout": args.dropout,
+            checkpoint_config = {
+                "architecture": "v30_continuous_so3_inr_latent_diffusion",
+                "model": asdict(config),
                 "diffusion_steps": args.diffusion_steps,
-                "max_len": int(dataset.target.shape[1]),
+                "condition_dropout": args.condition_dropout,
                 "loss_weights": weights,
-                "dataset_meta": dataset.meta,
                 "split_meta": split_meta,
+                "dataset_meta": dataset.meta,
                 "seed": args.seed,
             }
             torch.save(
                 {
-                    "model": model.state_dict(),
-                    "ema_model": ema.state_dict(),
-                    "config": config,
+                    "system": system.state_dict(),
+                    "ema_diffusion": ema.state_dict(),
+                    "config": checkpoint_config,
+                    "latent_mean": latent_mean.detach().cpu().numpy(),
+                    "latent_std": latent_std.detach().cpu().numpy(),
                     "best_val_loss": best,
                     "epoch": epoch,
-                    "val_metrics": val_metrics,
+                    "autoencoder_checkpoint": str(ae_best_path),
                 },
-                checkpoint_dir / "best.pt",
+                best_path,
             )
         else:
             bad_epochs += 1
-            if bad_epochs >= args.patience:
-                print(f"[EARLY STOP] patience={args.patience}", flush=True)
+            if bad_epochs >= args.diffusion_patience:
+                print(
+                    f"[V30 latent diffusion EARLY STOP] patience={args.diffusion_patience}"
+                )
                 break
 
-    (out_dir / "history.json").write_text(
-        json.dumps(history, ensure_ascii=False, indent=2),
+    (output / "diffusion_history.json").write_text(
+        json.dumps(diffusion_history, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    (out_dir / "split.json").write_text(
+    (output / "history.json").write_text(
+        json.dumps(diffusion_history, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (output / "split.json").write_text(
         json.dumps(split_meta, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    best_path = checkpoint_dir / "best.pt"
-    (out_dir / "BEST_V27_TRANSITION_DIFFUSION_CKPT.txt").write_text(
+    (output / "BEST_V27_TRANSITION_DIFFUSION_CKPT.txt").write_text(
         str(best_path), encoding="utf-8"
     )
-    (out_dir / "BEST_V29_TRANSITION_DIFFUSION_CKPT.txt").write_text(
+    (output / "BEST_V30_CONTINUOUS_INR_DIFFUSION_CKPT.txt").write_text(
         str(best_path), encoding="utf-8"
+    )
+    (output / "BEST_V30_INR_AUTOENCODER_CKPT.txt").write_text(
+        str(ae_best_path), encoding="utf-8"
     )
     print(f"[SAVED] {best_path}")
 
