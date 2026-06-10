@@ -1,58 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Backward-compatible transition generation entry point for EDGE V30.
+"""Backward-compatible safe transition entry point for EDGE V31.
 
-Existing schedulers import ``load_transition_diffusion`` and
-``sample_transition_diffusion`` from this historical path.  V30 keeps that
-contract but dispatches new checkpoints to continuous INR latent diffusion.
-Legacy V29 temporal-sequence checkpoints remain loadable for ablation runs.
+The historical module path is retained because the V26 scheduler imports it.
+V31 always constructs a deterministic C2 SO(3) baseline, samples several
+band-limited coefficient candidates, evaluates each candidate against the
+baseline, and falls back whenever learned generation is not demonstrably safe.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
-)
 
-from tools.v29_motion_geometry import (
-    CONTACT,
-    MOTION_DIM,
-    NUM_JOINTS,
-    ROOT,
-    ROOT_X,
-    ROOT_Z,
-    ROT,
-    make_so3_transition,
-    project_motion_rotations_np,
-    temporal_so3_filter_np,
-    transition_blend_envelope,
-)
-from tools.v30_continuous_inr import (
-    V30ContinuousTransitionSystem,
+from tools.v29_motion_geometry import MOTION_DIM
+from tools.v31_bandlimited_transition import (
+    V31TransitionModel,
     config_from_dict,
+    decode_coefficients,
     linear_beta_schedule,
     selected_timesteps,
 )
+from tools.v31_transition_quality import (
+    accept_candidate,
+    transition_risk,
+)
+
+_RISK_PREVIOUS: np.ndarray | None = None
+_RISK_FOLLOWING: np.ndarray | None = None
 
 
-def _load_raw_checkpoint(path: str | Path, device: torch.device) -> Dict[str, Any]:
-    checkpoint_path = Path(str(path))
-    if not checkpoint_path.is_file():
-        raise RuntimeError(f"Transition checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(
-        str(checkpoint_path), map_location=device, weights_only=False
+def set_transition_risk_context(
+    previous: np.ndarray,
+    following: np.ndarray,
+) -> None:
+    """Set exact neighbouring contents for the next sequential transition."""
+    global _RISK_PREVIOUS, _RISK_FOLLOWING
+    _RISK_PREVIOUS = np.asarray(previous, np.float32).copy()
+    _RISK_FOLLOWING = np.asarray(following, np.float32).copy()
+
+
+def _consume_transition_risk_context(
+    start: np.ndarray,
+    end: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    global _RISK_PREVIOUS, _RISK_FOLLOWING
+    previous = (
+        _RISK_PREVIOUS
+        if _RISK_PREVIOUS is not None
+        else np.stack([start, start], axis=0)
     )
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(f"Invalid transition checkpoint: {checkpoint_path}")
-    return checkpoint
+    following = (
+        _RISK_FOLLOWING
+        if _RISK_FOLLOWING is not None
+        else np.stack([end, end], axis=0)
+    )
+    _RISK_PREVIOUS = None
+    _RISK_FOLLOWING = None
+    return previous, following
 
 
 def load_transition_diffusion(
@@ -61,160 +69,111 @@ def load_transition_diffusion(
 ) -> Dict[str, Any] | None:
     if not path:
         return None
+    checkpoint_path = Path(str(path))
+    if not checkpoint_path.is_file():
+        raise RuntimeError(f"Transition checkpoint not found: {checkpoint_path}")
     device = torch.device(device)
-    checkpoint = _load_raw_checkpoint(path, device)
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
     config_values = dict(checkpoint.get("config", {}))
-    architecture = str(config_values.get("architecture", "legacy_frame_mlp"))
-
-    if architecture == "v30_continuous_so3_inr_latent_diffusion":
-        model_config = config_from_dict(
-            dict(config_values.get("model", config_values))
+    architecture = str(config_values.get("architecture", ""))
+    if architecture != "v31_bandlimited_so3_coefficient_diffusion":
+        raise RuntimeError(
+            f"Checkpoint architecture={architecture!r} is not V31. "
+            "Retrain with the V31 train_v27_transition_diffusion.py."
         )
-        system = V30ContinuousTransitionSystem(model_config).to(device)
-        state = checkpoint.get("system", checkpoint.get("model"))
-        if state is None:
-            raise RuntimeError("V30 checkpoint has no system/model state")
-        system.load_state_dict(state)
-        diffusion_state = checkpoint.get("ema_diffusion")
-        if diffusion_state is not None:
-            system.diffusion.load_state_dict(diffusion_state)
-        system.eval()
-        latent_mean = torch.as_tensor(
-            checkpoint.get("latent_mean", np.zeros((model_config.latent_dim,), np.float32)),
-            device=device,
-            dtype=torch.float32,
-        ).reshape(1, -1)
-        latent_std = torch.as_tensor(
-            checkpoint.get("latent_std", np.ones((model_config.latent_dim,), np.float32)),
-            device=device,
-            dtype=torch.float32,
-        ).reshape(1, -1).clamp_min(1e-4)
-        return {
-            "architecture": architecture,
-            "system": system,
-            "config": config_values,
-            "path": str(path),
-            "device": device,
-            "latent_mean": latent_mean,
-            "latent_std": latent_std,
-            "best_val_loss": checkpoint.get("best_val_loss"),
-            "epoch": checkpoint.get("epoch"),
-        }
+    model_config = config_from_dict(
+        dict(config_values.get("model", config_values))
+    )
+    model = V31TransitionModel(model_config).to(device)
+    model.load_state_dict(checkpoint["model"])
+    ema = checkpoint.get("ema_model")
+    if ema is not None:
+        model.load_state_dict(ema)
+    model.eval()
 
-    if architecture == "v29_temporal_dilated_attention":
-        from tools.v29_transition_diffusion_legacy import (
-            load_transition_diffusion as load_legacy,
+    def tensor(name: str) -> torch.Tensor:
+        if name not in checkpoint:
+            raise RuntimeError(f"V31 checkpoint missing {name}")
+        return torch.as_tensor(
+            checkpoint[name], device=device, dtype=torch.float32
         )
-        bundle = load_legacy(path, device=device)
-        if bundle is not None:
-            bundle["architecture"] = architecture
-        return bundle
 
-    raise RuntimeError(
-        f"Unsupported transition checkpoint architecture={architecture}. "
-        "Retrain with the V30 train_v27_transition_diffusion.py script."
+    return {
+        "architecture": architecture,
+        "model": model,
+        "config": config_values,
+        "path": str(checkpoint_path),
+        "device": device,
+        "coefficient_mean": tensor("coefficient_mean").reshape(1, -1),
+        "pca_components": tensor("pca_components"),
+        "score_mean": tensor("score_mean").reshape(1, -1),
+        "score_std": tensor("score_std").reshape(1, -1).clamp_min(1e-5),
+        "coefficient_abs_limit": tensor("coefficient_abs_limit").reshape(1, -1),
+        "best_val_loss": checkpoint.get("best_val_loss"),
+        "epoch": checkpoint.get("epoch"),
+    }
+
+
+def _seed(start: np.ndarray, end: np.ndarray, length: int, candidate: int) -> int:
+    base = int(os.getenv("V31_TRANSITION_SEED", "20260610"))
+    signature = int(np.round(
+        np.sum(np.abs(start[:48])) * 997.0
+        + np.sum(np.abs(end[:48])) * 1597.0
+    ))
+    return int(
+        (base + length * 65537 + candidate * 104729 + signature)
+        % (2**31 - 1)
     )
 
 
-def _geodesic_motion_blend(
-    base: np.ndarray,
-    generated: np.ndarray,
-    weight: np.ndarray,
-) -> np.ndarray:
-    a = np.asarray(base, dtype=np.float32)
-    b = np.asarray(generated, dtype=np.float32)
-    w = np.asarray(weight, dtype=np.float32).reshape(-1, 1)
-    if a.shape != b.shape or a.ndim != 2 or a.shape[-1] != MOTION_DIM:
-        raise ValueError(f"Blend expects matching [T,151], got {a.shape}, {b.shape}")
-    with torch.no_grad():
-        ra = rotation_6d_to_matrix(
-            torch.from_numpy(a[:, ROT]).reshape(len(a), NUM_JOINTS, 6)
-        )
-        rb = rotation_6d_to_matrix(
-            torch.from_numpy(b[:, ROT]).reshape(len(b), NUM_JOINTS, 6)
-        )
-        relative = torch.matmul(ra.transpose(-1, -2), rb)
-        tangent = matrix_to_axis_angle(relative)
-        alpha = torch.from_numpy(w).reshape(len(a), 1, 1)
-        rotation = torch.matmul(ra, axis_angle_to_matrix(alpha * tangent))
-        rot6d = matrix_to_rotation_6d(rotation).reshape(len(a), -1).cpu().numpy()
-    out = a.copy()
-    out[:, CONTACT] = (1.0 - w) * a[:, CONTACT] + w * b[:, CONTACT]
-    out[:, ROOT] = (1.0 - w) * a[:, ROOT] + w * b[:, ROOT]
-    out[:, ROT] = rot6d
-    out[:, ROOT_X] = 0.0
-    out[:, ROOT_Z] = 0.0
-    return project_motion_rotations_np(out)
+def _coordinates(length: int, device: torch.device) -> torch.Tensor:
+    return torch.linspace(
+        1.0 / (length + 1), length / (length + 1), length,
+        device=device,
+    ).reshape(1, length, 1)
 
 
-def _seed_for_transition(
-    start: np.ndarray,
-    end: np.ndarray,
-    length: int,
-) -> int:
-    base = int(os.getenv("V30_TRANSITION_SEED", "20260610"))
-    signature = int(
-        np.round(
-            np.sum(np.abs(start[: min(48, len(start))])) * 1009.0
-            + np.sum(np.abs(end[: min(48, len(end))])) * 1709.0
-        )
+def _inverse_pca(bundle: Dict[str, Any], normalized: torch.Tensor) -> torch.Tensor:
+    score = (
+        normalized * bundle["score_std"] + bundle["score_mean"]
     )
-    return int((base + int(length) * 65537 + signature) % (2**31 - 1))
+    flat = (
+        bundle["coefficient_mean"]
+        + score @ bundle["pca_components"]
+    )
+    limit = bundle["coefficient_abs_limit"]
+    flat = torch.maximum(torch.minimum(flat, limit), -limit)
+    model: V31TransitionModel = bundle["model"]
+    return flat.reshape(
+        flat.shape[0],
+        model.config.basis_count,
+        model.config.coefficient_dim,
+    )
 
 
-def _sample_v30(
+def _sample_normalized_score(
     bundle: Dict[str, Any],
-    start_frame: np.ndarray,
-    end_frame: np.ndarray,
-    length: int,
-    music_query: np.ndarray,
-    rough: np.ndarray | None,
-    device: torch.device,
-    blend: float,
+    condition: torch.Tensor,
     steps: int,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    system: V30ContinuousTransitionSystem = bundle["system"]
-    config_values = dict(bundle.get("config", {}))
-    diffusion_steps = int(config_values.get("diffusion_steps", 100))
-    k = int(length)
-    start_np = np.asarray(start_frame, dtype=np.float32).reshape(-1)
-    end_np = np.asarray(end_frame, dtype=np.float32).reshape(-1)
-    if rough is None or len(rough) != k:
-        rough_np = make_so3_transition(start_np[None], end_np[None], k)
-    else:
-        rough_np = np.asarray(rough, dtype=np.float32).copy()
-
-    start = torch.from_numpy(start_np).to(device).reshape(1, -1)
-    end = torch.from_numpy(end_np).to(device).reshape(1, -1)
-    rough_tensor = torch.from_numpy(rough_np).to(device).reshape(1, k, -1)
-    start_velocity = rough_tensor[:, 0] - start
-    end_velocity = end - rough_tensor[:, -1]
-    music = torch.from_numpy(
-        np.asarray(music_query, dtype=np.float32).reshape(1, -1)
-    ).to(device)
-    length_frames = torch.tensor([[float(k)]], device=device)
-    condition = system.condition(
-        start,
-        end,
-        start_velocity,
-        end_velocity,
-        music,
-        length_frames,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    model: V31TransitionModel = bundle["model"]
+    device = condition.device
+    diffusion_steps = int(
+        bundle["config"].get(
+            "diffusion_steps", model.config.diffusion_steps
+        )
     )
-
-    latent_mean = bundle["latent_mean"]
-    latent_std = bundle["latent_std"]
-    generator = torch.Generator(device=device)
-    generator.manual_seed(_seed_for_transition(start_np, end_np, k))
+    _, _, alpha_bar = linear_beta_schedule(diffusion_steps, device)
+    indices = selected_timesteps(diffusion_steps, steps, device)
     latent = torch.randn(
-        (1, system.config.latent_dim),
+        (1, model.config.pca_dim),
         device=device,
         generator=generator,
     )
-    _, _, alpha_bar = linear_beta_schedule(diffusion_steps, device)
-    indices = selected_timesteps(diffusion_steps, int(steps), device)
-    guidance = float(os.getenv("V30_LATENT_GUIDANCE", "1.20"))
-
+    guidance = float(os.getenv("V31_GUIDANCE", "1.0"))
     with torch.no_grad():
         for position, index in enumerate(indices):
             time = torch.full(
@@ -222,19 +181,21 @@ def _sample_v30(
                 float(index.item()) / max(diffusion_steps - 1, 1),
                 device=device,
             )
-            eps_cond = system.diffusion(latent, time, condition)
+            conditional = model.diffusion(latent, time, condition)
             if abs(guidance - 1.0) > 1e-6:
-                eps_uncond = system.diffusion(
+                unconditional = model.diffusion(
                     latent, time, torch.zeros_like(condition)
                 )
-                epsilon = eps_uncond + guidance * (eps_cond - eps_uncond)
+                epsilon = unconditional + guidance * (
+                    conditional - unconditional
+                )
             else:
-                epsilon = eps_cond
-            ab_t = alpha_bar[index]
+                epsilon = conditional
+            ab = alpha_bar[index]
             x0 = (
-                latent - torch.sqrt(1.0 - ab_t) * epsilon
-            ) / torch.sqrt(ab_t).clamp_min(1e-6)
-            x0 = x0.clamp(-6.0, 6.0)
+                latent - torch.sqrt(1.0 - ab) * epsilon
+            ) / torch.sqrt(ab).clamp_min(1e-6)
+            x0 = x0.clamp(-5.0, 5.0)
             if position + 1 < len(indices):
                 previous = indices[position + 1]
                 ab_previous = alpha_bar[previous]
@@ -244,64 +205,31 @@ def _sample_v30(
                 )
             else:
                 latent = x0
+    return latent
 
-        latent = latent * latent_std + latent_mean
-        coordinates = torch.linspace(
-            1.0 / (k + 1), k / (k + 1), k,
-            device=device,
-        ).reshape(1, k, 1)
-        generated = system.decode(
-            latent,
+
+def _decode(
+    model: V31TransitionModel,
+    coefficients: torch.Tensor,
+    start: torch.Tensor,
+    end: torch.Tensor,
+    start_velocity: torch.Tensor,
+    end_velocity: torch.Tensor,
+    length_frames: torch.Tensor,
+    length: int,
+) -> np.ndarray:
+    with torch.no_grad():
+        motion = decode_coefficients(
+            coefficients,
             start,
             end,
             start_velocity,
             end_velocity,
-            condition,
-            coordinates,
+            _coordinates(length, start.device),
             length_frames,
-        )[0].cpu().numpy().astype(np.float32)
-
-    # The INR is already endpoint-safe; the envelope is retained as a final
-    # conservative trust control for early experiments and ablations.
-    configured_blend = float(os.getenv("V30_INR_BLEND", str(blend)))
-    configured_blend = float(np.clip(configured_blend, 0.0, 1.0))
-    envelope_power = float(os.getenv("V30_INR_BLEND_POWER", "1.0"))
-    envelope = transition_blend_envelope(k, envelope_power)[:, None]
-    result = _geodesic_motion_blend(
-        rough_np,
-        generated,
-        configured_blend * envelope,
-    )
-
-    preserve_contacts = os.getenv("V30_PRESERVE_ROUGH_CONTACTS", "1").lower() in {
-        "1", "true", "yes", "on",
-    }
-    if preserve_contacts:
-        result[:, CONTACT] = rough_np[:, CONTACT]
-    filter_window = int(os.getenv("V30_TRANSITION_FILTER_WINDOW", "3"))
-    filter_strength = float(os.getenv("V30_TRANSITION_FILTER_STRENGTH", "0.10"))
-    if filter_window > 1 and filter_strength > 0.0:
-        result = temporal_so3_filter_np(
-            result,
-            window=filter_window,
-            strength=float(np.clip(filter_strength, 0.0, 1.0)),
-            preserve_contacts=preserve_contacts,
-        )
-    return result.astype(np.float32), {
-        "enabled": True,
-        "architecture": "v30_continuous_so3_inr_latent_diffusion",
-        "checkpoint": str(bundle.get("path", "")),
-        "latent_dim": int(system.config.latent_dim),
-        "decode_frames": k,
-        "continuous_time": True,
-        "diffusion_steps_used": int(len(indices)),
-        "diffusion_train_steps": int(diffusion_steps),
-        "guidance": guidance,
-        "inr_blend": configured_blend,
-        "filter_window": filter_window,
-        "filter_strength": filter_strength,
-        "preserve_contacts": preserve_contacts,
-    }
+            model.config,
+        )[0]
+    return motion.cpu().numpy().astype(np.float32)
 
 
 def sample_transition_diffusion(
@@ -312,53 +240,133 @@ def sample_transition_diffusion(
     music_query: np.ndarray,
     rough: np.ndarray | None = None,
     device: torch.device | str = "cpu",
-    blend: float = 0.85,
+    blend: float = 0.20,
     steps: int = 32,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    k = int(length)
-    if k <= 0:
-        return np.zeros((0, MOTION_DIM), dtype=np.float32), {
-            "enabled": False,
-            "reason": "zero_length",
+    length = int(length)
+    if length <= 0:
+        return np.zeros((0, MOTION_DIM), np.float32), {
+            "enabled": False, "reason": "zero_length"
         }
-    start_np = np.asarray(start_frame, dtype=np.float32).reshape(-1)
-    end_np = np.asarray(end_frame, dtype=np.float32).reshape(-1)
-    if bundle is None:
-        transition = (
-            np.asarray(rough, dtype=np.float32)
-            if rough is not None and len(rough) == k
-            else make_so3_transition(start_np[None], end_np[None], k)
-        )
-        return transition, {"enabled": False, "reason": "no_checkpoint"}
+    start_np = np.asarray(start_frame, np.float32).reshape(-1)
+    end_np = np.asarray(end_frame, np.float32).reshape(-1)
+    device = torch.device(device)
 
-    architecture = str(bundle.get("architecture", bundle.get("config", {}).get(
-        "architecture", ""
-    )))
-    if architecture == "v29_temporal_dilated_attention":
-        from tools.v29_transition_diffusion_legacy import (
-            sample_transition_diffusion as sample_legacy,
+    if bundle is None:
+        raise RuntimeError(
+            "V31 transition diffusion is enabled but no checkpoint was loaded"
         )
-        return sample_legacy(
-            bundle,
-            start_frame,
-            end_frame,
-            length,
-            music_query,
-            rough=rough,
-            device=device,
-            blend=blend,
-            steps=steps,
-        )
-    if architecture != "v30_continuous_so3_inr_latent_diffusion":
-        raise RuntimeError(f"Unsupported transition bundle: {architecture}")
-    return _sample_v30(
-        bundle,
-        start_frame,
-        end_frame,
-        length,
-        music_query,
-        rough,
-        torch.device(device),
-        blend,
-        steps,
+    model: V31TransitionModel = bundle["model"]
+    start = torch.from_numpy(start_np).to(device).reshape(1, -1)
+    end = torch.from_numpy(end_np).to(device).reshape(1, -1)
+
+    # Endpoint velocities are estimated from actual neighbouring contents, not
+    # from the old learned refiner.  The scheduler passes a rough path; use its
+    # first/last step when available, otherwise use zero tangents.
+    if rough is not None and len(rough) == length:
+        rough_np = np.asarray(rough, np.float32)
+        start_velocity_np = rough_np[0] - start_np
+        end_velocity_np = end_np - rough_np[-1]
+    else:
+        start_velocity_np = np.zeros_like(start_np)
+        end_velocity_np = np.zeros_like(end_np)
+    start_velocity = torch.from_numpy(start_velocity_np).to(device).reshape(1, -1)
+    end_velocity = torch.from_numpy(end_velocity_np).to(device).reshape(1, -1)
+    music = torch.from_numpy(
+        np.asarray(music_query, np.float32).reshape(1, -1)
+    ).to(device)
+    length_frames = torch.tensor(
+        [[float(length)]], device=device, dtype=torch.float32
     )
+    condition = model.condition(
+        start, end, start_velocity, end_velocity, music, length_frames
+    )
+
+    zero = torch.zeros(
+        (1, model.config.basis_count, model.config.coefficient_dim),
+        device=device,
+    )
+    baseline = _decode(
+        model, zero, start, end, start_velocity, end_velocity,
+        length_frames, length,
+    )
+
+    # The V31 scheduler supplies exact neighbouring content arrays. Direct
+    # standalone calls fall back to duplicated endpoint context.
+    previous, following = _consume_transition_risk_context(start_np, end_np)
+    baseline_risk = transition_risk(previous, baseline, following)
+
+    candidate_count = max(
+        1, int(os.getenv("V31_CANDIDATES", "6"))
+    )
+    trust = float(np.clip(
+        float(os.getenv("V31_RESIDUAL_TRUST", str(blend))),
+        0.0, 0.50,
+    ))
+    max_total_ratio = float(os.getenv("V31_MAX_TOTAL_RISK_RATIO", "1.02"))
+    max_boundary_ratio = float(os.getenv("V31_MAX_BOUNDARY_RATIO", "1.04"))
+    max_jerk_ratio = float(os.getenv("V31_MAX_JERK_RATIO", "1.03"))
+    max_foot_ratio = float(os.getenv("V31_MAX_FOOT_RATIO", "1.05"))
+    max_step = float(os.getenv("V31_MAX_ROTATION_STEP_RAD", "0.22"))
+
+    rows: List[Dict[str, Any]] = []
+    accepted: List[Tuple[float, np.ndarray, Dict[str, Any]]] = []
+    for candidate_index in range(candidate_count):
+        generator = torch.Generator(device=device)
+        generator.manual_seed(
+            _seed(start_np, end_np, length, candidate_index)
+        )
+        normalized = _sample_normalized_score(
+            bundle, condition, int(steps), generator
+        )
+        coefficients = _inverse_pca(bundle, normalized) * trust
+        candidate = _decode(
+            model, coefficients, start, end,
+            start_velocity, end_velocity, length_frames, length,
+        )
+        risk = transition_risk(previous, candidate, following)
+        is_safe, gate = accept_candidate(
+            baseline_risk,
+            risk,
+            max_total_ratio=max_total_ratio,
+            max_boundary_ratio=max_boundary_ratio,
+            max_jerk_ratio=max_jerk_ratio,
+            max_foot_ratio=max_foot_ratio,
+            max_rotation_step_rad=max_step,
+        )
+        row = {
+            "index": candidate_index,
+            "risk": risk,
+            "gate": gate,
+        }
+        rows.append(row)
+        if is_safe:
+            accepted.append((float(risk["total"]), candidate, row))
+
+    if accepted:
+        accepted.sort(key=lambda item: item[0])
+        selected = accepted[0]
+        result = selected[1]
+        selected_index = int(selected[2]["index"])
+        fallback = False
+    else:
+        result = baseline
+        selected_index = -1
+        fallback = True
+
+    return result.astype(np.float32), {
+        "enabled": True,
+        "architecture": "v31_bandlimited_so3_coefficient_diffusion",
+        "checkpoint": str(bundle.get("path", "")),
+        "continuous_time": True,
+        "basis_count": int(model.config.basis_count),
+        "pca_dim": int(model.config.pca_dim),
+        "candidate_count": candidate_count,
+        "accepted_count": len(accepted),
+        "selected_index": selected_index,
+        "fallback_to_c2_baseline": fallback,
+        "residual_trust": trust,
+        "guidance": float(os.getenv("V31_GUIDANCE", "1.0")),
+        "baseline_risk": baseline_risk,
+        "candidate_audit": rows,
+    }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build the V30 continuous-transition research dataset.
+"""Build the V31 risk-controlled band-limited transition dataset.
 
 The historical filename is retained for command compatibility.  V30 separates
 four supervision sources and records them explicitly:
@@ -373,7 +373,7 @@ def _load_external_prior(path: str | Path, store: SampleStore) -> int:
             end_event_id=f"external:{index}",
             start_group=f"external:{index}",
             end_group=f"external:{index}",
-            real_target=True,
+            real_target=False,
             source_path=str(prior_path),
         )
         count += 1
@@ -393,12 +393,13 @@ def main() -> None:
     parser.add_argument("--samples_per_event", type=int, default=6)
     parser.add_argument("--real_masks_per_boundary", type=int, default=3)
     parser.add_argument("--source_pairs_per_event", type=float, default=1.0)
-    parser.add_argument("--pseudo_pairs_per_event", type=float, default=0.25)
+    parser.add_argument("--pseudo_pairs_per_event", type=float, default=0.0)
     parser.add_argument("--condition_dropout", type=float, default=0.10)
     parser.add_argument("--max_source_gap", type=int, default=120)
-    parser.add_argument("--allow_synthetic_adjacent", type=int, default=1)
+    parser.add_argument("--allow_synthetic_adjacent", type=int, default=0)
     parser.add_argument("--require_real_boundary_count", type=int, default=0)
     parser.add_argument("--require_real_boundary_ratio", type=float, default=0.0)
+    parser.add_argument("--require_unique_real_boundary_count", type=int, default=0)
     parser.add_argument("--max_events", type=int, default=0)
     parser.add_argument("--pseudo_max_pose_deg", type=float, default=38.0)
     parser.add_argument("--pseudo_max_velocity_deg_s", type=float, default=220.0)
@@ -482,6 +483,7 @@ def main() -> None:
     actual_gap_count = 0
     real_boundary_mask_count = 0
     synthetic_adjacent_count = 0
+    unique_real_boundary_pairs: set[str] = set()
 
     for first, second in adjacent_pairs[:max_adjacent]:
         prev, nxt = motions[first], motions[second]
@@ -489,10 +491,14 @@ def main() -> None:
             continue
         start_a, end_a = bounds[first]
         start_b, end_b = bounds[second]
-        minimum_source_length = max(
-            (end_b or 0) + args.max_len + 4,
-            (start_b or 0) + args.max_len + 4,
-        )
+        # Only require the indexed boundary to exist. The V30 builder added
+        # max_len to this check, which rejected valid full sequences near the
+        # sequence tail and silently reduced real-boundary supervision.
+        maximum_bound = max(
+            value for value in (end_a, start_b, end_b)
+            if value is not None
+        ) if any(value is not None for value in (end_a, start_b, end_b)) else 0
+        minimum_source_length = maximum_bound + 2
         candidates = _candidate_source_paths(
             items[first],
             manifest,
@@ -510,47 +516,67 @@ def main() -> None:
             full_source is not None
             and end_a is not None
             and start_b is not None
-            and 0 <= end_a < start_b < len(full_source)
+            and 0 <= end_a < len(full_source)
+            and 0 <= start_b < len(full_source)
         ):
-            gap = full_source[end_a + 1 : start_b]
-            if args.min_len <= len(gap) <= args.max_source_gap:
-                k = min(len(gap), args.max_len)
-                store.add(
-                    target=_resample(gap, k),
-                    start=full_source[end_a],
-                    end=full_source[start_b],
-                    music=_drop_condition(condition, rng, args.condition_dropout),
-                    kind="source_gap_real",
-                    weight=2.00,
-                    start_event_id=event_a,
-                    end_event_id=event_b,
-                    start_group=groups[first],
-                    end_group=groups[second],
-                    real_target=True,
-                    source_path=source_path,
-                    source_start_frame=end_a + 1,
-                    source_end_frame=start_b,
-                )
-                actual_gap_count += 1
+            pair_key = f"{groups[first]}|{event_a}|{event_b}|{end_a}|{start_b}"
 
-            # Real masked intervals spanning the indexed event boundary.  This
-            # remains available when the two event crops are contiguous.
+            # A genuine omitted source interval exists only when there is at
+            # least one frame strictly between the two indexed events.
+            if end_a + 1 < start_b:
+                gap = full_source[end_a + 1 : start_b]
+                if args.min_len <= len(gap) <= args.max_source_gap:
+                    k = min(len(gap), args.max_len)
+                    store.add(
+                        target=_resample(gap, k),
+                        start=full_source[end_a],
+                        end=full_source[start_b],
+                        music=_drop_condition(
+                            condition, rng, args.condition_dropout
+                        ),
+                        kind="source_gap_real",
+                        weight=2.00,
+                        start_event_id=event_a,
+                        end_event_id=event_b,
+                        start_group=groups[first],
+                        end_group=groups[second],
+                        real_target=True,
+                        source_path=source_path,
+                        source_start_frame=end_a + 1,
+                        source_end_frame=start_b,
+                    )
+                    actual_gap_count += 1
+                    unique_real_boundary_pairs.add(pair_key)
+
+            # Mask a real interval around the annotated boundary. This remains
+            # valid for contiguous or mildly overlapping event crops.
             boundary = int(round(0.5 * (end_a + start_b)))
             for _ in range(max(0, args.real_masks_per_boundary)):
                 k = int(rng.integers(args.min_len, args.max_len + 1))
-                jitter = int(rng.integers(-max(1, k // 6), max(2, k // 6 + 1)))
+                jitter = int(rng.integers(
+                    -max(1, k // 8), max(2, k // 8 + 1)
+                ))
                 left = boundary - k // 2 - 1 + jitter
                 right = left + k + 1
                 if left < 0 or right >= len(full_source):
                     continue
-                # Require the hidden interval to genuinely cross the event boundary.
-                if not (left < end_a < right or left < start_b < right):
+                lower_boundary = min(end_a, start_b)
+                upper_boundary = max(end_a, start_b)
+                if not (
+                    left < lower_boundary < right
+                    or left < upper_boundary < right
+                ):
+                    continue
+                target = full_source[left + 1 : right]
+                if len(target) != k:
                     continue
                 store.add(
-                    target=full_source[left + 1 : right],
+                    target=target,
                     start=full_source[left],
                     end=full_source[right],
-                    music=_drop_condition(condition, rng, args.condition_dropout),
+                    music=_drop_condition(
+                        condition, rng, args.condition_dropout
+                    ),
                     kind="source_boundary_mask_real",
                     weight=2.20,
                     start_event_id=event_a,
@@ -563,6 +589,7 @@ def main() -> None:
                     source_end_frame=right,
                 )
                 real_boundary_mask_count += 1
+                unique_real_boundary_pairs.add(pair_key)
 
         if bool(args.allow_synthetic_adjacent):
             k = int(rng.integers(args.min_len, args.max_len + 1))
@@ -641,10 +668,19 @@ def main() -> None:
             "Real boundary ratio below strict publication threshold: "
             f"ratio={real_boundary_ratio:.4f}, required={args.require_real_boundary_ratio:.4f}."
         )
+    if len(unique_real_boundary_pairs) < int(
+        args.require_unique_real_boundary_count
+    ):
+        raise RuntimeError(
+            "Insufficient unique real boundaries: "
+            f"found={len(unique_real_boundary_pairs)}, "
+            f"required={args.require_unique_real_boundary_count}. "
+            "Multiple masks from one boundary do not count as independent evidence."
+        )
 
     music = np.stack(store.rows["music"]).astype(np.float32)
     meta = {
-        "version": "v30_continuous_inr_real_boundary_dataset",
+        "version": "v31_bandlimited_real_boundary_dataset",
         "num_samples": len(store),
         "num_events": n,
         "num_source_groups": len(set(groups)),
@@ -656,11 +692,14 @@ def main() -> None:
         "real_boundary_mask_count": real_boundary_mask_count,
         "real_boundary_total": real_boundary_total,
         "real_boundary_ratio": real_boundary_ratio,
+        "unique_real_boundary_count": len(unique_real_boundary_pairs),
         "synthetic_adjacent_count": synthetic_adjacent_count,
         "pseudo_requested": requested_pseudo,
         "pseudo_accepted": accepted,
         "pseudo_attempts": attempts,
         "external_prior_count": external_count,
+        "external_prior_is_real_target": False,
+        "bounds_convention": "source_start inclusive; source_end treated as indexed endpoint; real gaps use end+1:start",
         "music_nonzero_rate": float(np.mean(np.linalg.norm(music, axis=1) > 1e-6)),
         "sample_kind_counts": {str(k): int(v) for k, v in zip(kinds, counts)},
         "source_manifest": str(args.source_manifest),

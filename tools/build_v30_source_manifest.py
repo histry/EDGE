@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Audit event metadata and build a V30 full-sequence source manifest.
+"""Audit event metadata and build a V31 full-sequence source manifest.
 
 The output does not fabricate full source paths. It resolves only paths that
 exist and records unresolved groups so the researcher can repair them.
@@ -124,7 +124,7 @@ def main() -> None:
             })
 
     report = {
-        "version": "v30_full_sequence_source_manifest",
+        "version": "v31_full_sequence_source_manifest",
         "num_sources": len(sources),
         "resolved_sources": int(sum(bool(x.get("motion")) for x in sources.values())),
         "unresolved_sources": len(unresolved),

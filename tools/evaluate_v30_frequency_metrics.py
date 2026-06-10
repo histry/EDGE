@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Frequency, distribution and foot-dynamics evaluation for EDGE V30.
+"""Correct V31 frequency, distribution and foot-dynamics evaluator.
 
-Names are intentionally transparent:
-  * multi_scale_mmd is an RBF-kernel MMD over explicit kinematic descriptors;
-  * foot_motion_frechet is a Fréchet distance over explicit foot descriptors;
-  * neither is presented as a standard learned-encoder benchmark metric.
+This replaces the V30 evaluator whose helper `_spectrum_power` recursively
+called itself. Metrics are transparent internal descriptors; they are not
+presented as universal learned-encoder benchmarks.
 """
 from __future__ import annotations
 
@@ -24,83 +23,47 @@ from tools.v29_motion_geometry import (
     motion_to_joint_positions_np,
 )
 
-
 FOOT_JOINTS = (7, 8, 10, 11)
 
 
-def _load(path: str | Path) -> np.ndarray:
-    x = np.asarray(np.load(path, allow_pickle=True), np.float32)
-    if x.ndim == 3 and x.shape[0] == 1:
-        x = x[0]
-    if x.ndim != 2 or x.shape[-1] != 151:
-        raise ValueError(f"Expected [T,151], got {x.shape}")
-    return x
+def load_generated(path: str | Path) -> np.ndarray:
+    motion = np.asarray(np.load(path, allow_pickle=True), np.float32)
+    if motion.ndim == 3 and motion.shape[0] == 1:
+        motion = motion[0]
+    if motion.ndim != 2 or motion.shape[-1] != 151:
+        raise ValueError(f"Expected [T,151], got {motion.shape}")
+    return motion
 
 
-def _bands(power: np.ndarray, fps: float) -> Dict[str, float]:
-    frequency = np.arange(len(power), dtype=np.float32) * fps / max(2 * (len(power) - 1), 1)
-    total = float(power.sum()) + 1e-10
-    low = float(power[frequency < 2.0].sum() / total)
-    mid = float(power[(frequency >= 2.0) & (frequency < 6.0)].sum() / total)
-    high = float(power[frequency >= 6.0].sum() / total)
-    probability = power / total
-    entropy = float(
-        -(probability * np.log(probability + 1e-10)).sum()
-        / np.log(max(len(probability), 2))
-    )
-    return {
-        "low_below_2hz_ratio": low,
-        "mid_2_to_6hz_ratio": mid,
-        "high_above_6hz_ratio": high,
-        "spectral_entropy": entropy,
-    }
-
-
-def _spectrum_power(motion: np.ndarray, fps: float) -> Tuple[np.ndarray, np.ndarray]:
-    _frequency, power = _spectrum_power(motion, fps)
-    frequency = np.arange(len(power), dtype=np.float32) * fps / max(2 * (len(power) - 1), 1)
-    return frequency, power
-
-
-def spectrum_metrics(motion: np.ndarray, fps: float) -> Dict[str, float]:
+def spectrum_power(
+    motion: np.ndarray, fps: float
+) -> Tuple[np.ndarray, np.ndarray]:
     positions = motion_to_joint_positions_np(motion)
     local = positions - positions[:, :1]
     velocity = np.diff(local, axis=0) * fps
     acceleration = np.diff(velocity, axis=0) * fps
     jerk = np.diff(acceleration, axis=0) * fps
-    signal = jerk.reshape(len(jerk), -1) if len(jerk) else acceleration.reshape(len(acceleration), -1)
-    coefficients = dct(signal, axis=0, norm="ortho")
-    power = np.mean(coefficients**2, axis=1)
-    result = _bands(power, fps)
-    result["dct_total_energy"] = float(power.sum())
-    result["dct_high_low_ratio"] = float(
-        result["high_above_6hz_ratio"] / max(result["low_below_2hz_ratio"], 1e-8)
+    signal = (
+        jerk.reshape(len(jerk), -1)
+        if len(jerk)
+        else acceleration.reshape(len(acceleration), -1)
     )
-    return result
+    if len(signal) < 2:
+        return np.zeros((0,), np.float32), np.zeros((0,), np.float32)
+    coefficient = dct(signal, axis=0, norm="ortho")
+    power = np.mean(coefficient**2, axis=1).astype(np.float32)
+    frequency = (
+        np.arange(len(power), dtype=np.float32)
+        * fps
+        / max(2 * (len(power) - 1), 1)
+    )
+    return frequency, power
 
 
-
-def transition_segments(motion: np.ndarray, report_path: str) -> List[np.ndarray]:
-    if not report_path or not Path(report_path).is_file():
-        return []
-    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    allocation = report.get("allocation", {})
-    boundaries = [int(x) for x in allocation.get("output_boundaries", [])]
-    lengths = [int(x) for x in allocation.get("transition_lengths", [])]
-    result = []
-    for slot in range(1, min(len(boundaries), len(lengths))):
-        start = boundaries[slot]
-        end = min(len(motion), start + lengths[slot])
-        if end - start >= 6:
-            result.append(motion[start:end])
-    return result
-
-
-def aggregate_transition_spectrum(segments: List[np.ndarray], fps: float) -> Dict[str, float]:
-    rows = [spectrum_metrics(segment, fps) for segment in segments if len(segment) >= 6]
-    if not rows:
+def band_metrics(motion: np.ndarray, fps: float) -> Dict[str, float]:
+    frequency, power = spectrum_power(motion, fps)
+    if not len(power):
         return {
-            "num_transitions": 0,
             "low_below_2hz_ratio": 0.0,
             "mid_2_to_6hz_ratio": 0.0,
             "high_above_6hz_ratio": 0.0,
@@ -108,48 +71,103 @@ def aggregate_transition_spectrum(segments: List[np.ndarray], fps: float) -> Dic
             "dct_total_energy": 0.0,
             "dct_high_low_ratio": 0.0,
         }
-    keys = rows[0].keys()
+    total = float(power.sum()) + 1e-12
+    low = float(power[frequency < 2.0].sum() / total)
+    middle = float(
+        power[(frequency >= 2.0) & (frequency < 6.0)].sum() / total
+    )
+    high = float(power[frequency >= 6.0].sum() / total)
+    probability = power / total
+    entropy = float(
+        -(probability * np.log(probability + 1e-12)).sum()
+        / np.log(max(len(probability), 2))
+    )
     return {
-        "num_transitions": len(rows),
-        **{key: float(np.mean([row[key] for row in rows])) for key in keys},
+        "low_below_2hz_ratio": low,
+        "mid_2_to_6hz_ratio": middle,
+        "high_above_6hz_ratio": high,
+        "spectral_entropy": entropy,
+        "dct_total_energy": total,
+        "dct_high_low_ratio": high / max(low, 1e-8),
     }
 
 
-def foot_descriptor(motion: np.ndarray, fps: float) -> Tuple[np.ndarray, Dict[str, float]]:
+def transition_segments(
+    motion: np.ndarray, report_path: str
+) -> List[np.ndarray]:
+    if not report_path or not Path(report_path).is_file():
+        return []
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    allocation = report.get("allocation", {})
+    boundaries = [int(x) for x in allocation.get("output_boundaries", [])]
+    lengths = [int(x) for x in allocation.get("transition_lengths", [])]
+    segments = []
+    for slot in range(1, min(len(boundaries), len(lengths))):
+        start = boundaries[slot]
+        end = min(len(motion), start + lengths[slot])
+        if end - start >= 8:
+            segments.append(motion[start:end])
+    return segments
+
+
+def aggregate_spectrum(
+    segments: List[np.ndarray], fps: float
+) -> Dict[str, float]:
+    rows = [band_metrics(segment, fps) for segment in segments]
+    if not rows:
+        return {"num_transitions": 0, **band_metrics(
+            np.zeros((2, 151), np.float32), fps
+        )}
+    return {
+        "num_transitions": len(rows),
+        **{
+            key: float(np.mean([row[key] for row in rows]))
+            for key in rows[0]
+        },
+    }
+
+
+def foot_descriptor(
+    motion: np.ndarray, fps: float
+) -> Tuple[np.ndarray, Dict[str, float]]:
     positions = motion_to_joint_positions_np(motion)
     feet = positions[:, FOOT_JOINTS]
     velocity = np.diff(feet, axis=0, prepend=feet[:1]) * fps
-    speed = np.linalg.norm(velocity, axis=-1)
+    speed = np.linalg.vector_norm(velocity, axis=-1)
     contacts = np.asarray(motion[:, CONTACT] > 0.5)
-    if contacts.shape[1] != 4:
-        contacts = speed < np.percentile(speed, 25)
-    slide_values = speed[contacts]
-    descriptor = np.asarray(
-        [
-            speed.mean(),
-            speed.std(),
-            np.percentile(speed, 95),
-            float(slide_values.mean()) if slide_values.size else 0.0,
-            float(np.percentile(slide_values, 95)) if slide_values.size else 0.0,
-            np.abs(np.diff(contacts.astype(np.float32), axis=0)).mean(),
-            feet[..., 1].mean(),
-            feet[..., 1].std(),
-        ],
-        np.float32,
-    )
+    slide = speed[contacts]
+    descriptor = np.asarray([
+        speed.mean(),
+        speed.std(),
+        np.percentile(speed, 95),
+        slide.mean() if slide.size else 0.0,
+        np.percentile(slide, 95) if slide.size else 0.0,
+        np.abs(np.diff(contacts.astype(np.float32), axis=0)).mean()
+        if len(contacts) > 1 else 0.0,
+        feet[..., 1].mean(),
+        feet[..., 1].std(),
+    ], np.float32)
     return descriptor, {
-        "contact_slide_mean": float(slide_values.mean()) if slide_values.size else 0.0,
-        "contact_slide_p95": float(np.percentile(slide_values, 95)) if slide_values.size else 0.0,
-        "contact_switch_rate": float(
-            np.abs(np.diff(contacts.astype(np.float32), axis=0)).mean()
-        ) if len(contacts) > 1 else 0.0,
+        "contact_slide_mean": float(slide.mean()) if slide.size else 0.0,
+        "contact_slide_p95": (
+            float(np.percentile(slide, 95)) if slide.size else 0.0
+        ),
+        "contact_switch_rate": (
+            float(np.abs(np.diff(
+                contacts.astype(np.float32), axis=0
+            )).mean())
+            if len(contacts) > 1 else 0.0
+        ),
     }
 
 
 def window_features(
-    motion: np.ndarray, fps: float, window: int = 60, stride: int = 30
-) -> np.ndarray:
-    rows: List[np.ndarray] = []
+    motion: np.ndarray,
+    fps: float,
+    window: int = 60,
+    stride: int = 30,
+) -> Tuple[np.ndarray, np.ndarray]:
+    motion_rows, foot_rows = [], []
     for start in range(0, max(1, len(motion) - window + 1), stride):
         segment = motion[start : start + window]
         if len(segment) < 12:
@@ -159,78 +177,107 @@ def window_features(
         velocity = np.diff(local, axis=0) * fps
         acceleration = np.diff(velocity, axis=0) * fps
         jerk = np.diff(acceleration, axis=0) * fps
+        spectrum = band_metrics(segment, fps)
         foot, _ = foot_descriptor(segment, fps)
-        spectral = spectrum_metrics(segment, fps)
-        rows.append(np.concatenate([
+        motion_rows.append(np.concatenate([
             np.asarray([
-                np.linalg.norm(velocity, axis=-1).mean(),
-                np.linalg.norm(velocity, axis=-1).std(),
-                np.linalg.norm(acceleration, axis=-1).mean(),
-                np.percentile(np.linalg.norm(acceleration, axis=-1), 95),
-                np.linalg.norm(jerk, axis=-1).mean() if len(jerk) else 0.0,
-                np.percentile(np.linalg.norm(jerk, axis=-1), 95) if len(jerk) else 0.0,
-                spectral["low_below_2hz_ratio"],
-                spectral["high_above_6hz_ratio"],
+                np.linalg.vector_norm(velocity, axis=-1).mean(),
+                np.linalg.vector_norm(velocity, axis=-1).std(),
+                np.linalg.vector_norm(acceleration, axis=-1).mean(),
+                np.percentile(
+                    np.linalg.vector_norm(acceleration, axis=-1), 95
+                ),
+                np.linalg.vector_norm(jerk, axis=-1).mean()
+                if len(jerk) else 0.0,
+                np.percentile(
+                    np.linalg.vector_norm(jerk, axis=-1), 95
+                ) if len(jerk) else 0.0,
+                spectrum["low_below_2hz_ratio"],
+                spectrum["high_above_6hz_ratio"],
             ], np.float32),
             foot,
         ]))
-    return np.stack(rows).astype(np.float32) if rows else np.zeros((0, 16), np.float32)
+        foot_rows.append(foot)
+    return (
+        np.stack(motion_rows).astype(np.float32)
+        if motion_rows else np.zeros((0, 16), np.float32),
+        np.stack(foot_rows).astype(np.float32)
+        if foot_rows else np.zeros((0, 8), np.float32),
+    )
 
 
-def _rbf_mmd(a: np.ndarray, b: np.ndarray, scales=(0.5, 1.0, 2.0, 4.0)) -> float:
-    if len(a) < 2 or len(b) < 2:
+def rbf_mmd(
+    first: np.ndarray,
+    second: np.ndarray,
+    scales=(0.5, 1.0, 2.0, 4.0),
+) -> float:
+    if len(first) < 2 or len(second) < 2:
         return 0.0
-    combined = np.concatenate([a, b], axis=0)
-    scale = np.std(combined, axis=0, keepdims=True) + 1e-6
-    a = a / scale
-    b = b / scale
-    aa = np.sum((a[:, None] - a[None]) ** 2, axis=-1)
-    bb = np.sum((b[:, None] - b[None]) ** 2, axis=-1)
-    ab = np.sum((a[:, None] - b[None]) ** 2, axis=-1)
-    value = 0.0
+    combined = np.concatenate([first, second])
+    standard = np.std(combined, axis=0, keepdims=True) + 1e-6
+    first = first / standard
+    second = second / standard
+    aa = np.sum((first[:, None] - first[None]) ** 2, axis=-1)
+    bb = np.sum((second[:, None] - second[None]) ** 2, axis=-1)
+    ab = np.sum((first[:, None] - second[None]) ** 2, axis=-1)
+    values = []
     for sigma in scales:
-        denom = 2.0 * float(sigma) ** 2
-        value += (
-            np.exp(-aa / denom).mean()
-            + np.exp(-bb / denom).mean()
-            - 2.0 * np.exp(-ab / denom).mean()
+        denominator = 2.0 * float(sigma) ** 2
+        values.append(
+            np.exp(-aa / denominator).mean()
+            + np.exp(-bb / denominator).mean()
+            - 2.0 * np.exp(-ab / denominator).mean()
         )
-    return float(max(value / len(scales), 0.0))
+    return float(max(np.mean(values), 0.0))
 
 
-def _sqrtm_psd(matrix: np.ndarray) -> np.ndarray:
-    values, vectors = np.linalg.eigh((matrix + matrix.T) * 0.5)
-    values = np.clip(values, 0.0, None)
-    return (vectors * np.sqrt(values)[None]) @ vectors.T
+def sqrt_psd(matrix: np.ndarray) -> np.ndarray:
+    value, vector = np.linalg.eigh((matrix + matrix.T) * 0.5)
+    value = np.clip(value, 0.0, None)
+    return (vector * np.sqrt(value)[None]) @ vector.T
 
 
-def _frechet(a: np.ndarray, b: np.ndarray) -> float:
-    if len(a) < 2 or len(b) < 2:
+def frechet(first: np.ndarray, second: np.ndarray) -> float:
+    if len(first) < 2 or len(second) < 2:
         return 0.0
-    ma, mb = a.mean(0), b.mean(0)
-    ca = np.cov(a, rowvar=False) + np.eye(a.shape[1]) * 1e-6
-    cb = np.cov(b, rowvar=False) + np.eye(b.shape[1]) * 1e-6
-    middle = _sqrtm_psd(_sqrtm_psd(ca) @ cb @ _sqrtm_psd(ca))
-    return float(max(np.sum((ma - mb) ** 2) + np.trace(ca + cb - 2 * middle), 0.0))
+    mean_a, mean_b = first.mean(0), second.mean(0)
+    cov_a = np.cov(first, rowvar=False) + np.eye(first.shape[1]) * 1e-6
+    cov_b = np.cov(second, rowvar=False) + np.eye(second.shape[1]) * 1e-6
+    middle = sqrt_psd(sqrt_psd(cov_a) @ cov_b @ sqrt_psd(cov_a))
+    return float(max(
+        np.sum((mean_a - mean_b) ** 2)
+        + np.trace(cov_a + cov_b - 2.0 * middle),
+        0.0,
+    ))
 
 
 def real_bank(
-    index_json: str, index_npz: str, fps: float, max_events: int
+    index_json: str,
+    index_npz: str,
+    fps: float,
+    maximum: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     _, _, items = load_shared_index(Path(index_json), Path(index_npz))
     motion_rows, foot_rows = [], []
-    for item in items[:max_events]:
+    for item in items[:maximum]:
         try:
-            motion = load_motion(Path(str(item.get("pkl", item.get("path", "")))))
+            motion = load_motion(
+                Path(str(item.get("pkl", item.get("path", ""))))
+            )
         except Exception:
             continue
-        features = window_features(motion, fps, min(60, len(motion)), 30)
-        if len(features):
-            motion_rows.append(features)
-        foot_rows.append(foot_descriptor(motion, fps)[0])
+        motion_feature, foot_feature = window_features(
+            motion, fps, min(60, len(motion)), 30
+        )
+        if len(motion_feature):
+            motion_rows.append(motion_feature)
+        if len(foot_feature):
+            foot_rows.append(foot_feature)
     return (
-        np.concatenate(motion_rows, axis=0) if motion_rows else np.zeros((0, 16), np.float32),
-        np.stack(foot_rows) if foot_rows else np.zeros((0, 8), np.float32),
+        np.concatenate(motion_rows)
+        if motion_rows else np.zeros((0, 16), np.float32),
+        np.concatenate(foot_rows)
+        if foot_rows else np.zeros((0, 8), np.float32),
     )
 
 
@@ -246,47 +293,46 @@ def main() -> None:
     parser.add_argument("--real_max_events", type=int, default=1000)
     args = parser.parse_args()
 
-    motion = _load(args.motion)
-    generated = window_features(motion, args.fps)
-    generated_foot = []
-    for start in range(0, max(1, len(motion) - 60 + 1), 30):
-        segment = motion[start : start + 60]
-        if len(segment) >= 12:
-            generated_foot.append(foot_descriptor(segment, args.fps)[0])
-    generated_foot = np.stack(generated_foot) if generated_foot else np.zeros((0, 8), np.float32)
+    motion = load_generated(args.motion)
+    generated, generated_foot = window_features(motion, args.fps)
     real, real_foot = real_bank(
-        args.index_json, args.duration_index_npz, args.fps, args.real_max_events
+        args.index_json,
+        args.duration_index_npz,
+        args.fps,
+        args.real_max_events,
     )
-    foot_summary = foot_descriptor(motion, args.fps)[1]
     segments = transition_segments(motion, args.schedule_report)
+    _, foot_summary = foot_descriptor(motion, args.fps)
     result = {
-        "version": "v30_frequency_distribution_foot_metrics",
+        "version": "v31_corrected_frequency_distribution_foot_metrics",
         "motion": args.motion,
-        "whole_song_spectrum": spectrum_metrics(motion, args.fps),
-        "transition_spectrum": aggregate_transition_spectrum(segments, args.fps),
+        "whole_song_spectrum": band_metrics(motion, args.fps),
+        "transition_spectrum": aggregate_spectrum(segments, args.fps),
         "foot": foot_summary,
-        "multi_scale_mmd": _rbf_mmd(generated, real),
-        "foot_motion_frechet": _frechet(generated_foot, real_foot),
+        "multi_scale_rbf_mmd": rbf_mmd(generated, real),
+        "foot_motion_frechet": frechet(generated_foot, real_foot),
         "generated_windows": int(len(generated)),
         "real_windows": int(len(real)),
         "note": (
-            "multi_scale_mmd and foot_motion_frechet use explicit transparent "
-            "kinematic descriptors; they are not claimed as standard learned-encoder metrics."
+            "Transparent descriptor metrics; not a substitute for a named "
+            "community learned-encoder benchmark."
         ),
     }
-    out = Path(args.out_json)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    output = Path(args.out_json)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     if args.out_png:
         import matplotlib.pyplot as plt
-        plot_motion = max(segments, key=len) if segments else motion
-        frequency, power = _spectrum_power(plot_motion, args.fps)
+        frequency, power = spectrum_power(motion, args.fps)
         plt.figure(figsize=(8, 4.5))
         plt.semilogy(frequency, power + 1e-12)
         plt.xlabel("Frequency (Hz)")
-        plt.ylabel("Mean DCT power")
-        plt.title("V30 transition jerk DCT spectrum")
+        plt.ylabel("Mean DCT jerk power")
+        plt.title("V31 whole-song motion spectrum")
         plt.tight_layout()
         plt.savefig(args.out_png, dpi=180)
         plt.close()
