@@ -106,7 +106,7 @@ def transition_risk(
 
     feet = transition_positions[:, FOOT_JOINTS]
     foot_velocity = np.diff(feet, axis=0, prepend=feet[:1]) * fps
-    foot_speed = np.linalg.vector_norm(foot_velocity, axis=-1)
+    foot_speed = np.linalg.norm(foot_velocity, axis=-1)
     contacts = np.asarray(trans[:, CONTACT] > 0.5)
     foot_slip = (
         float(np.mean(foot_speed[contacts]))

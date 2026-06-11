@@ -123,7 +123,7 @@ def main() -> None:
                 torch.from_numpy(event),
                 curvature,
             )[0].cpu().numpy()
-        distance_e = np.linalg.vector_norm(event - query[None], axis=1)
+        distance_e = np.linalg.norm(event - query[None], axis=1)
         order_h = np.argsort(distance_h)
         order_e = np.argsort(distance_e)
         ranks_hyperbolic.append(int(np.flatnonzero(order_h == positive)[0]))
