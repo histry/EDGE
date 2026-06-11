@@ -133,7 +133,7 @@ def foot_descriptor(
     positions = motion_to_joint_positions_np(motion)
     feet = positions[:, FOOT_JOINTS]
     velocity = np.diff(feet, axis=0, prepend=feet[:1]) * fps
-    speed = np.linalg.vector_norm(velocity, axis=-1)
+    speed = np.linalg.norm(velocity, axis=-1)
     contacts = np.asarray(motion[:, CONTACT] > 0.5)
     slide = speed[contacts]
     descriptor = np.asarray([
@@ -181,16 +181,16 @@ def window_features(
         foot, _ = foot_descriptor(segment, fps)
         motion_rows.append(np.concatenate([
             np.asarray([
-                np.linalg.vector_norm(velocity, axis=-1).mean(),
-                np.linalg.vector_norm(velocity, axis=-1).std(),
-                np.linalg.vector_norm(acceleration, axis=-1).mean(),
+                np.linalg.norm(velocity, axis=-1).mean(),
+                np.linalg.norm(velocity, axis=-1).std(),
+                np.linalg.norm(acceleration, axis=-1).mean(),
                 np.percentile(
-                    np.linalg.vector_norm(acceleration, axis=-1), 95
+                    np.linalg.norm(acceleration, axis=-1), 95
                 ),
-                np.linalg.vector_norm(jerk, axis=-1).mean()
+                np.linalg.norm(jerk, axis=-1).mean()
                 if len(jerk) else 0.0,
                 np.percentile(
-                    np.linalg.vector_norm(jerk, axis=-1), 95
+                    np.linalg.norm(jerk, axis=-1), 95
                 ) if len(jerk) else 0.0,
                 spectrum["low_below_2hz_ratio"],
                 spectrum["high_above_6hz_ratio"],
