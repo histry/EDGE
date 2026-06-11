@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -19,8 +18,6 @@ import argparse
 import json
 import os
 import tempfile
-from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -58,7 +55,14 @@ def clean_runs(binary: np.ndarray, min_run: int = 2, max_gap: int = 2) -> np.nda
     return x
 
 
-def infer_contacts(feet: np.ndarray, fps: float = 30.0) -> tuple[np.ndarray, np.ndarray]:
+def infer_contacts(
+    feet: np.ndarray,
+    fps: float = 30.0,
+    enter: float = 0.97,
+    leave: float = 0.90,
+    min_run: int = 3,
+    max_gap: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
     """Infer hard labels and soft confidence from [T,4,3] foot positions."""
     feet = np.asarray(feet, np.float32)
     t = len(feet)
@@ -95,9 +99,13 @@ def infer_contacts(feet: np.ndarray, fps: float = 30.0) -> tuple[np.ndarray, np.
         state = False
         values = np.zeros((t,), dtype=bool)
         for i, p in enumerate(probability[:, channel]):
-            state = bool(p >= (0.34 if state else 0.58))
+            state = bool(p >= (leave if state else enter))
             values[i] = state
-        hard[:, channel] = clean_runs(values).astype(np.float32)
+        hard[:, channel] = clean_runs(
+            values,
+            min_run=min_run,
+            max_gap=max_gap,
+        ).astype(np.float32)
 
     # Avoid an entirely empty anatomical side in very short/root-local clips.
     for channels in ((0, 2), (1, 3)):
@@ -111,7 +119,11 @@ def infer_contacts(feet: np.ndarray, fps: float = 30.0) -> tuple[np.ndarray, np.
                 local = int(value % 2)
                 hard[frame, channels[local]] = 1.0
             for channel in channels:
-                hard[:, channel] = clean_runs(hard[:, channel] > 0.5).astype(np.float32)
+                hard[:, channel] = clean_runs(
+                    hard[:, channel] > 0.5,
+                    min_run=min_run,
+                    max_gap=max_gap,
+                ).astype(np.float32)
 
     return hard, probability
 
@@ -129,6 +141,10 @@ def main() -> None:
     parser.add_argument("--out_json", default="")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--enter", type=float, default=0.97)
+    parser.add_argument("--leave", type=float, default=0.90)
+    parser.add_argument("--min_run", type=int, default=3)
+    parser.add_argument("--max_gap", type=int, default=1)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--force", type=int, default=0)
     args = parser.parse_args()
@@ -199,7 +215,14 @@ def main() -> None:
 
         for local, sample in enumerate(range(first, last)):
             k = int(length[sample])
-            hard, probability = infer_contacts(feet[local, :k + 2], args.fps)
+            hard, probability = infer_contacts(
+                feet[local, :k + 2],
+                fps=args.fps,
+                enter=args.enter,
+                leave=args.leave,
+                min_run=args.min_run,
+                max_gap=args.max_gap,
+            )
             start[sample, :4] = hard[0]
             target[sample, :k, :4] = hard[1:k + 1]
             target[sample, k:, :4] = 0.0
@@ -229,6 +252,10 @@ def main() -> None:
         "label_status": "kinematic_pseudo_contact_not_human_ground_truth",
         "method": "FK foot height + horizontal speed + hysteresis + temporal cleanup",
         "fps": args.fps,
+        "enter_threshold": args.enter,
+        "leave_threshold": args.leave,
+        "min_run_frames": args.min_run,
+        "max_gap_frames": args.max_gap,
         "original_contact_rate": original_rate,
         "reconstructed_contact_rate": final_rate,
     }
@@ -254,6 +281,10 @@ def main() -> None:
         "mean_contact_rate_per_channel": sample_rate.mean(axis=0).astype(float).tolist(),
         "mean_confidence_per_channel": confidence_mean.mean(axis=0).astype(float).tolist(),
         "label_source": "kinematic_pseudo_contact",
+        "enter_threshold": args.enter,
+        "leave_threshold": args.leave,
+        "min_run_frames": args.min_run,
+        "max_gap_frames": args.max_gap,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if args.out_json:
