@@ -85,4 +85,4 @@ print("gpu", torch.cuda.get_device_name(0))
 PY
 
 nvidia-smi
-bash scripts/run_v32_contact_inr_full.sh
+bash scripts/run_v33_event_contact_inr_full.sh

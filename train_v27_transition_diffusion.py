@@ -112,6 +112,19 @@ class TransitionDataset(torch.utils.data.Dataset):
         self.sample_weight = array(
             "sample_weight", np.ones((total,), np.float32)
         ).astype(np.float32)
+        if "contact_confidence" not in data.files:
+            raise RuntimeError(
+                "V33 training requires event-level contact_confidence. "
+                "Rebuild the dataset with build_v33_event_contact_cache.py "
+                "and the V33 transition dataset builder."
+            )
+        self.contact_confidence = array("contact_confidence").astype(np.float32)
+        self.start_contact_confidence = array(
+            "start_contact_confidence", np.ones((total, 4), np.float32)
+        ).astype(np.float32)
+        self.end_contact_confidence = array(
+            "end_contact_confidence", np.ones((total, 4), np.float32)
+        ).astype(np.float32)
         self.sample_kind = kinds[indices]
         self.real_target = real_target[indices]
         self.start_group = array(
@@ -126,6 +139,14 @@ class TransitionDataset(torch.utils.data.Dataset):
             json.loads(str(data["meta"].item()))
             if "meta" in data.files else {}
         )
+        contact_pipeline = self.meta.get("contact_pipeline", {})
+        if contact_pipeline.get("level") != "complete_event_before_window_sampling":
+            raise RuntimeError(
+                "Refusing non-event-level contact dataset: "
+                f"contact_pipeline={contact_pipeline}"
+            )
+        if not bool(contact_pipeline.get("synchronised_slicing", False)):
+            raise RuntimeError("Contact labels were not synchronously sliced")
         self.original_indices = indices.astype(np.int64)
 
     def __len__(self) -> int:
@@ -143,6 +164,9 @@ class TransitionDataset(torch.utils.data.Dataset):
             "music": self.music[index],
             "length": self.length[index],
             "sample_weight": self.sample_weight[index],
+            "contact_confidence": self.contact_confidence[index],
+            "start_contact_confidence": self.start_contact_confidence[index],
+            "end_contact_confidence": self.end_contact_confidence[index],
             "start_velocity": (first - self.start[index]).astype(np.float32),
             "end_velocity": (self.end[index] - last).astype(np.float32),
             "real_target": float(self.real_target[index]),
@@ -306,6 +330,7 @@ def reconstruction_losses(
     music = batch["music"].to(device).float()
     length = batch["length"].to(device).float().reshape(-1, 1)
     sample_weight = batch["sample_weight"].to(device).float().reshape(-1)
+    contact_confidence = batch["contact_confidence"].to(device).float()
     real_target = batch["real_target"].to(device).float().reshape(-1)
     sample_weight = sample_weight * (1.0 + 0.50 * real_target)
     start_velocity = batch["start_velocity"].to(device).float()
@@ -429,6 +454,7 @@ def reconstruction_losses(
         mask,
         aux["contact_logits"],
         sample_weight,
+        contact_confidence=contact_confidence,
         fps=float(weights.get("fps", 30.0)),
         penetration_tolerance=float(
             weights.get("penetration_tolerance", 0.008)
@@ -525,7 +551,7 @@ def encode_subset(
         key: [] for key in (
             "latent", "condition", "weight", "target", "mask",
             "start", "end", "music", "length",
-            "start_velocity", "end_velocity",
+            "start_velocity", "end_velocity", "contact_confidence",
         )
     }
     for batch in loader:
@@ -546,7 +572,7 @@ def encode_subset(
         rows["weight"].append(batch["sample_weight"].reshape(-1).float())
         for key in (
             "target", "mask", "start", "end", "music", "length",
-            "start_velocity", "end_velocity",
+            "start_velocity", "end_velocity", "contact_confidence",
         ):
             value = batch[key]
             if not torch.is_tensor(value):
@@ -592,6 +618,7 @@ def decoded_diffusion_loss(
     target = batch["target"][:count].to(device)
     mask = batch["mask"][:count].to(device)
     sample_weight = batch["weight"][:count].to(device)
+    contact_confidence = batch["contact_confidence"][:count].to(device)
     coordinate = _coordinates(length, target.shape[1])
     predicted, aux = system.decode(
         latent,
@@ -625,6 +652,7 @@ def decoded_diffusion_loss(
         mask,
         aux["contact_logits"],
         sample_weight,
+        contact_confidence=contact_confidence,
         fps=float(weights.get("fps", 30.0)),
     )
     contact_total = contact_loss_total(contact, weights)
@@ -1011,6 +1039,7 @@ def main() -> None:
         "swing_clearance": args.w_swing_clearance,
         "contact_temporal": args.w_contact_temporal,
         "contact_binary": args.w_contact_binary,
+        "contact_confidence_mean": 0.0,
         "fps": args.fps,
         "decoded_rotation": 0.40,
         "decoded_fk": 0.60,

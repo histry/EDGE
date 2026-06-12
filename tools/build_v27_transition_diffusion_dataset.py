@@ -29,12 +29,17 @@ import numpy as np
 from tools.schedule_v21_multi_music import load_shared_index
 from tools.v21_common import load_motion
 from tools.v29_motion_geometry import (
+    CONTACT,
     MOTION_DIM,
     ROOT_X,
     ROOT_Z,
     endpoint_metrics_np,
     make_so3_transition,
     resample_motion_so3_np,
+)
+from tools.v33_event_contacts import (
+    LABEL_SOURCE,
+    EventContactCache,
 )
 
 EVENT_GROUPS = {
@@ -252,24 +257,37 @@ def _candidate_source_paths(
 
 
 class SourceCache:
-    def __init__(self) -> None:
-        self.cache: Dict[str, np.ndarray | None] = {}
+    """Cache complete source sequences and infer contacts once per source."""
 
-    def load(self, paths: Sequence[Path], minimum_length: int) -> Tuple[np.ndarray | None, str]:
+    def __init__(self, event_contact_cache: EventContactCache) -> None:
+        self.event_contact_cache = event_contact_cache
+        self.cache: Dict[str, Tuple[np.ndarray, np.ndarray] | None] = {}
+
+    def load(
+        self,
+        paths: Sequence[Path],
+        minimum_length: int,
+    ) -> Tuple[np.ndarray | None, np.ndarray | None, str]:
         for path in paths:
             key = str(path)
             if key not in self.cache:
                 try:
-                    self.cache[key] = load_motion(path).astype(np.float32) if path.is_file() else None
+                    if not path.is_file():
+                        self.cache[key] = None
+                    else:
+                        original = load_motion(path).astype(np.float32)
+                        hard, confidence = self.event_contact_cache.infer_sequence(original)
+                        original = original.copy()
+                        original[:, CONTACT] = hard
+                        original[:, ROOT_X] = 0.0
+                        original[:, ROOT_Z] = 0.0
+                        self.cache[key] = (original, confidence.astype(np.float32))
                 except Exception:
                     self.cache[key] = None
-            motion = self.cache[key]
-            if motion is not None and len(motion) >= int(minimum_length):
-                motion = motion.copy()
-                motion[:, ROOT_X] = 0.0
-                motion[:, ROOT_Z] = 0.0
-                return motion, key
-        return None, ""
+            row = self.cache[key]
+            if row is not None and len(row[0]) >= int(minimum_length):
+                return row[0].copy(), row[1].copy(), key
+        return None, None, ""
 
 
 def _drop_condition(
@@ -285,6 +303,20 @@ def _resample(target: np.ndarray, length: int) -> np.ndarray:
         return np.asarray(target, dtype=np.float32)
     positions = np.linspace(0.0, len(target) - 1, length, dtype=np.float32)
     return resample_motion_so3_np(target, positions)
+
+
+def _resample_contact_confidence(confidence: np.ndarray, length: int) -> np.ndarray:
+    value = np.asarray(confidence, dtype=np.float32)
+    if len(value) == length:
+        return value.copy()
+    if len(value) == 1:
+        return np.repeat(value, length, axis=0)
+    old = np.linspace(0.0, 1.0, len(value), dtype=np.float32)
+    new = np.linspace(0.0, 1.0, length, dtype=np.float32)
+    result = np.empty((length, 4), dtype=np.float32)
+    for channel in range(4):
+        result[:, channel] = np.interp(new, old, value[:, channel])
+    return np.clip(result, 0.0, 1.0).astype(np.float32)
 
 
 class SampleStore:
@@ -308,6 +340,13 @@ class SampleStore:
         source_path: str = "",
         source_start_frame: int = -1,
         source_end_frame: int = -1,
+        contact_confidence: np.ndarray | None = None,
+        start_contact_confidence: np.ndarray | None = None,
+        end_contact_confidence: np.ndarray | None = None,
+        contact_label_source: str = "none",
+        contact_origin_id: str = "",
+        contact_target_start: int = -1,
+        contact_target_end_exclusive: int = -1,
     ) -> None:
         target = np.asarray(target, dtype=np.float32)
         if len(target) < 2 or len(target) > self.max_len:
@@ -316,6 +355,21 @@ class SampleStore:
         mask = np.zeros((self.max_len,), dtype=np.float32)
         padded[: len(target)] = target
         mask[: len(target)] = 1.0
+
+        if contact_confidence is None:
+            confidence = np.zeros((len(target), 4), dtype=np.float32)
+        else:
+            confidence = np.asarray(contact_confidence, dtype=np.float32)
+            if confidence.shape != (len(target), 4):
+                raise ValueError(
+                    f"contact_confidence shape={confidence.shape}, "
+                    f"expected={(len(target), 4)}"
+                )
+        confidence_padded = np.zeros((self.max_len, 4), dtype=np.float32)
+        confidence_padded[: len(target)] = np.clip(confidence, 0.0, 1.0)
+        start_conf = np.zeros((4,), dtype=np.float32) if start_contact_confidence is None else np.asarray(start_contact_confidence, dtype=np.float32).reshape(4)
+        end_conf = np.zeros((4,), dtype=np.float32) if end_contact_confidence is None else np.asarray(end_contact_confidence, dtype=np.float32).reshape(4)
+
         self.rows["target"].append(padded)
         self.rows["mask"].append(mask)
         self.rows["start"].append(np.asarray(start, dtype=np.float32))
@@ -332,10 +386,64 @@ class SampleStore:
         self.rows["source_path"].append(str(source_path))
         self.rows["source_start_frame"].append(int(source_start_frame))
         self.rows["source_end_frame"].append(int(source_end_frame))
+        self.rows["contact_confidence"].append(confidence_padded)
+        self.rows["start_contact_confidence"].append(np.clip(start_conf, 0.0, 1.0))
+        self.rows["end_contact_confidence"].append(np.clip(end_conf, 0.0, 1.0))
+        self.rows["contact_label_source"].append(str(contact_label_source))
+        self.rows["contact_origin_id"].append(str(contact_origin_id))
+        self.rows["contact_target_start"].append(int(contact_target_start))
+        self.rows["contact_target_end_exclusive"].append(int(contact_target_end_exclusive))
 
     def __len__(self) -> int:
         return len(self.rows["target"])
 
+
+def assert_synchronised_contact_slices(store: SampleStore) -> Dict[str, int]:
+    """Prove that overlapping real samples use identical source-frame labels."""
+    seen: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]] = {}
+    comparisons = 0
+    overlaps = 0
+    for row in range(len(store)):
+        origin = str(store.rows["contact_origin_id"][row])
+        start = int(store.rows["contact_target_start"][row])
+        end = int(store.rows["contact_target_end_exclusive"][row])
+        if not origin or start < 0 or end <= start:
+            continue
+        length = int(store.rows["length"][row])
+        if end - start != length:
+            raise AssertionError(
+                f"Contact origin interval length mismatch at sample {row}: "
+                f"[{start},{end}) vs length={length}"
+            )
+        target = np.asarray(store.rows["target"][row], np.float32)[:length, CONTACT]
+        confidence = np.asarray(
+            store.rows["contact_confidence"][row], np.float32
+        )[:length]
+        for local in range(length):
+            key = (origin, start + local)
+            value = (target[local], confidence[local])
+            comparisons += 1
+            if key in seen:
+                overlaps += 1
+                old_contact, old_confidence = seen[key]
+                if not np.array_equal(old_contact, value[0]):
+                    raise AssertionError(
+                        f"Conflicting contact labels for {key}: "
+                        f"{old_contact.tolist()} vs {value[0].tolist()}"
+                    )
+                if not np.allclose(old_confidence, value[1], atol=1e-7, rtol=0.0):
+                    raise AssertionError(
+                        f"Conflicting contact confidence for {key}: "
+                        f"{old_confidence.tolist()} vs {value[1].tolist()}"
+                    )
+            else:
+                seen[key] = (value[0].copy(), value[1].copy())
+    return {
+        "unique_origin_frames": len(seen),
+        "frame_comparisons": comparisons,
+        "overlap_comparisons": overlaps,
+        "conflicts": 0,
+    }
 
 def _load_external_prior(path: str | Path, store: SampleStore) -> int:
     if not path:
@@ -385,6 +493,9 @@ def main() -> None:
     parser.add_argument("--index_json", required=True)
     parser.add_argument("--duration_index_npz", required=True)
     parser.add_argument("--out_npz", required=True)
+    parser.add_argument("--event_contact_cache", required=True)
+    parser.add_argument("--require_event_contacts", type=int, default=1)
+    parser.add_argument("--assert_contact_consistency", type=int, default=1)
     parser.add_argument("--source_manifest", default="")
     parser.add_argument("--full_motion_root", default="")
     parser.add_argument("--external_prior_npz", default="")
@@ -418,8 +529,16 @@ def main() -> None:
     )
     items = all_items[: args.max_events] if args.max_events > 0 else all_items
     n = len(items)
+    event_contact_cache = EventContactCache(args.event_contact_cache)
+    if len(event_contact_cache) != len(all_items):
+        raise RuntimeError(
+            f"Event contact cache has {len(event_contact_cache)} entries, "
+            f"index has {len(all_items)}"
+        )
 
     motions: List[np.ndarray | None] = []
+    event_contact_confidence: List[np.ndarray | None] = []
+    event_contact_origin: List[str] = []
     groups: List[str] = []
     conditions: List[np.ndarray] = []
     bounds: List[Tuple[int | None, int | None]] = []
@@ -427,11 +546,22 @@ def main() -> None:
         path = Path(str(item.get("pkl", item.get("path", ""))))
         try:
             motion = load_motion(path).astype(np.float32)
+            hard, confidence, origin = event_contact_cache.get(
+                index, item, motion, strict=bool(args.require_event_contacts)
+            )
+            motion = motion.copy()
+            motion[:, CONTACT] = hard
             motion[:, ROOT_X] = 0.0
             motion[:, ROOT_Z] = 0.0
         except Exception:
+            if bool(args.require_event_contacts):
+                raise
             motion = None
+            confidence = None
+            origin = ""
         motions.append(motion)
+        event_contact_confidence.append(confidence)
+        event_contact_origin.append(origin)
         groups.append(_source_group(item, index))
         conditions.append(_event_condition(item, arrays, index))
         bounds.append(_bounds(item, manifest))
@@ -462,6 +592,13 @@ def main() -> None:
                 source_path=str(item.get("pkl", item.get("path", ""))),
                 source_start_frame=(bounds[index][0] + left + 1) if bounds[index][0] is not None else -1,
                 source_end_frame=(bounds[index][0] + right) if bounds[index][0] is not None else -1,
+                contact_confidence=event_contact_confidence[index][left + 1 : right],
+                start_contact_confidence=event_contact_confidence[index][left],
+                end_contact_confidence=event_contact_confidence[index][right],
+                contact_label_source=LABEL_SOURCE,
+                contact_origin_id=event_contact_origin[index],
+                contact_target_start=left + 1,
+                contact_target_end_exclusive=right,
             )
 
     grouped: Dict[str, List[int]] = defaultdict(list)
@@ -479,7 +616,7 @@ def main() -> None:
         adjacent_pairs.extend(list(zip(ordered, ordered[1:])))
     rng.shuffle(adjacent_pairs)
     max_adjacent = int(round(args.source_pairs_per_event * max(n, 1)))
-    source_cache = SourceCache()
+    source_cache = SourceCache(event_contact_cache)
     actual_gap_count = 0
     real_boundary_mask_count = 0
     synthetic_adjacent_count = 0
@@ -505,7 +642,7 @@ def main() -> None:
             groups[first],
             args.full_motion_root,
         )
-        full_source, source_path = source_cache.load(
+        full_source, full_source_confidence, source_path = source_cache.load(
             candidates, minimum_length=max(minimum_source_length, 8)
         )
         condition = _normalise(0.5 * conditions[first] + 0.5 * conditions[second])
@@ -544,6 +681,17 @@ def main() -> None:
                         source_path=source_path,
                         source_start_frame=end_a + 1,
                         source_end_frame=start_b,
+                        contact_confidence=_resample_contact_confidence(
+                            full_source_confidence[end_a + 1 : start_b], k
+                        ),
+                        start_contact_confidence=full_source_confidence[end_a],
+                        end_contact_confidence=full_source_confidence[start_b],
+                        contact_label_source=LABEL_SOURCE,
+                        contact_origin_id=(
+                            f"source:{source_path}" if k == len(gap) else ""
+                        ),
+                        contact_target_start=(end_a + 1 if k == len(gap) else -1),
+                        contact_target_end_exclusive=(start_b if k == len(gap) else -1),
                     )
                     actual_gap_count += 1
                     unique_real_boundary_pairs.add(pair_key)
@@ -587,6 +735,13 @@ def main() -> None:
                     source_path=source_path,
                     source_start_frame=left + 1,
                     source_end_frame=right,
+                    contact_confidence=full_source_confidence[left + 1 : right],
+                    start_contact_confidence=full_source_confidence[left],
+                    end_contact_confidence=full_source_confidence[right],
+                    contact_label_source=LABEL_SOURCE,
+                    contact_origin_id=f"source:{source_path}",
+                    contact_target_start=left + 1,
+                    contact_target_end_exclusive=right,
                 )
                 real_boundary_mask_count += 1
                 unique_real_boundary_pairs.add(pair_key)
@@ -652,6 +807,17 @@ def main() -> None:
     if len(store) == 0:
         raise RuntimeError("No transition samples were built")
 
+    contact_consistency = (
+        assert_synchronised_contact_slices(store)
+        if bool(args.assert_contact_consistency)
+        else {
+            "unique_origin_frames": 0,
+            "frame_comparisons": 0,
+            "overlap_comparisons": 0,
+            "conflicts": -1,
+        }
+    )
+
     kinds, counts = np.unique(
         np.asarray(store.rows["sample_kind"], dtype=object), return_counts=True
     )
@@ -680,7 +846,7 @@ def main() -> None:
 
     music = np.stack(store.rows["music"]).astype(np.float32)
     meta = {
-        "version": "v31_bandlimited_real_boundary_dataset",
+        "version": "v33_event_level_contact_transition_dataset",
         "num_samples": len(store),
         "num_events": n,
         "num_source_groups": len(set(groups)),
@@ -706,6 +872,15 @@ def main() -> None:
         "full_motion_root": str(args.full_motion_root),
         "source_index_json": str(args.index_json),
         "source_duration_index_npz": str(args.duration_index_npz),
+        "event_contact_cache": str(args.event_contact_cache),
+        "contact_pipeline": {
+            "level": "complete_event_before_window_sampling",
+            "label_source": LABEL_SOURCE,
+            "synchronised_slicing": True,
+            "window_level_relabeling": False,
+            "consistency_assertion": contact_consistency,
+            "cache_meta": event_contact_cache.meta,
+        },
     }
 
     output = Path(args.out_npz)
@@ -728,6 +903,15 @@ def main() -> None:
         source_path=np.asarray(store.rows["source_path"], dtype=object),
         source_start_frame=np.asarray(store.rows["source_start_frame"], dtype=np.int32),
         source_end_frame=np.asarray(store.rows["source_end_frame"], dtype=np.int32),
+        contact_confidence=np.stack(store.rows["contact_confidence"]).astype(np.float32),
+        start_contact_confidence=np.stack(store.rows["start_contact_confidence"]).astype(np.float32),
+        end_contact_confidence=np.stack(store.rows["end_contact_confidence"]).astype(np.float32),
+        contact_label_source=np.asarray(store.rows["contact_label_source"], dtype=object),
+        contact_origin_id=np.asarray(store.rows["contact_origin_id"], dtype=object),
+        contact_target_start=np.asarray(store.rows["contact_target_start"], dtype=np.int32),
+        contact_target_end_exclusive=np.asarray(
+            store.rows["contact_target_end_exclusive"], dtype=np.int32
+        ),
         meta=np.asarray(json.dumps(meta, ensure_ascii=False), dtype=object),
     )
     print(json.dumps(meta, ensure_ascii=False, indent=2))
