@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""EDGE V32: continuous C2-safe SO(3) INR with differentiable contacts.
+"""EDGE V32: continuous C3-safe SO(3) INR with differentiable contacts.
 
 The historical V30 idea (latent diffusion over a continuous motion INR) is kept,
 but the high-frequency SIREN decoder is removed. V32 uses:
-  * a quintic C2 SO(3) base path with endpoint pose/velocity constraints;
+  * a regularised septic SO(3) base matching pose/velocity/acceleration/jerk;
   * low-band Fourier coordinates and SiLU residual blocks;
-  * a C2-zero envelope 64*t^3*(1-t)^3 for every learned residual;
+  * a C3-zero envelope 256*t^4*(1-t)^4 for every learned residual;
   * deterministic transition latents (no VAE posterior mismatch);
   * a separate contact-logit head for differentiable contact supervision;
   * arbitrary-length decoding at continuous t in [0,1].
@@ -17,6 +17,7 @@ Native EDGE motion layout:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import asdict, dataclass
 from typing import Dict, Tuple
 
@@ -28,6 +29,12 @@ from pytorch3d.transforms import (
     matrix_to_axis_angle,
     matrix_to_rotation_6d,
     rotation_6d_to_matrix,
+)
+
+from tools.v34_boundary_dynamics import (
+    boundary_state_from_training_batch,
+    make_v34_transition_np,
+    septic_so3_root_base,
 )
 
 from tools.v29_motion_geometry import (
@@ -93,9 +100,15 @@ def quintic_smootherstep(t: torch.Tensor) -> torch.Tensor:
     return x**3 * (10.0 - 15.0 * x + 6.0 * x**2)
 
 
-def c2_zero_envelope(t: torch.Tensor) -> torch.Tensor:
+def c3_zero_envelope(t: torch.Tensor) -> torch.Tensor:
+    """Residual envelope with zero value and first three derivatives at ends."""
     x = t.clamp(0.0, 1.0)
-    return 64.0 * x**3 * (1.0 - x) ** 3
+    return 256.0 * x**4 * (1.0 - x) ** 4
+
+
+def c2_zero_envelope(t: torch.Tensor) -> torch.Tensor:
+    """Backward-compatible alias; V34 now preserves the septic C3 boundary."""
+    return c3_zero_envelope(t)
 
 
 def _safe_contact_logit(contact: torch.Tensor) -> torch.Tensor:
@@ -372,7 +385,7 @@ class ContinuousContactINR(torch.nn.Module):
         for block in self.blocks:
             x = block(x)
         x = F.silu(self.norm(x))
-        envelope = c2_zero_envelope(t)
+        envelope = c3_zero_envelope(t)
         rotation = self.rotation_head(x).reshape(
             batch, count, NUM_JOINTS, 3
         )
@@ -517,9 +530,38 @@ class V32ContactINRSystem(torch.nn.Module):
         t: torch.Tensor,
         length_frames: torch.Tensor,
         return_aux: bool = False,
+        boundary_state: Dict[str, torch.Tensor] | None = None,
     ):
-        base_logits, base_root, base_rotation = c2_quintic_so3_base(
-            start, end, start_velocity, end_velocity, t, length_frames
+        if boundary_state is None:
+            # Compatibility path for historical callers/checkpoints.  Velocity
+            # is retained, while acceleration/jerk default to zero.
+            batch = start.shape[0]
+            r0 = _rotation(start)
+            r1 = _rotation(end)
+            rs = _rotation(project_motion_rotations_torch(start + start_velocity))
+            re = _rotation(project_motion_rotations_torch(end - end_velocity))
+            zeros_w = start.new_zeros((batch, NUM_JOINTS, 3))
+            zeros_r = start.new_zeros((batch, 3))
+            boundary_state = {
+                "start_omega": matrix_to_axis_angle(
+                    torch.matmul(r0.transpose(-1, -2), rs)
+                ),
+                "end_omega": matrix_to_axis_angle(
+                    torch.matmul(re.transpose(-1, -2), r1)
+                ),
+                "start_alpha": zeros_w,
+                "end_alpha": zeros_w,
+                "start_angular_jerk": zeros_w,
+                "end_angular_jerk": zeros_w,
+                "start_root_velocity": start_velocity[..., ROOT],
+                "end_root_velocity": end_velocity[..., ROOT],
+                "start_root_acceleration": zeros_r,
+                "end_root_acceleration": zeros_r,
+                "start_root_jerk": zeros_r,
+                "end_root_jerk": zeros_r,
+            }
+        base_logits, base_root, base_rotation = septic_so3_root_base(
+            start, end, t, length_frames, boundary_state
         )
         residual_rotation, residual_root_y, residual_contact_logits = (
             self.inr(t, latent, condition)
@@ -555,42 +597,8 @@ def make_c2_transition_np(
     following: np.ndarray,
     length: int,
 ) -> np.ndarray:
-    a = np.asarray(previous, np.float32)
-    b = np.asarray(following, np.float32)
-    k = max(0, int(length))
-    if k == 0:
-        return np.zeros((0, MOTION_DIM), np.float32)
-    start_np = a[-1]
-    end_np = b[0]
-    start_velocity_np = (
-        a[-1] - a[-2] if len(a) >= 2 else np.zeros_like(start_np)
-    )
-    end_velocity_np = (
-        b[1] - b[0] if len(b) >= 2 else np.zeros_like(end_np)
-    )
-    with torch.no_grad():
-        start = torch.from_numpy(start_np).reshape(1, -1)
-        end = torch.from_numpy(end_np).reshape(1, -1)
-        start_velocity = torch.from_numpy(
-            start_velocity_np
-        ).reshape(1, -1)
-        end_velocity = torch.from_numpy(
-            end_velocity_np
-        ).reshape(1, -1)
-        coordinate = torch.linspace(
-            1.0 / (k + 1), k / (k + 1), k
-        ).reshape(1, k, 1)
-        length_frames = torch.tensor([[float(k)]])
-        logits, root, rotation = c2_quintic_so3_base(
-            start, end, start_velocity, end_velocity,
-            coordinate, length_frames,
-        )
-        rot6d = matrix_to_rotation_6d(rotation).reshape(k, -1)
-        motion = torch.cat(
-            [torch.sigmoid(logits)[0], root[0], rot6d], dim=-1
-        )
-        motion = project_motion_rotations_torch(motion)
-    return motion.cpu().numpy().astype(np.float32)
+    """Compatibility name for the V34 regularised septic boundary path."""
+    return make_v34_transition_np(previous, following, length)
 
 
 def linear_beta_schedule(

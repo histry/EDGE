@@ -22,6 +22,11 @@ from pytorch3d.transforms import (
     rotation_6d_to_matrix,
 )
 
+from tools.v34_boundary_dynamics import (
+    boundary_state_from_context_np,
+    boundary_state_to_torch,
+)
+
 from tools.v29_motion_geometry import (
     CONTACT,
     MOTION_DIM,
@@ -60,9 +65,13 @@ def load_transition_diffusion(
     )
     config_values = dict(checkpoint.get("config", {}))
     architecture = str(config_values.get("architecture", ""))
-    if architecture != "v32_continuous_c2_contact_inr_latent_diffusion":
+    supported = {
+        "v32_continuous_c2_contact_inr_latent_diffusion",
+        "v34_continuous_c3_contact_inr_latent_diffusion",
+    }
+    if architecture not in supported:
         raise RuntimeError(
-            f"Checkpoint architecture={architecture!r} is not V32. "
+            f"Checkpoint architecture={architecture!r} is not V32/V34. "
             "Retrain with the supplied train_v27_transition_diffusion.py."
         )
     model_config = config_from_dict(
@@ -302,6 +311,11 @@ def sample_transition_diffusion(
         start, end, start_velocity, end_velocity,
         music, length_frames,
     )
+    boundary_state = boundary_state_to_torch(
+        boundary_state_from_context_np(previous, following),
+        device=device,
+        dtype=start.dtype,
+    )
     coordinate = torch.linspace(
         1.0 / (k + 1), k / (k + 1), k,
         device=device,
@@ -309,6 +323,40 @@ def sample_transition_diffusion(
 
     baseline_risk = transition_risk(
         previous, baseline, following
+    )
+    baseline_absolute_safe, baseline_gate = accept_candidate(
+        baseline_risk,
+        baseline_risk,
+        max_total_ratio=1.0,
+        max_entry_ratio=1.0,
+        max_exit_ratio=1.0,
+        max_jerk_ratio=1.0,
+        max_foot_ratio=1.0,
+        max_penetration_ratio=1.0,
+        max_rotation_step_rad=float(
+            os.getenv("V32_MAX_ROTATION_STEP_RAD", "0.20")
+        ),
+        max_boundary_jerk_abs=float(
+            os.getenv("V34_MAX_BOUNDARY_JERK", "5000")
+        ),
+        max_boundary_angular_jerk_abs=float(
+            os.getenv("V34_MAX_BOUNDARY_ANGULAR_JERK", "5000")
+        ),
+        max_entry_rotation_step_rad=float(
+            os.getenv("V34_MAX_ENTRY_ROTATION_STEP_RAD", "0.16")
+        ),
+        max_exit_rotation_step_rad=float(
+            os.getenv("V34_MAX_EXIT_ROTATION_STEP_RAD", "0.12")
+        ),
+        max_entry_fk_jump=float(
+            os.getenv("V34_MAX_ENTRY_FK_JUMP", "0.060")
+        ),
+        max_exit_fk_jump=float(
+            os.getenv("V34_MAX_EXIT_FK_JUMP", "0.040")
+        ),
+        max_exit_acceleration=float(
+            os.getenv("V34_MAX_EXIT_ACCELERATION", "12.0")
+        ),
     )
     candidate_count = max(
         1, int(os.getenv("V32_CANDIDATES", "8"))
@@ -342,6 +390,7 @@ def sample_transition_diffusion(
                 condition,
                 coordinate,
                 length_frames,
+                boundary_state=boundary_state,
             )[0].cpu().numpy().astype(np.float32)
         candidate = _geodesic_blend(
             baseline, generated, trust
@@ -372,6 +421,27 @@ def sample_transition_diffusion(
             ),
             max_rotation_step_rad=float(
                 os.getenv("V32_MAX_ROTATION_STEP_RAD", "0.20")
+            ),
+            max_boundary_jerk_abs=float(
+                os.getenv("V34_MAX_BOUNDARY_JERK", "5000")
+            ),
+            max_boundary_angular_jerk_abs=float(
+                os.getenv("V34_MAX_BOUNDARY_ANGULAR_JERK", "5000")
+            ),
+            max_entry_rotation_step_rad=float(
+                os.getenv("V34_MAX_ENTRY_ROTATION_STEP_RAD", "0.16")
+            ),
+            max_exit_rotation_step_rad=float(
+                os.getenv("V34_MAX_EXIT_ROTATION_STEP_RAD", "0.12")
+            ),
+            max_entry_fk_jump=float(
+                os.getenv("V34_MAX_ENTRY_FK_JUMP", "0.060")
+            ),
+            max_exit_fk_jump=float(
+                os.getenv("V34_MAX_EXIT_FK_JUMP", "0.040")
+            ),
+            max_exit_acceleration=float(
+                os.getenv("V34_MAX_EXIT_ACCELERATION", "12.0")
             ),
         )
         row = {
@@ -412,6 +482,7 @@ def sample_transition_diffusion(
                 latent, start, end,
                 start_velocity, end_velocity,
                 condition, coordinate, length_frames,
+                boundary_state=boundary_state,
             )[0].cpu().numpy().astype(np.float32)
         result = _geodesic_blend(
             baseline, generated, trust
@@ -423,6 +494,15 @@ def sample_transition_diffusion(
         selected_index = -1
         fallback = True
 
+    unsafe_fallback = bool(fallback and not baseline_absolute_safe)
+    if unsafe_fallback and os.getenv(
+        "V34_FAIL_ON_UNSAFE_BOUNDARY", "0"
+    ).lower() in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "V34 absolute boundary gate rejected every learned candidate and "
+            f"the septic baseline is unsafe: {baseline_gate}"
+        )
+
     if os.getenv(
         "V32_HARD_CONTACT_OUTPUT", "0"
     ).lower() in {"1", "true", "yes", "on"}:
@@ -433,7 +513,7 @@ def sample_transition_diffusion(
     return result.astype(np.float32), {
         "enabled": True,
         "architecture":
-            "v32_continuous_c2_contact_inr_latent_diffusion",
+            "v34_continuous_c3_contact_inr_latent_diffusion",
         "checkpoint": str(bundle.get("path", "")),
         "continuous_time": True,
         "contact_aware": True,
@@ -444,5 +524,8 @@ def sample_transition_diffusion(
         "inr_trust": trust,
         "guidance": float(os.getenv("V32_GUIDANCE", "1.0")),
         "baseline_risk": baseline_risk,
+        "baseline_gate": baseline_gate,
+        "baseline_absolute_safe": bool(baseline_absolute_safe),
+        "unsafe_fallback": unsafe_fallback,
         "candidate_audit": candidates,
     }

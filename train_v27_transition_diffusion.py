@@ -39,6 +39,10 @@ from tools.v29_motion_geometry import (
     motion_to_joint_positions_torch,
     project_motion_rotations_torch,
 )
+from tools.v34_boundary_dynamics import (
+    boundary_state_from_training_batch,
+)
+
 from tools.v32_contact_inr import (
     V32ContactINRSystem,
     V32INRConfig,
@@ -344,6 +348,9 @@ def reconstruction_losses(
         latent = latent.detach()
         condition = condition.detach()
     coordinate = _coordinates(length, target.shape[1])
+    boundary_state = boundary_state_from_training_batch(
+        start, target, end, length
+    )
     predicted, aux = system.decode(
         latent,
         start,
@@ -354,6 +361,7 @@ def reconstruction_losses(
         coordinate,
         length,
         return_aux=True,
+        boundary_state=boundary_state,
     )
     predicted = project_motion_rotations_torch(predicted)
     target = project_motion_rotations_torch(target)
@@ -440,6 +448,72 @@ def reconstruction_losses(
     )
     losses["endpoint"] = weighted_mean(
         endpoint_pose + endpoint_velocity, sample_weight
+    )
+
+    # V34 explicitly supervises the first/last acceleration and jerk of the
+    # decoded interval in FK space.  This complements the septic base and keeps
+    # the learned residual from re-introducing a cross-boundary impulse.
+    start_positions = motion_to_joint_positions_torch(start)
+    end_positions = motion_to_joint_positions_torch(end)
+    endpoint_acceleration_rows = []
+    endpoint_jerk_rows = []
+    for batch_index in range(len(target)):
+        count = int(lengths[batch_index].item())
+        predicted_sequence = torch.cat([
+            start_positions[batch_index : batch_index + 1],
+            predicted_positions[batch_index, :count],
+            end_positions[batch_index : batch_index + 1],
+        ], dim=0)
+        target_sequence = torch.cat([
+            start_positions[batch_index : batch_index + 1],
+            target_positions[batch_index, :count],
+            end_positions[batch_index : batch_index + 1],
+        ], dim=0)
+        if len(predicted_sequence) >= 3:
+            predicted_acceleration = torch.stack([
+                predicted_sequence[2] - 2.0 * predicted_sequence[1]
+                + predicted_sequence[0],
+                predicted_sequence[-1] - 2.0 * predicted_sequence[-2]
+                + predicted_sequence[-3],
+            ])
+            target_acceleration = torch.stack([
+                target_sequence[2] - 2.0 * target_sequence[1]
+                + target_sequence[0],
+                target_sequence[-1] - 2.0 * target_sequence[-2]
+                + target_sequence[-3],
+            ])
+            endpoint_acceleration_rows.append(F.smooth_l1_loss(
+                predicted_acceleration,
+                target_acceleration,
+                reduction="mean",
+            ))
+        else:
+            endpoint_acceleration_rows.append(target.new_tensor(0.0))
+        if len(predicted_sequence) >= 4:
+            predicted_jerk = torch.stack([
+                predicted_sequence[3] - 3.0 * predicted_sequence[2]
+                + 3.0 * predicted_sequence[1] - predicted_sequence[0],
+                predicted_sequence[-1] - 3.0 * predicted_sequence[-2]
+                + 3.0 * predicted_sequence[-3] - predicted_sequence[-4],
+            ])
+            target_jerk = torch.stack([
+                target_sequence[3] - 3.0 * target_sequence[2]
+                + 3.0 * target_sequence[1] - target_sequence[0],
+                target_sequence[-1] - 3.0 * target_sequence[-2]
+                + 3.0 * target_sequence[-3] - target_sequence[-4],
+            ])
+            endpoint_jerk_rows.append(F.smooth_l1_loss(
+                predicted_jerk,
+                target_jerk,
+                reduction="mean",
+            ))
+        else:
+            endpoint_jerk_rows.append(target.new_tensor(0.0))
+    losses["endpoint_acceleration"] = weighted_mean(
+        torch.stack(endpoint_acceleration_rows), sample_weight
+    )
+    losses["endpoint_jerk"] = weighted_mean(
+        torch.stack(endpoint_jerk_rows), sample_weight
     )
 
     spectral, high_frequency = _spectral_loss(
@@ -620,6 +694,9 @@ def decoded_diffusion_loss(
     sample_weight = batch["weight"][:count].to(device)
     contact_confidence = batch["contact_confidence"][:count].to(device)
     coordinate = _coordinates(length, target.shape[1])
+    boundary_state = boundary_state_from_training_batch(
+        start, target, end, length
+    )
     predicted, aux = system.decode(
         latent,
         start,
@@ -630,6 +707,7 @@ def decoded_diffusion_loss(
         coordinate,
         length,
         return_aux=True,
+        boundary_state=boundary_state,
     )
     target = project_motion_rotations_torch(target)
     predicted = project_motion_rotations_torch(predicted)
@@ -804,7 +882,7 @@ def save_autoencoder_checkpoint(
     torch.save({
         "system": system.state_dict(),
         "config": {
-            "architecture": "v32_continuous_c2_contact_inr_autoencoder",
+            "architecture": "v34_continuous_c3_contact_inr_autoencoder",
             "model": asdict(config),
             "stage": stage,
         },
@@ -951,6 +1029,8 @@ def main() -> None:
     parser.add_argument("--w_jerk", type=float, default=0.10)
     parser.add_argument("--w_angular_velocity", type=float, default=0.22)
     parser.add_argument("--w_endpoint", type=float, default=0.90)
+    parser.add_argument("--w_endpoint_acceleration", type=float, default=0.45)
+    parser.add_argument("--w_endpoint_jerk", type=float, default=0.20)
     parser.add_argument("--w_spectral", type=float, default=0.18)
     parser.add_argument("--w_high_frequency", type=float, default=0.10)
     parser.add_argument("--w_latent_variance", type=float, default=0.04)
@@ -1027,6 +1107,8 @@ def main() -> None:
         "jerk": args.w_jerk,
         "angular_velocity": args.w_angular_velocity,
         "endpoint": args.w_endpoint,
+        "endpoint_acceleration": args.w_endpoint_acceleration,
+        "endpoint_jerk": args.w_endpoint_jerk,
         "spectral": args.w_spectral,
         "high_frequency": args.w_high_frequency,
         "latent_variance": args.w_latent_variance,
@@ -1117,6 +1199,8 @@ def main() -> None:
             "acceleration": args.w_acceleration * 0.85,
             "jerk": args.w_jerk * 1.25,
             "endpoint": args.w_endpoint * 1.20,
+            "endpoint_acceleration": args.w_endpoint_acceleration * 1.50,
+            "endpoint_jerk": args.w_endpoint_jerk * 1.75,
             "contact_bce": args.w_contact_bce * 1.50,
             "contact_skate": args.w_contact_skate * 1.80,
             "contact_height": args.w_contact_height * 1.50,
@@ -1267,7 +1351,7 @@ def main() -> None:
                 "ema_diffusion": ema.state_dict(),
                 "config": {
                     "architecture":
-                        "v32_continuous_c2_contact_inr_latent_diffusion",
+                        "v34_continuous_c3_contact_inr_latent_diffusion",
                     "model": asdict(config),
                     "diffusion_steps": args.diffusion_steps,
                     "contact_weights": weights,
