@@ -327,14 +327,25 @@ def choose_events_v34(
         if len(feasible_indices) == 0:
             natural_min = float(np.min(natural)) if len(natural) else float("nan")
             natural_max = float(np.max(natural)) if len(natural) else float("nan")
+            if slot == 0:
+                guidance = (
+                    "The first slot has no preceding transition and must be "
+                    "filled entirely by one event. Split/repartition this "
+                    "first slot or introduce an explicit start-pose bridge."
+                )
+            else:
+                guidance = (
+                    "Repartition the slot or verify the transition budget. "
+                    "Do not disable strict warp pruning for paper runs."
+                )
+
             raise RuntimeError(
                 f"V34 slot has no globally warp-feasible event: slot={slot}, "
                 f"music_length={phrase.length}, bounds=[{minimum},{maximum}], "
                 f"natural_range=[{natural_min},{natural_max}], "
                 f"min_content={args.min_content_frames}, "
                 f"transition_range=[{args.transition_min_frames},"
-                f"{args.transition_max_frames}]. Merge/repartition the music "
-                "slot; making it shorter cannot restore feasibility."
+                f"{args.transition_max_frames}]. {guidance}"
             )
         ranked_feasible = feasible_indices[
             np.argsort(base[feasible_indices])[::-1]
