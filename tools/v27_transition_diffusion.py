@@ -366,7 +366,7 @@ def sample_transition_diffusion(
         0.0, 0.65,
     ))
     candidates: List[Dict[str, Any]] = []
-    accepted: List[Tuple[float, np.ndarray, Dict[str, Any]]] = []
+    accepted: List[Tuple[float, np.ndarray, Dict[str, Any], torch.Tensor]] = []
 
     for candidate_index in range(candidate_count):
         generator = torch.Generator(device=device)
@@ -451,16 +451,132 @@ def sample_transition_diffusion(
         }
         candidates.append(row)
         if safe:
-            accepted.append((risk["total"], candidate, row))
+            accepted.append((
+                risk["total"],
+                candidate,
+                row,
+                latent.detach().clone(),
+            ))
 
     force_model = os.getenv(
         "V32_FORCE_MODEL", "0"
     ).lower() in {"1", "true", "yes", "on"}
+    latent_blend_meta: Dict[str, Any] = {
+        "enabled": os.getenv(
+            "V34_LATENT_SNIPPET_BLEND", "0"
+        ).lower() in {"1", "true", "yes", "on"},
+        "applied": False,
+    }
     if accepted:
         accepted.sort(key=lambda x: x[0])
         result = accepted[0][1]
         selected_index = int(accepted[0][2]["index"])
         fallback = False
+        if latent_blend_meta["enabled"] and len(accepted) >= 2:
+            top_count = min(
+                len(accepted),
+                max(2, int(os.getenv("V34_LATENT_BLEND_TOP_K", "3"))),
+            )
+            temperature = max(
+                1e-4, float(os.getenv("V34_LATENT_BLEND_TEMPERATURE", "0.08"))
+            )
+            top = accepted[:top_count]
+            risk_values = torch.as_tensor(
+                [float(row[0]) for row in top],
+                device=device,
+                dtype=torch.float32,
+            )
+            weights = torch.softmax(
+                -(risk_values - risk_values.min()) / temperature,
+                dim=0,
+            )
+            blended_latent = torch.zeros_like(top[0][3])
+            for weight, row in zip(weights, top):
+                blended_latent = blended_latent + weight.reshape(1, 1) * row[3]
+            with torch.no_grad():
+                generated = system.decode(
+                    blended_latent,
+                    start,
+                    end,
+                    start_velocity,
+                    end_velocity,
+                    condition,
+                    coordinate,
+                    length_frames,
+                    boundary_state=boundary_state,
+                )[0].cpu().numpy().astype(np.float32)
+            blended_candidate = _geodesic_blend(
+                baseline, generated, trust
+            )
+            blended_risk = transition_risk(
+                previous, blended_candidate, following
+            )
+            blended_safe, blended_gate = accept_candidate(
+                baseline_risk,
+                blended_risk,
+                max_total_ratio=float(
+                    os.getenv("V32_MAX_TOTAL_RISK_RATIO", "1.02")
+                ),
+                max_entry_ratio=float(
+                    os.getenv("V32_MAX_ENTRY_RATIO", "1.05")
+                ),
+                max_exit_ratio=float(
+                    os.getenv("V32_MAX_EXIT_RATIO", "1.03")
+                ),
+                max_jerk_ratio=float(
+                    os.getenv("V32_MAX_JERK_RATIO", "1.03")
+                ),
+                max_foot_ratio=float(
+                    os.getenv("V32_MAX_FOOT_RATIO", "1.02")
+                ),
+                max_penetration_ratio=float(
+                    os.getenv("V32_MAX_PENETRATION_RATIO", "1.02")
+                ),
+                max_rotation_step_rad=float(
+                    os.getenv("V32_MAX_ROTATION_STEP_RAD", "0.20")
+                ),
+                max_boundary_jerk_abs=float(
+                    os.getenv("V34_MAX_BOUNDARY_JERK", "5000")
+                ),
+                max_boundary_angular_jerk_abs=float(
+                    os.getenv("V34_MAX_BOUNDARY_ANGULAR_JERK", "5000")
+                ),
+                max_entry_rotation_step_rad=float(
+                    os.getenv("V34_MAX_ENTRY_ROTATION_STEP_RAD", "0.16")
+                ),
+                max_exit_rotation_step_rad=float(
+                    os.getenv("V34_MAX_EXIT_ROTATION_STEP_RAD", "0.12")
+                ),
+                max_entry_fk_jump=float(
+                    os.getenv("V34_MAX_ENTRY_FK_JUMP", "0.060")
+                ),
+                max_exit_fk_jump=float(
+                    os.getenv("V34_MAX_EXIT_FK_JUMP", "0.040")
+                ),
+                max_exit_acceleration=float(
+                    os.getenv("V34_MAX_EXIT_ACCELERATION", "12.0")
+                ),
+            )
+            keep_ratio = float(os.getenv("V34_LATENT_BLEND_KEEP_RATIO", "1.01"))
+            use_blend = bool(
+                blended_safe
+                and float(blended_risk["total"]) <= float(accepted[0][0]) * keep_ratio
+            )
+            latent_blend_meta.update({
+                "top_k": int(top_count),
+                "temperature": float(temperature),
+                "weights": [float(x) for x in weights.detach().cpu()],
+                "candidate_risks": [float(row[0]) for row in top],
+                "blended_risk": blended_risk,
+                "blended_gate": blended_gate,
+                "blended_safe": bool(blended_safe),
+                "keep_ratio": float(keep_ratio),
+                "selected": bool(use_blend),
+            })
+            if use_blend:
+                result = blended_candidate
+                selected_index = -2
+                latent_blend_meta["applied"] = True
     elif force_model and candidates:
         best_index = int(np.argmin([
             row["risk"]["total"] for row in candidates
@@ -527,5 +643,6 @@ def sample_transition_diffusion(
         "baseline_gate": baseline_gate,
         "baseline_absolute_safe": bool(baseline_absolute_safe),
         "unsafe_fallback": unsafe_fallback,
+        "latent_snippet_blend": latent_blend_meta,
         "candidate_audit": candidates,
     }

@@ -14,6 +14,7 @@ import numpy as np
 import tools.schedule_v32_whole_song as v32_overlay
 from tools.v32_transition_quality import transition_risk
 from tools.v34_boundary_dynamics import apply_exit_handshake_np
+from tools.v34_boundary_inpainting import maybe_inpaint_boundary
 from tools.v34_warp_aware_retrieval import choose_events_v34
 
 scheduler = v32_overlay.scheduler
@@ -336,6 +337,32 @@ def generate_one_v34(
             else:
                 diffusion_meta = {"enabled": False}
 
+            risk_pre_inpaint = transition_risk(
+                previous_content, transition, content, fps=float(args.fps)
+            )
+            previous_content, transition, content, inpaint_meta = (
+                maybe_inpaint_boundary(
+                    transition_bundle=args.transition_diffusion_bundle,
+                    previous_content=previous_content,
+                    transition=transition,
+                    content=content,
+                    music_query=np.asarray(phrases[slot].query, np.float32),
+                    device=device,
+                    fps=float(args.fps),
+                    blend=args.transition_diffusion_blend,
+                    steps=args.transition_diffusion_steps,
+                    part=selected_state.parts[slot],
+                    diffusion_meta=diffusion_meta,
+                )
+            )
+            if bool(inpaint_meta.get("applied", False)):
+                contents[slot - 1] = previous_content
+                contents[slot] = content
+                if pieces:
+                    pieces[-1] = previous_content
+                transition = scheduler.enforce_yaw_safe_transition(
+                    transition, previous_content, content
+                )
             risk_before = transition_risk(
                 previous_content, transition, content, fps=float(args.fps)
             )
@@ -385,6 +412,8 @@ def generate_one_v34(
                 "transition_meta", {}
             )
             metrics["transition_diffusion"] = diffusion_meta
+            metrics["v34_risk_pre_inpainting"] = risk_pre_inpaint
+            metrics["v34_boundary_inpainting"] = inpaint_meta
             metrics["v34_risk_before_handshake"] = risk_before
             metrics["v34_risk_after_handshake"] = risk_after
             metrics["v34_handshake_tail_risk"] = handshake_tail_risk
@@ -441,6 +470,8 @@ def generate_one_v34(
             "warp_aware_retrieval": True,
             "regularised_septic_so3": True,
             "c3_zero_inr_envelope": True,
+            "masked_boundary_inpainting": _enabled("V34_BOUNDARY_INPAINT", "0"),
+            "latent_snippet_blending": _enabled("V34_LATENT_SNIPPET_BLEND", "0"),
             "cross_boundary_absolute_gate": True,
             "exit_handshake": _enabled("V34_EXIT_HANDSHAKE", "1"),
             "exit_handshake_frames": handshake_frames,

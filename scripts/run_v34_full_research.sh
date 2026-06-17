@@ -36,6 +36,7 @@ echo "[COMMIT] $(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 python -m py_compile \
   tools/v34_boundary_dynamics.py \
+  tools/v34_boundary_inpainting.py \
   tools/v34_warp_aware_retrieval.py \
   tools/build_v34_contact_event_library.py \
   tools/calibrate_v34_boundary_thresholds.py \
