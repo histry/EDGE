@@ -21,6 +21,11 @@ try:
 except Exception:  # pragma: no cover - keeps old CPU path usable everywhere.
     build_v34_gpu_candidate_cache = None
 
+try:
+    from tools.v34_boundary_compatibility import evaluate_boundary_compatibility
+except Exception:  # pragma: no cover - keeps baseline retrieval importable.
+    evaluate_boundary_compatibility = None
+
 
 def _enabled(name: str, default: str = "1") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
@@ -227,6 +232,12 @@ def choose_events_v34(
     hard_prune = _enabled("V34_WARP_HARD_PRUNE", "1")
     warp_weight = float(os.getenv("V34_WARP_PENALTY_WEIGHT", "1.25"))
     requested_top_k = int(os.getenv("V34_WARP_PREFILTER_TOP_K", "512"))
+    compat_enabled = (
+        _enabled("V34_BOUNDARY_COMPAT", "1")
+        and evaluate_boundary_compatibility is not None
+    )
+    compat_hard_prune = _enabled("V34_COMPAT_HARD_PRUNE", "1")
+    compat_weight = float(os.getenv("V34_BOUNDARY_COMPAT_WEIGHT", "1.20"))
 
     beam = [scheduler.CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
@@ -385,6 +396,7 @@ def choose_events_v34(
         shortlist = ranked_feasible[: min(node_top_k, len(ranked_feasible))]
         expanded: List[Any] = []
         rejected_warp = 0
+        compat_rejected = 0
         negotiated_count = 0
         budget_penalty_weight = float(
             os.getenv("V34_TRANSITION_BUDGET_PENALTY_WEIGHT", "0.035")
@@ -433,6 +445,8 @@ def choose_events_v34(
                 graph_edge_meta: Dict[str, Any] = {}
                 transition_meta: Dict[str, Any] = {}
                 gpu_boundary_cache_hit = False
+                boundary_compat_score = 0.0
+                boundary_compat_meta: Dict[str, Any] = {"enabled": False}
                 if state.selected:
                     previous = state.selected[-1]
                     cached_boundary = (
@@ -512,6 +526,29 @@ def choose_events_v34(
                             and graph_edge_cost > args.graph_hard_prune_threshold
                         ):
                             continue
+                    if compat_enabled:
+                        boundary_compat_meta = evaluate_boundary_compatibility(
+                            previous_index=int(previous),
+                            candidate_index=int(idx),
+                            candidate_boundary=candidate_boundary,
+                            transition_cost=float(transition_cost),
+                            phrase=phrase,
+                            args=args,
+                            hierarchy=hierarchy,
+                        )
+                        boundary_compat_score = float(
+                            boundary_compat_meta.get("score", 0.0)
+                        )
+                        if (
+                            compat_hard_prune
+                            and bool(boundary_compat_meta.get("hard_reject", False))
+                        ):
+                            compat_rejected += 1
+                            continue
+                        transition_meta = dict(transition_meta)
+                        transition_meta["boundary_compatibility"] = (
+                            boundary_compat_meta
+                        )
 
                 desired_transition_len = int(transition_len)
                 negotiated = _negotiate_transition_budget(
@@ -590,6 +627,7 @@ def choose_events_v34(
                     - args.boundary_acceleration_penalty_weight
                     * boundary_acceleration_penalty
                     - args.graph_edge_weight * graph_edge_cost
+                    - compat_weight * boundary_compat_score
                     - args.mmr_weight * mmr
                     - args.family_repeat_weight * same_family
                     - args.source_repeat_weight * same_source
@@ -689,6 +727,10 @@ def choose_events_v34(
                     "graph_scheduler_enabled": bool(args.graph_scheduler),
                     "graph_edge_cost": float(graph_edge_cost),
                     "graph_edge_meta": graph_edge_meta,
+                    "boundary_compat_enabled": bool(compat_enabled),
+                    "boundary_compat_hard_prune": bool(compat_hard_prune),
+                    "boundary_compat_score": float(boundary_compat_score),
+                    "boundary_compat_meta": boundary_compat_meta,
                     "gpu_boundary_cache": bool(gpu_boundary_cache_hit),
                     "mmr_penalty": float(mmr),
                     "score": float(score),
@@ -706,11 +748,13 @@ def choose_events_v34(
                 f"V34 found no warp-feasible candidate for slot={slot}, "
                 f"music_length={phrase.length}, bounds=[{minimum},{maximum}], "
                 f"warp_rejected={rejected_warp}, "
+                f"compat_rejected={compat_rejected}, "
                 f"globally_feasible={len(feasible_indices)}, "
                 f"negotiated={negotiated_count}. The failure is now caused by "
-                "graph/family/duplicate constraints rather than warp ranking. "
-                "Increase the feasible shortlist or relax only those structural "
-                "constraints; keep the strict warp gate enabled."
+                "boundary compatibility, graph/family/duplicate constraints, "
+                "or an undersized shortlist rather than warp ranking. Increase "
+                "the feasible shortlist first; relax compatibility only for "
+                "ablation, and keep the strict warp gate enabled."
             )
         expanded.sort(key=lambda state: state.score, reverse=True)
         beam = expanded[: int(args.beam_size)]
