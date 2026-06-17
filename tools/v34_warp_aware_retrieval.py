@@ -16,9 +16,52 @@ import torch
 
 import tools.schedule_v26_whole_song as scheduler
 
+try:
+    from tools.v34_gpu_candidate_cache import build_v34_gpu_candidate_cache
+except Exception:  # pragma: no cover - keeps old CPU path usable everywhere.
+    build_v34_gpu_candidate_cache = None
+
 
 def _enabled(name: str, default: str = "1") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _broad_feasible_mask(
+    natural: np.ndarray,
+    *,
+    slot_length: int,
+    first_slot: bool,
+    min_content_frames: int,
+    transition_min_frames: int,
+    transition_max_frames: int,
+    minimum_warp: float,
+    maximum_warp: float,
+    tolerance: float,
+) -> np.ndarray:
+    """Vectorized version of _integer_content_interval(... ) is not None."""
+    natural = np.maximum(np.asarray(natural, dtype=np.float32), 1.0)
+    minimum = max(0.0, float(minimum_warp) - float(tolerance))
+    maximum = max(minimum, float(maximum_warp) + float(tolerance))
+    warp_low = np.ceil(minimum * natural - 1e-7).astype(np.int32)
+    warp_high = np.floor(maximum * natural + 1e-7).astype(np.int32)
+    slot_length = int(slot_length)
+    if first_slot:
+        return (warp_low <= slot_length) & (slot_length <= warp_high)
+
+    transition_high = min(int(transition_max_frames), slot_length - int(min_content_frames))
+    transition_low = max(0, int(transition_min_frames))
+    if transition_high < transition_low:
+        return np.zeros_like(natural, dtype=bool)
+    content_low = np.maximum.reduce([
+        np.full_like(warp_low, int(min_content_frames)),
+        np.full_like(warp_low, slot_length - transition_high),
+        warp_low,
+    ])
+    content_high = np.minimum(
+        np.full_like(warp_high, slot_length - transition_low),
+        warp_high,
+    )
+    return content_low <= content_high
 
 
 
@@ -174,6 +217,9 @@ def choose_events_v34(
         router, queries, motion_desc, device
     )
     transition_choices = scheduler.planner_bundle_lengths(args.planner_ckpt)
+    gpu_cache = None
+    if build_v34_gpu_candidate_cache is not None:
+        gpu_cache = build_v34_gpu_candidate_cache(arrays, motions, device)
 
     minimum = float(os.getenv("V34_WARP_MIN", str(args.min_time_warp)))
     maximum = float(os.getenv("V34_WARP_MAX", str(args.max_time_warp)))
@@ -309,43 +355,29 @@ def choose_events_v34(
         # The previous implementation ranked all 4,225 events first and only
         # then tested the top-K. Short events needed by a small slot could be
         # absent from that top-K even when they existed in the database.
-        broad_feasible = np.asarray([
-            _integer_content_interval(
-                natural_duration=float(natural[index]),
-                slot_length=int(phrase.length),
-                first_slot=(slot == 0),
-                min_content_frames=int(args.min_content_frames),
-                transition_min_frames=int(args.transition_min_frames),
-                transition_max_frames=int(args.transition_max_frames),
-                minimum_warp=minimum,
-                maximum_warp=maximum,
-                tolerance=tolerance,
-            ) is not None
-            for index in range(len(items))
-        ], dtype=bool)
+        broad_feasible = _broad_feasible_mask(
+            natural,
+            slot_length=int(phrase.length),
+            first_slot=(slot == 0),
+            min_content_frames=int(args.min_content_frames),
+            transition_min_frames=int(args.transition_min_frames),
+            transition_max_frames=int(args.transition_max_frames),
+            minimum_warp=minimum,
+            maximum_warp=maximum,
+            tolerance=tolerance,
+        )
         feasible_indices = np.flatnonzero(broad_feasible)
         if len(feasible_indices) == 0:
             natural_min = float(np.min(natural)) if len(natural) else float("nan")
             natural_max = float(np.max(natural)) if len(natural) else float("nan")
-            if slot == 0:
-                guidance = (
-                    "The first slot has no preceding transition and must be "
-                    "filled entirely by one event. Split/repartition this "
-                    "first slot or introduce an explicit start-pose bridge."
-                )
-            else:
-                guidance = (
-                    "Repartition the slot or verify the transition budget. "
-                    "Do not disable strict warp pruning for paper runs."
-                )
-
             raise RuntimeError(
                 f"V34 slot has no globally warp-feasible event: slot={slot}, "
                 f"music_length={phrase.length}, bounds=[{minimum},{maximum}], "
                 f"natural_range=[{natural_min},{natural_max}], "
                 f"min_content={args.min_content_frames}, "
                 f"transition_range=[{args.transition_min_frames},"
-                f"{args.transition_max_frames}]. {guidance}"
+                f"{args.transition_max_frames}]. Merge/repartition the music "
+                "slot; making it shorter cannot restore feasibility."
             )
         ranked_feasible = feasible_indices[
             np.argsort(base[feasible_indices])[::-1]
@@ -357,6 +389,23 @@ def choose_events_v34(
         budget_penalty_weight = float(
             os.getenv("V34_TRANSITION_BUDGET_PENALTY_WEIGHT", "0.035")
         )
+        slot_boundary_cache = None
+        if gpu_cache is not None and slot > 0:
+            previous_indices = [
+                int(state.selected[-1]) for state in beam if state.selected
+            ]
+            try:
+                slot_boundary_cache = gpu_cache.compute_slot(
+                    previous_indices,
+                    shortlist,
+                    phrase,
+                    args,
+                )
+            except Exception as exc:
+                if _enabled("V34_GPU_STRICT", "0"):
+                    raise
+                if _enabled("V34_GPU_RETRIEVAL_VERBOSE", "1"):
+                    print(f"[V34-GPU] slot={slot} fallback to CPU: {exc}")
 
         for state in beam:
             for raw_idx in shortlist:
@@ -383,36 +432,58 @@ def choose_events_v34(
                 graph_edge_cost = 0.0
                 graph_edge_meta: Dict[str, Any] = {}
                 transition_meta: Dict[str, Any] = {}
+                gpu_boundary_cache_hit = False
                 if state.selected:
                     previous = state.selected[-1]
-                    transition_cost = scheduler.transition_cost_from_arrays(
-                        exit_pose[previous], exit_vel[previous],
-                        entry_pose[idx], entry_vel[idx],
+                    cached_boundary = (
+                        slot_boundary_cache.get(previous, idx, args)
+                        if slot_boundary_cache is not None else None
                     )
-                    candidate_boundary = scheduler.boundary_metrics(
-                        motions[previous], motions[idx]
-                    )
-                    boundary_velocity_penalty = min(
-                        candidate_boundary["velocity_jump"]
-                        / max(args.velocity_jump_reference, 1e-6),
-                        args.boundary_penalty_cap,
-                    )
-                    boundary_acceleration_penalty = min(
-                        candidate_boundary["acceleration_jump"]
-                        / max(args.acceleration_jump_reference, 1e-6),
-                        args.boundary_penalty_cap,
-                    )
-                    if args.music_dominant_timing:
-                        transition_len, transition_meta = (
-                            scheduler.dynamic_transition_len(
-                                motions[previous], motions[idx], phrase, args
-                            )
+                    if cached_boundary is not None:
+                        gpu_boundary_cache_hit = True
+                        transition_cost = float(cached_boundary["transition_cost"])
+                        candidate_boundary = dict(cached_boundary["candidate_boundary"])
+                        boundary_velocity_penalty = float(
+                            cached_boundary["boundary_velocity_penalty"]
                         )
-                        transition_meta = {
-                            **transition_meta,
-                            "candidate_boundary": candidate_boundary,
-                        }
-                    else:
+                        boundary_acceleration_penalty = float(
+                            cached_boundary["boundary_acceleration_penalty"]
+                        )
+                        if args.music_dominant_timing:
+                            transition_len = int(cached_boundary["transition_len"])
+                            transition_meta = {
+                                **dict(cached_boundary["transition_meta"]),
+                                "candidate_boundary": candidate_boundary,
+                            }
+                    if not gpu_boundary_cache_hit:
+                        transition_cost = scheduler.transition_cost_from_arrays(
+                            exit_pose[previous], exit_vel[previous],
+                            entry_pose[idx], entry_vel[idx],
+                        )
+                        candidate_boundary = scheduler.boundary_metrics(
+                            motions[previous], motions[idx]
+                        )
+                        boundary_velocity_penalty = min(
+                            candidate_boundary["velocity_jump"]
+                            / max(args.velocity_jump_reference, 1e-6),
+                            args.boundary_penalty_cap,
+                        )
+                        boundary_acceleration_penalty = min(
+                            candidate_boundary["acceleration_jump"]
+                            / max(args.acceleration_jump_reference, 1e-6),
+                            args.boundary_penalty_cap,
+                        )
+                        if args.music_dominant_timing:
+                            transition_len, transition_meta = (
+                                scheduler.dynamic_transition_len(
+                                    motions[previous], motions[idx], phrase, args
+                                )
+                            )
+                            transition_meta = {
+                                **transition_meta,
+                                "candidate_boundary": candidate_boundary,
+                            }
+                    if not args.music_dominant_timing:
                         class_index = int(predictions["transition_class"][slot])
                         transition_len = int(
                             transition_choices[
@@ -618,6 +689,7 @@ def choose_events_v34(
                     "graph_scheduler_enabled": bool(args.graph_scheduler),
                     "graph_edge_cost": float(graph_edge_cost),
                     "graph_edge_meta": graph_edge_meta,
+                    "gpu_boundary_cache": bool(gpu_boundary_cache_hit),
                     "mmr_penalty": float(mmr),
                     "score": float(score),
                 }
