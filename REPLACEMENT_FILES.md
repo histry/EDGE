@@ -1,100 +1,151 @@
-# V34 Boundary-Compatible Event-RAG Patch
+# V34 Graceful Degradation + Deferred Veto Replacement Files
 
-This patch targets the failure mode where V34 strict warp succeeds but adjacent
-retrieved snippets are physically incompatible, so Contact-INR falls back or
-cannot repair a hard pose/contact/velocity jump.
+These files are meant to be copied into `/home/disk/lsm/storage/EDGE` with the
+same relative paths.
 
-## Files to copy into the EDGE repository
+## Files
 
-Copy these files to the same relative paths under your EDGE root:
+- `tools/schedule_v34_whole_song.py`
+- `tools/v34_boundary_inpainting.py`
+- `scripts/launch_v34_inpaint_blend.sh`
+- `scripts/resume_v34_inference_v33ckpt.sh`
+- `scripts/run_v34_full_research.sh`
+- `scripts/launch_v34_graceful_pipeline.sh`
 
-- `tools/v34_warp_aware_retrieval.py`
-- `tools/v34_boundary_compatibility.py`
-- `tools/v34_gpu_candidate_cache.py`
-- `scripts/launch_v34_boundary_compat.sh`
+## What Changed
 
-Optional installer from the patch directory:
+1. Boundary inpainting is now protected from a destructive post-inpaint
+   handshake. If `_adaptive_exit_handshake` makes the absolute boundary gate
+   unsafe, the scheduler falls back to the pre-handshake inpainted sequence and
+   records the rejected handshake in the schedule report.
+2. Unsafe boundary vetoes are deferred by default instead of terminating the
+   whole run. The report records `v34_deferred_vetoes`, so bad slots remain
+   auditable.
+3. Inpainting acceptance now allows physically meaningful improvements, not
+   only a strict max-risk-ratio pass.
+4. Inference now prefers the newest V34 full-rebuild checkpoint before falling
+   back to the old V33 checkpoint.
+5. The full research script writes explicit stage markers and checks whether
+   both `.npy` and `.schedule_report.json` artifacts exist for every target.
+6. All delivered shell scripts use LF line endings.
+
+## Replace On Server
 
 ```bash
-python install_v34_boundary_compat_patch.py --edge_root /home/disk/lsm/storage/EDGE
+cd /home/disk/lsm/storage/EDGE
+
+cp /path/to/replacement/tools/schedule_v34_whole_song.py tools/schedule_v34_whole_song.py
+cp /path/to/replacement/tools/v34_boundary_inpainting.py tools/v34_boundary_inpainting.py
+cp /path/to/replacement/scripts/launch_v34_inpaint_blend.sh scripts/launch_v34_inpaint_blend.sh
+cp /path/to/replacement/scripts/resume_v34_inference_v33ckpt.sh scripts/resume_v34_inference_v33ckpt.sh
+cp /path/to/replacement/scripts/run_v34_full_research.sh scripts/run_v34_full_research.sh
+cp /path/to/replacement/scripts/launch_v34_graceful_pipeline.sh scripts/launch_v34_graceful_pipeline.sh
+
+chmod +x scripts/launch_v34_inpaint_blend.sh \
+  scripts/resume_v34_inference_v33ckpt.sh \
+  scripts/run_v34_full_research.sh \
+  scripts/launch_v34_graceful_pipeline.sh
 ```
 
-The installer backs up overwritten files to:
-
-```text
-/home/disk/lsm/storage/EDGE/backup_v34_boundary_compat_YYYYMMDD_HHMMSS
-```
-
-## Default research policy
-
-The new retrieval policy is enabled by default:
+## Verify After Replacement
 
 ```bash
+cd /home/disk/lsm/storage/EDGE
+
+python -m py_compile \
+  tools/schedule_v34_whole_song.py \
+  tools/v34_boundary_inpainting.py
+
+bash -n \
+  scripts/launch_v34_inpaint_blend.sh \
+  scripts/resume_v34_inference_v33ckpt.sh \
+  scripts/run_v34_full_research.sh \
+  scripts/launch_v34_graceful_pipeline.sh
+```
+
+## Recommended Inference, Reuse Latest V34 Checkpoint
+
+```bash
+cd /home/disk/lsm/storage/EDGE
+
+tmux new-session -d -s v34_graceful_infer "bash -lc '
+set -euo pipefail
+cd /home/disk/lsm/storage/EDGE
+
+export EDGE_ROOT=/home/disk/lsm/storage/EDGE
+export EDGE_ENV=/home/disk/lsm/conda_envs/edge
+export PATH=\$EDGE_ENV/bin:\$PATH
+export PYTHONPATH=\$EDGE_ROOT
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONUNBUFFERED=1
+
+export V34_TRAIN=0
+export V34_BUILD_EVENT_LIBRARY=0
 export V34_BOUNDARY_COMPAT=1
 export V34_COMPAT_HARD_PRUNE=1
-export V34_BOUNDARY_COMPAT_WEIGHT=1.20
+export V34_BOUNDARY_INPAINT=1
+export V34_LATENT_SNIPPET_BLEND=1
 export V34_USE_GPU_RETRIEVAL=1
+export V34_FAIL_ON_UNSAFE_BOUNDARY=0
+export V34_DEFER_UNSAFE_BOUNDARY=1
+export V34_HANDSHAKE_FALLBACK_ON_UNSAFE=1
+
+export RUN_ID=v34_graceful_infer_\$(date +%Y%m%d_%H%M%S)
+bash scripts/launch_v34_graceful_pipeline.sh
+'"
 ```
 
-Main hard gates:
+## Full Rebuild + Retrain
 
 ```bash
-export V34_COMPAT_MAX_POSE_JUMP=0.42
-export V34_COMPAT_MAX_VELOCITY_JUMP=0.060
-export V34_COMPAT_MAX_ACCELERATION_JUMP=0.120
-export V34_COMPAT_MAX_CONTACT_JUMP=0.62
-export V34_COMPAT_MAX_YAW_GAP_DEG=62
-export V34_COMPAT_MAX_TRANSITION_COST=0.95
-```
+cd /home/disk/lsm/storage/EDGE
 
-For ablation:
+tmux new-session -d -s v34_graceful_full "bash -lc '
+set -euo pipefail
+cd /home/disk/lsm/storage/EDGE
 
-```bash
-export V34_BOUNDARY_COMPAT=0
-```
+export EDGE_ROOT=/home/disk/lsm/storage/EDGE
+export EDGE_ENV=/home/disk/lsm/conda_envs/edge
+export PATH=\$EDGE_ENV/bin:\$PATH
+export PYTHONPATH=\$EDGE_ROOT
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONUNBUFFERED=1
 
-For soft penalty only:
-
-```bash
+export V34_TRAIN=1
+export V34_BUILD_EVENT_LIBRARY=1
+export V34_OVERWRITE_EVENT_LIBRARY=1
 export V34_BOUNDARY_COMPAT=1
-export V34_COMPAT_HARD_PRUNE=0
+export V34_COMPAT_HARD_PRUNE=1
+export V34_BOUNDARY_INPAINT=1
+export V34_LATENT_SNIPPET_BLEND=1
+export V34_USE_GPU_RETRIEVAL=1
+export V34_FAIL_ON_UNSAFE_BOUNDARY=0
+export V34_DEFER_UNSAFE_BOUNDARY=1
+export V34_HANDSHAKE_FALLBACK_ON_UNSAFE=1
+
+export RUN_ID=v34_graceful_full_rebuild_\$(date +%Y%m%d_%H%M%S)
+bash scripts/launch_v34_graceful_pipeline.sh
+'"
 ```
 
-## Recommended launch
-
-Fast checkpoint reuse:
+## Monitor
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
-bash scripts/launch_v34_boundary_compat.sh
+
+RUN_ROOT=$(cat output/LATEST_V34_GRACEFUL_PIPELINE.txt)
+echo "RUN_ROOT=$RUN_ROOT"
+
+grep -nE "\[STAGE START\]|\[STAGE DONE\]|\[STAGE ERROR\]|\[V34 CKPT\]|graceful_degradation|deferred_veto|PASS|DONE|ERROR|Traceback|RuntimeError|SAVED" \
+  "$RUN_ROOT/run.log" "$RUN_ROOT/outer.log" 2>/dev/null | tail -200
+
+find "$RUN_ROOT" -type f \
+  \( -name "*.schedule_report.json" \
+     -o -name "*.boundary_v34.json" \
+     -o -name "*.public_metrics.json" \
+     -o -name "*.frequency_foot.json" \
+     -o -name "*.contact_metrics.json" \
+     -o -name "*.jitter.json" \
+     -o -name "*.mp4" \
+     -o -name "*SUMMARY.json" \) | sort
 ```
-
-Full retraining / overnight research run:
-
-```bash
-cd /home/disk/lsm/storage/EDGE
-V34_TRAIN=1 bash scripts/launch_v34_boundary_compat.sh
-```
-
-## What to inspect after the run
-
-Each selected schedule part now records:
-
-- `boundary_compat_enabled`
-- `boundary_compat_hard_prune`
-- `boundary_compat_score`
-- `boundary_compat_meta`
-- `transition_meta.boundary_compatibility`
-
-Useful checks:
-
-```bash
-RUN_ROOT=$(cat output/LATEST_V34_1_INFERENCE_LAUNCH.txt 2>/dev/null || cat output/LATEST_V34_OVERNIGHT_LAUNCH.txt)
-grep -nE "compat_rejected|Unsafe V34|Traceback|RuntimeError|\\[SAVED\\]|\\[PASS\\]" "$RUN_ROOT"/run.log "$RUN_ROOT"/launcher.log 2>/dev/null | tail -120
-find "$RUN_ROOT" -type f -name "*.schedule_report.json" -o -name "*.boundary_v34.json" | sort
-```
-
-The expected improvement is not that Contact-INR becomes stronger.  The expected
-improvement is that hard-incompatible snippet pairs are removed before
-Contact-INR, so the post-handshake absolute gate sees fewer catastrophic
-boundaries and fewer unsafe fallbacks.

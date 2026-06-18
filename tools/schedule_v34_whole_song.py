@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -59,6 +59,26 @@ def _risk_score(risk: Dict[str, float]) -> float:
         float(risk[key]) / max(value, 1e-8)
         for key, value in thresholds.items()
     ))
+
+
+def _boundary_check_pair(
+    risk: Dict[str, float],
+    tail_risk: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    main_checks = _absolute_boundary_checks(risk)
+    tail_checks = (
+        _absolute_boundary_checks(tail_risk)
+        if tail_risk is not None else dict(main_checks)
+    )
+    return {
+        "main_checks": main_checks,
+        "tail_checks": tail_checks,
+        "safe": bool(all(main_checks.values()) and all(tail_checks.values())),
+        "score": float(max(
+            _risk_score(risk),
+            _risk_score(tail_risk) if tail_risk is not None else _risk_score(risk),
+        )),
+    }
 
 
 def _adaptive_exit_handshake(
@@ -289,6 +309,7 @@ def generate_one_v34(
 
     pieces: List[np.ndarray] = []
     boundary_reports: List[Dict[str, Any]] = []
+    deferred_vetoes: List[Dict[str, Any]] = []
     handshake_frames = int(os.getenv("V34_EXIT_HANDSHAKE_FRAMES", "10"))
     handshake_strength = float(
         os.getenv("V34_EXIT_HANDSHAKE_STRENGTH", "1.0")
@@ -366,8 +387,11 @@ def generate_one_v34(
             risk_before = transition_risk(
                 previous_content, transition, content, fps=float(args.fps)
             )
+            fallback_content = content.copy()
+            fallback_risk = dict(risk_before)
+            fallback_tail_risk = dict(risk_before)
             if _enabled("V34_EXIT_HANDSHAKE", "1"):
-                content, handshake_meta, risk_after, handshake_tail_risk = (
+                handshake_content, handshake_meta, risk_after, handshake_tail_risk = (
                     _adaptive_exit_handshake(
                         transition,
                         content,
@@ -379,7 +403,30 @@ def generate_one_v34(
                         max_root=handshake_max_root,
                     )
                 )
-                contents[slot] = content
+                pair_checks = _boundary_check_pair(risk_after, handshake_tail_risk)
+                handshake_meta["post_handshake_safe_before_fallback"] = bool(
+                    pair_checks["safe"]
+                )
+                handshake_meta["post_handshake_checks_before_fallback"] = pair_checks
+                if (
+                    bool(pair_checks["safe"])
+                    or not _enabled("V34_HANDSHAKE_FALLBACK_ON_UNSAFE", "1")
+                ):
+                    content = handshake_content
+                    contents[slot] = content
+                else:
+                    handshake_meta["graceful_degradation_applied"] = True
+                    handshake_meta["fallback_reason"] = (
+                        "handshake_rejected_by_absolute_gate"
+                    )
+                    handshake_meta["rejected_handshake_risk"] = risk_after
+                    handshake_meta["rejected_handshake_tail_risk"] = (
+                        handshake_tail_risk
+                    )
+                    content = fallback_content
+                    contents[slot] = content
+                    risk_after = fallback_risk
+                    handshake_tail_risk = fallback_tail_risk
             else:
                 handshake_meta = {
                     "enabled": False,
@@ -391,20 +438,31 @@ def generate_one_v34(
                 handshake_tail_risk = risk_after
 
             if _enabled("V34_POST_HANDSHAKE_ABSOLUTE_VETO", "1"):
-                safe = bool(
-                    all(_absolute_boundary_checks(risk_after).values())
-                    and all(
-                        _absolute_boundary_checks(handshake_tail_risk).values()
-                    )
+                final_checks = _boundary_check_pair(
+                    risk_after, handshake_tail_risk
                 )
+                safe = bool(final_checks["safe"])
                 handshake_meta["post_handshake_safe"] = safe
+                handshake_meta["post_handshake_checks"] = final_checks
                 if not safe:
-                    if _enabled("V34_FAIL_ON_UNSAFE_BOUNDARY", "1"):
+                    veto_meta = {
+                        "slot": int(slot),
+                        "main_risk": risk_after,
+                        "tail_risk": handshake_tail_risk,
+                        "checks": final_checks,
+                        "deferred": _enabled("V34_DEFER_UNSAFE_BOUNDARY", "1"),
+                    }
+                    deferred_vetoes.append(veto_meta)
+                    if (
+                        _enabled("V34_FAIL_ON_UNSAFE_BOUNDARY", "1")
+                        and not _enabled("V34_DEFER_UNSAFE_BOUNDARY", "1")
+                    ):
                         raise RuntimeError(
                             f"Unsafe V34 post-handshake boundary slot={slot}: "
                             f"main={risk_after}, tail={handshake_tail_risk}"
                         )
                     handshake_meta["post_handshake_unsafe"] = True
+                    handshake_meta["post_handshake_deferred_veto"] = True
 
             metrics = scheduler.boundary_metrics(previous_content, content)
             metrics["transition_len"] = k
@@ -465,6 +523,7 @@ def generate_one_v34(
         "score": selected_state.score,
         "schedule": [],
         "boundary_metrics": boundary_reports,
+        "v34_deferred_vetoes": deferred_vetoes,
         "v34_policy": {
             "contact_back_injected": True,
             "warp_aware_retrieval": True,
@@ -472,7 +531,20 @@ def generate_one_v34(
             "c3_zero_inr_envelope": True,
             "masked_boundary_inpainting": _enabled("V34_BOUNDARY_INPAINT", "0"),
             "latent_snippet_blending": _enabled("V34_LATENT_SNIPPET_BLEND", "0"),
+            "latent_snippet_blending_status": (
+                "transition_sampler_latent_mixture"
+                if _enabled("V34_LATENT_SNIPPET_BLEND", "0") else "disabled"
+            ),
             "cross_boundary_absolute_gate": True,
+            "deferred_unsafe_boundary_veto": _enabled(
+                "V34_DEFER_UNSAFE_BOUNDARY", "1"
+            ),
+            "handshake_fallback_on_unsafe": _enabled(
+                "V34_HANDSHAKE_FALLBACK_ON_UNSAFE", "1"
+            ),
+            "post_handshake_repair": _enabled(
+                "V34_POST_HANDSHAKE_REPAIR", "0"
+            ),
             "exit_handshake": _enabled("V34_EXIT_HANDSHAKE", "1"),
             "exit_handshake_frames": handshake_frames,
         },

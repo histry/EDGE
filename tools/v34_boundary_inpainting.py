@@ -242,10 +242,27 @@ def maybe_inpaint_boundary(
     risk_after = transition_risk(new_previous, new_transition, new_following, fps=float(fps))
     before_score = _risk_score(risk_before)
     after_score = _risk_score(risk_after)
+    before_checks = _absolute_checks(risk_before)
+    after_checks = _absolute_checks(risk_after)
+    check_improvement = int(sum(after_checks.values()) - sum(before_checks.values()))
+    absolute_improved = bool(
+        check_improvement > 0
+        or (
+            float(risk_after["exit_acceleration"])
+            < float(risk_before["exit_acceleration"])
+            and float(risk_after["boundary_joint_jerk_max"])
+            <= float(risk_before["boundary_joint_jerk_max"])
+            * _env_float("V34_INPAINT_IMPROVE_JERK_TOL", 1.05)
+        )
+    )
     max_ratio = _env_float("V34_INPAINT_MAX_RISK_RATIO", 1.03)
     accept = bool(
         after_score <= before_score * max_ratio
-        or (all(_absolute_checks(risk_after).values()) and not all(_absolute_checks(risk_before).values()))
+        or (all(after_checks.values()) and not all(before_checks.values()))
+        or (
+            _enabled("V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES", "1")
+            and absolute_improved
+        )
         or _enabled("V34_INPAINT_FORCE_ACCEPT", "0")
     )
 
@@ -256,6 +273,10 @@ def maybe_inpaint_boundary(
         "context_frames": int(context),
         "redraw_meta": redraw_meta,
         "risk_after": risk_after,
+        "absolute_checks_before": before_checks,
+        "absolute_checks_after": after_checks,
+        "absolute_check_improvement": int(check_improvement),
+        "absolute_improved": bool(absolute_improved),
         "risk_score_after": float(after_score),
         "risk_ratio_after_over_before": float(after_score / max(before_score, 1e-8)),
         "accepted": bool(accept),

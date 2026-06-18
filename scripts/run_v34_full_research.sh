@@ -34,6 +34,32 @@ echo "[START] $(date)"
 echo "[RUN_ROOT] $RUN_ROOT"
 echo "[COMMIT] $(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
+run_stage() {
+  local name="$1"
+  shift
+  echo "[STAGE START] $name $(date)"
+  "$@"
+  echo "[STAGE DONE] $name $(date)"
+}
+
+check_motion_outputs() {
+  local directory="$1"
+  local label="$2"
+  IFS=';' read -ra CHECK_KEYS <<< "$V32_KEYS"
+  for key in "${CHECK_KEYS[@]}"; do
+    local motion="$directory/${key}_v26.npy"
+    local report="$directory/${key}_v26.schedule_report.json"
+    [[ -f "$motion" ]] || {
+      echo "[STAGE ERROR] $label missing motion: $motion" >&2
+      return 3
+    }
+    [[ -f "$report" ]] || {
+      echo "[STAGE ERROR] $label missing schedule report: $report" >&2
+      return 3
+    }
+  done
+}
+
 python -m py_compile \
   tools/v34_boundary_dynamics.py \
   tools/v34_boundary_inpainting.py \
@@ -169,7 +195,10 @@ export V26_MAX_TIME_WARP="${V26_MAX_TIME_WARP:-1.30}"
 export V32_STRICT_LOCKED_WARP=1
 export V32_MAX_WARP_VIOLATIONS=0
 export V34_WARP_HARD_PRUNE=1
-export V34_FAIL_ON_UNSAFE_BOUNDARY="${V34_FAIL_ON_UNSAFE_BOUNDARY:-1}"
+export V34_FAIL_ON_UNSAFE_BOUNDARY="${V34_FAIL_ON_UNSAFE_BOUNDARY:-0}"
+export V34_DEFER_UNSAFE_BOUNDARY="${V34_DEFER_UNSAFE_BOUNDARY:-1}"
+export V34_HANDSHAKE_FALLBACK_ON_UNSAFE="${V34_HANDSHAKE_FALLBACK_ON_UNSAFE:-1}"
+export V34_POST_HANDSHAKE_REPAIR="${V34_POST_HANDSHAKE_REPAIR:-0}"
 export V34_EXIT_HANDSHAKE="${V34_EXIT_HANDSHAKE:-1}"
 export V34_EXIT_HANDSHAKE_FRAMES="${V34_EXIT_HANDSHAKE_FRAMES:-10}"
 export V32_CANDIDATES="${V32_CANDIDATES:-8}"
@@ -179,12 +208,14 @@ export V32_INFERENCE_STEPS="${V32_INFERENCE_STEPS:-40}"
 if [[ "${V34_RUN_SEPTIC_BASELINE:-1}" == "1" ]]; then
   export V26_OUT_DIR="$RUN_ROOT/septic_handshake_baseline"
   export V27_TRANSITION_DIFFUSION=0
-  bash scripts/run_v34_whole_song.sh
+  run_stage septic_handshake_baseline bash scripts/run_v34_whole_song.sh
+  check_motion_outputs "$V26_OUT_DIR" septic_handshake_baseline
 fi
 
 export V26_OUT_DIR="$RUN_ROOT/v34_contact_inr"
 export V27_TRANSITION_DIFFUSION=1
-bash scripts/run_v34_whole_song.sh
+run_stage v34_contact_inr bash scripts/run_v34_whole_song.sh
+check_motion_outputs "$V26_OUT_DIR" v34_contact_inr
 
 # ------------------------------------------------------------------
 # 6. Evaluation and scientific render.
@@ -198,6 +229,7 @@ evaluate_directory() {
     local report="$directory/${key}_v26.schedule_report.json"
     local audio="test_music_bank/${key}.wav"
     [[ -f "$motion" ]] || { echo "[ERROR] Missing $motion" >&2; return 3; }
+    [[ -f "$report" ]] || { echo "[ERROR] Missing $report" >&2; return 3; }
 
     python tools/evaluate_v26_long_dance.py \
       --motion "$motion" --schedule_report "$report" \
@@ -232,14 +264,15 @@ evaluate_directory() {
   done
 }
 
-evaluate_directory "$RUN_ROOT/v34_contact_inr" v34
+run_stage evaluate_v34_contact_inr evaluate_directory "$RUN_ROOT/v34_contact_inr" v34
 if [[ -d "$RUN_ROOT/septic_handshake_baseline" ]]; then
-  evaluate_directory "$RUN_ROOT/septic_handshake_baseline" septic
+  run_stage evaluate_septic_baseline evaluate_directory "$RUN_ROOT/septic_handshake_baseline" septic
 fi
 
-python tools/summarize_v32_transition_gate.py \
-  --report_glob "$RUN_ROOT/v34_contact_inr/*_v26.schedule_report.json" \
-  --out_json "$RUN_ROOT/v34_transition_gate_summary.json"
+run_stage summarize_v34_transition_gate \
+  python tools/summarize_v32_transition_gate.py \
+    --report_glob "$RUN_ROOT/v34_contact_inr/*_v26.schedule_report.json" \
+    --out_json "$RUN_ROOT/v34_transition_gate_summary.json"
 
 echo "$RUN_ROOT" > output/LATEST_V34_RUN.txt
 echo "[DONE] $(date)"

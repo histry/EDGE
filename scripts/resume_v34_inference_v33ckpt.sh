@@ -51,15 +51,35 @@ export V34_CALIBRATE_THRESHOLDS="${V34_CALIBRATE_THRESHOLDS:-1}"
 export V34_DATASET="${V34_DATASET:-data/v33_transition_dataset.npz}"
 
 # ============================================================
-# Reuse trained V33 checkpoint; no retraining
+# Reuse trained transition checkpoint; no retraining.
+#
+# Prefer an explicit user-supplied checkpoint, then the newest V34 full-rebuild
+# checkpoint, and only then fall back to the older V33 checkpoint. This prevents
+# V34 inference experiments from silently evaluating the stale V33 model.
 # ============================================================
 export V34_TRAIN=0
 
-export V27_TRANSITION_DIFFUSION_CKPT="${V27_TRANSITION_DIFFUSION_CKPT:-output/v33_event_contact_20260611_204533/v32_contact_inr_training/checkpoints/best.pt}"
+if [[ -z "${V27_TRANSITION_DIFFUSION_CKPT:-}" ]]; then
+  latest_v34_ckpt="$(
+    ls -t output/v34_inpaint_blend_full_rebuild_*/v34_contact_inr_training/checkpoints/best.pt \
+      output/v34_boundary_compat_full_*/v34_contact_inr_training/checkpoints/best.pt \
+      2>/dev/null | head -1 || true
+  )"
+  if [[ -n "$latest_v34_ckpt" ]]; then
+    export V27_TRANSITION_DIFFUSION_CKPT="$latest_v34_ckpt"
+  else
+    export V27_TRANSITION_DIFFUSION_CKPT="output/v33_event_contact_20260611_204533/v32_contact_inr_training/checkpoints/best.pt"
+  fi
+fi
+echo "[V34 CKPT] $V27_TRANSITION_DIFFUSION_CKPT"
 
 # Diagnostic compatibility run. The post-handshake evaluator still records
 # unsafe boundaries, but does not terminate before all reports are written.
 export V34_FAIL_ON_UNSAFE_BOUNDARY="${V34_FAIL_ON_UNSAFE_BOUNDARY:-0}"
+export V34_DEFER_UNSAFE_BOUNDARY="${V34_DEFER_UNSAFE_BOUNDARY:-1}"
+export V34_HANDSHAKE_FALLBACK_ON_UNSAFE="${V34_HANDSHAKE_FALLBACK_ON_UNSAFE:-1}"
+export V34_POST_HANDSHAKE_REPAIR="${V34_POST_HANDSHAKE_REPAIR:-0}"
+export V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES="${V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES:-1}"
 
 # ============================================================
 # Deterministic V34.2 timing configuration

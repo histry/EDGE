@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Launch V34 with boundary-compatible Event-RAG retrieval, masked local
-# boundary inpainting, and latent transition-manifold blending.
+# boundary inpainting, and explicit unsafe-boundary fallback policy.
 #
 # Default mode reuses the existing V33/V34 checkpoint inference path.  Set
 # V34_TRAIN=1 when you want to run the full overnight research pipeline after
@@ -53,6 +53,17 @@ export V34_INPAINT_CONTEXT_FRAMES="${V34_INPAINT_CONTEXT_FRAMES:-4}"
 export V34_INPAINT_BLEND="${V34_INPAINT_BLEND:-${V32_INR_TRUST:-0.35}}"
 export V34_INPAINT_STEPS="${V34_INPAINT_STEPS:-${V32_INFERENCE_STEPS:-40}}"
 export V34_INPAINT_MAX_RISK_RATIO="${V34_INPAINT_MAX_RISK_RATIO:-1.03}"
+export V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES="${V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES:-1}"
+export V34_INPAINT_IMPROVE_JERK_TOL="${V34_INPAINT_IMPROVE_JERK_TOL:-1.05}"
+
+# Do not let a short SO(3) handshake destroy a usable inpainted boundary.  When
+# the post-handshake absolute gate is unsafe, keep the pre-handshake local
+# redraw and record the veto in the schedule report for later ranking.
+export V34_FAIL_ON_UNSAFE_BOUNDARY="${V34_FAIL_ON_UNSAFE_BOUNDARY:-0}"
+export V34_DEFER_UNSAFE_BOUNDARY="${V34_DEFER_UNSAFE_BOUNDARY:-1}"
+export V34_HANDSHAKE_FALLBACK_ON_UNSAFE="${V34_HANDSHAKE_FALLBACK_ON_UNSAFE:-1}"
+export V34_POST_HANDSHAKE_REPAIR="${V34_POST_HANDSHAKE_REPAIR:-0}"
+
 export V34_LATENT_SNIPPET_BLEND="${V34_LATENT_SNIPPET_BLEND:-1}"
 export V34_LATENT_BLEND_TOP_K="${V34_LATENT_BLEND_TOP_K:-3}"
 export V34_LATENT_BLEND_TEMPERATURE="${V34_LATENT_BLEND_TEMPERATURE:-0.08}"
@@ -64,7 +75,6 @@ if [[ "${V34_TRAIN:-0}" == "1" ]]; then
   bash scripts/launch_v34_full_overnight.sh "$@"
 else
   export V34_TRAIN=0
-  export V34_FAIL_ON_UNSAFE_BOUNDARY="${V34_FAIL_ON_UNSAFE_BOUNDARY:-0}"
   export RUN_ID="${RUN_ID:-v34_inpaint_blend_infer_$(date +%Y%m%d_%H%M%S)}"
   bash scripts/resume_v34_inference_v33ckpt.sh "$@"
 fi
