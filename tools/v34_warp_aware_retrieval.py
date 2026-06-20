@@ -419,6 +419,27 @@ def choose_events_v34(
     compat_hard_prune = _enabled("V34_COMPAT_HARD_PRUNE", "1")
     compat_weight = float(os.getenv("V34_BOUNDARY_COMPAT_WEIGHT", "1.20"))
     semantic_edge_weight = float(os.getenv("V34_SEMANTIC_EDGE_WEIGHT", "1.10"))
+    relax_constraints_on_empty = _enabled("V34_RELAX_CONSTRAINTS_ON_EMPTY", "1")
+    relax_compat_on_empty = (
+        relax_constraints_on_empty
+        and _enabled("V34_RELAX_COMPAT_ON_EMPTY", "1")
+    )
+    relax_semantic_on_empty = (
+        relax_constraints_on_empty
+        and _enabled("V34_RELAX_SEMANTIC_ON_EMPTY", "1")
+    )
+    compat_relax_penalty_weight = _env_float(
+        "V34_RELAX_COMPAT_PENALTY_WEIGHT",
+        max(5.0, 3.0 * compat_weight),
+    )
+    semantic_relax_penalty_weight = _env_float(
+        "V34_RELAX_SEMANTIC_PENALTY_WEIGHT",
+        max(4.5, 3.0 * semantic_edge_weight),
+    )
+    contact_relax_penalty_weight = _env_float(
+        "V34_RELAX_CONTACT_PENALTY_WEIGHT",
+        2.0,
+    )
 
     beam = [scheduler.CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
@@ -602,10 +623,15 @@ def choose_events_v34(
             np.argsort(base[feasible_indices])[::-1]
         ]
         shortlist = ranked_feasible[: min(node_top_k, len(ranked_feasible))]
+        strict_expanded: List[Any] = []
+        relaxed_expanded: List[Any] = []
         expanded: List[Any] = []
         rejected_warp = 0
         compat_rejected = 0
         semantic_rejected = 0
+        compat_deferred = 0
+        semantic_deferred = 0
+        contact_deferred = 0
         negotiated_count = 0
         budget_penalty_weight = float(
             os.getenv("V34_TRANSITION_BUDGET_PENALTY_WEIGHT", "0.035")
@@ -658,6 +684,12 @@ def choose_events_v34(
                 boundary_compat_meta: Dict[str, Any] = {"enabled": False}
                 semantic_edge_score = 0.0
                 semantic_edge_meta: Dict[str, Any] = {"enabled": False}
+                constraint_relaxed = False
+                compat_relaxed = False
+                semantic_relaxed = False
+                contact_relaxed = False
+                relaxation_reasons: List[str] = []
+                relaxation_penalty = 0.0
                 if state.selected:
                     previous = state.selected[-1]
                     cached_boundary = (
@@ -755,7 +787,39 @@ def choose_events_v34(
                             and bool(boundary_compat_meta.get("hard_reject", False))
                         ):
                             compat_rejected += 1
-                            continue
+                            if not relax_compat_on_empty:
+                                continue
+                            constraint_relaxed = True
+                            compat_relaxed = True
+                            compat_deferred += 1
+                            relaxation_reasons.append("boundary_compatibility")
+                            failed_checks = [
+                                str(key)
+                                for key, ok in dict(
+                                    boundary_compat_meta.get("checks", {})
+                                ).items()
+                                if not bool(ok)
+                            ]
+                            contact_failed = any(
+                                key in {
+                                    "contact",
+                                    "contact_binary",
+                                    "support_count",
+                                    "aerial_planted",
+                                    "stance_flip",
+                                }
+                                for key in failed_checks
+                            )
+                            if contact_failed:
+                                contact_relaxed = True
+                                contact_deferred += 1
+                                relaxation_reasons.append("contact_state")
+                            relaxation_penalty += (
+                                compat_relax_penalty_weight
+                                * (1.0 + boundary_compat_score)
+                            )
+                            if contact_failed:
+                                relaxation_penalty += contact_relax_penalty_weight
                         transition_meta = dict(transition_meta)
                         transition_meta["boundary_compatibility"] = (
                             boundary_compat_meta
@@ -775,7 +839,16 @@ def choose_events_v34(
                     semantic_edge_score = float(semantic_edge_meta.get("score", 0.0))
                     if bool(semantic_edge_meta.get("hard_reject", False)):
                         semantic_rejected += 1
-                        continue
+                        if not relax_semantic_on_empty:
+                            continue
+                        constraint_relaxed = True
+                        semantic_relaxed = True
+                        semantic_deferred += 1
+                        relaxation_reasons.append("semantic_continuity")
+                        relaxation_penalty += (
+                            semantic_relax_penalty_weight
+                            * (1.0 + semantic_edge_score)
+                        )
                     transition_meta = dict(transition_meta)
                     transition_meta["semantic_continuity"] = semantic_edge_meta
 
@@ -840,6 +913,27 @@ def choose_events_v34(
                 transition_meta["feasible_content_interval"] = (
                     feasible_content_interval
                 )
+                if relaxation_reasons:
+                    # Preserve order while removing duplicates.
+                    relaxation_reasons = list(dict.fromkeys(relaxation_reasons))
+                transition_meta["constraint_relaxation"] = {
+                    "enabled": bool(relax_constraints_on_empty),
+                    "active": bool(constraint_relaxed),
+                    "used_due_to_empty_strict": False,
+                    "compat_relaxed": bool(compat_relaxed),
+                    "semantic_relaxed": bool(semantic_relaxed),
+                    "contact_relaxed": bool(contact_relaxed),
+                    "reasons": relaxation_reasons,
+                    "penalty": float(relaxation_penalty),
+                    "penalty_weights": {
+                        "compat": float(compat_relax_penalty_weight),
+                        "semantic": float(semantic_relax_penalty_weight),
+                        "contact": float(contact_relax_penalty_weight),
+                    },
+                }
+                transition_meta["compat_relaxed"] = bool(compat_relaxed)
+                transition_meta["semantic_relaxed"] = bool(semantic_relaxed)
+                transition_meta["contact_relaxed"] = bool(contact_relaxed)
 
                 mmr = 0.0
                 if state.selected:
@@ -863,6 +957,7 @@ def choose_events_v34(
                     - args.source_repeat_weight * same_source
                     - warp_weight * warp_penalty
                     - transition_budget_penalty
+                    - relaxation_penalty
                 )
                 part = {
                     "slot": slot,
@@ -902,6 +997,14 @@ def choose_events_v34(
                     "warp_penalty": float(warp_penalty),
                     "transition_len": int(transition_len),
                     "transition_meta": transition_meta,
+                    "constraint_relaxed": bool(constraint_relaxed),
+                    "compat_relaxed": bool(compat_relaxed),
+                    "semantic_relaxed": bool(semantic_relaxed),
+                    "contact_relaxed": bool(contact_relaxed),
+                    "constraint_relaxation_reasons": relaxation_reasons,
+                    "constraint_relaxation_penalty": float(relaxation_penalty),
+                    "constraint_relaxation_used": False,
+                    "relax_constraints_on_empty": bool(relax_constraints_on_empty),
                     "style": float(style[idx]),
                     "quality": float(quality[idx]),
                     "safety": float(safety[idx]),
@@ -966,17 +1069,60 @@ def choose_events_v34(
                     "semantic_edge_weight": float(semantic_edge_weight),
                     "semantic_edge_score": float(semantic_edge_score),
                     "semantic_edge_meta": semantic_edge_meta,
+                    "semantic_edge_hard_prune": bool(
+                        _enabled("V34_SEMANTIC_EDGE_HARD_PRUNE", "1")
+                    ),
                     "gpu_boundary_cache": bool(gpu_boundary_cache_hit),
                     "mmr_penalty": float(mmr),
                     "score": float(score),
                 }
-                expanded.append(scheduler.CandidateState(
+                state_out = scheduler.CandidateState(
                     score=score,
                     selected=state.selected + [idx],
                     transition_lengths=state.transition_lengths
                     + [transition_len],
                     parts=state.parts + [part],
-                ))
+                )
+                if constraint_relaxed:
+                    relaxed_expanded.append(state_out)
+                else:
+                    strict_expanded.append(state_out)
+
+        if strict_expanded:
+            expanded = strict_expanded
+        elif relaxed_expanded and relax_constraints_on_empty:
+            expanded = relaxed_expanded
+            print(
+                "[V34-RELAX] "
+                f"slot={slot} strict feasible set empty; "
+                f"using {len(expanded)} relaxed candidates "
+                f"(compat_deferred={compat_deferred}, "
+                f"semantic_deferred={semantic_deferred}, "
+                f"contact_deferred={contact_deferred})."
+            )
+            for relaxed_state in expanded:
+                if not relaxed_state.parts:
+                    continue
+                relaxed_part = relaxed_state.parts[-1]
+                relaxed_part["constraint_relaxation_used"] = True
+                relaxed_transition_meta = dict(
+                    relaxed_part.get("transition_meta", {})
+                )
+                relax_meta = dict(
+                    relaxed_transition_meta.get("constraint_relaxation", {})
+                )
+                relax_meta["used_due_to_empty_strict"] = True
+                relaxed_transition_meta["constraint_relaxation"] = relax_meta
+                relaxed_transition_meta["semantic_relaxed"] = bool(
+                    relaxed_part.get("semantic_relaxed", False)
+                )
+                relaxed_transition_meta["compat_relaxed"] = bool(
+                    relaxed_part.get("compat_relaxed", False)
+                )
+                relaxed_transition_meta["contact_relaxed"] = bool(
+                    relaxed_part.get("contact_relaxed", False)
+                )
+                relaxed_part["transition_meta"] = relaxed_transition_meta
 
         if not expanded:
             raise RuntimeError(
@@ -985,13 +1131,16 @@ def choose_events_v34(
                 f"warp_rejected={rejected_warp}, "
                 f"compat_rejected={compat_rejected}, "
                 f"semantic_rejected={semantic_rejected}, "
+                f"compat_deferred={compat_deferred}, "
+                f"semantic_deferred={semantic_deferred}, "
+                f"contact_deferred={contact_deferred}, "
                 f"globally_feasible={len(feasible_indices)}, "
                 f"negotiated={negotiated_count}, "
-                f"warp_relaxed={warp_relaxed}. The failure is now caused by "
-                "boundary compatibility, graph/family/duplicate constraints, "
-                "or an undersized shortlist rather than warp ranking. Increase "
-                "the feasible shortlist first; relax compatibility only for "
-                "ablation, and keep the strict warp gate enabled."
+                f"warp_relaxed={warp_relaxed}, "
+                f"constraint_relax_on_empty={relax_constraints_on_empty}. "
+                "Even after adaptive semantic/contact relaxation, the graph is "
+                "deadlocked by non-relaxable constraints such as duplicate, "
+                "family, graph, or shortlist limits."
             )
         expanded.sort(key=lambda state: state.score, reverse=True)
         beam = expanded[: int(args.beam_size)]

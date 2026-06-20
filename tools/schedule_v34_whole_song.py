@@ -550,6 +550,14 @@ def generate_one_v34(
                 "V34_SEMANTIC_EDGE_HARD_PRUNE", "1"
             ),
             "warp_relax_on_empty": _enabled("V34_WARP_RELAX_ON_EMPTY", "1"),
+            "adaptive_constraint_relaxation": _enabled(
+                "V34_RELAX_CONSTRAINTS_ON_EMPTY", "1"
+            ),
+            "relax_compat_on_empty": _enabled("V34_RELAX_COMPAT_ON_EMPTY", "1"),
+            "relax_semantic_on_empty": _enabled("V34_RELAX_SEMANTIC_ON_EMPTY", "1"),
+            "inpaint_on_relaxed_constraint": _enabled(
+                "V34_INPAINT_ON_RELAXED_CONSTRAINT", "1"
+            ),
             "post_handshake_repair": _enabled(
                 "V34_POST_HANDSHAKE_REPAIR", "0"
             ),

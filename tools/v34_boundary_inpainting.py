@@ -84,6 +84,19 @@ def _should_inpaint(
     trigger = _env_float("V34_INPAINT_TRIGGER_RATIO", 0.72)
     compat_trigger = _env_float("V34_INPAINT_COMPAT_SCORE_TRIGGER", 0.10)
     compat_score = float((part or {}).get("boundary_compat_score", 0.0))
+    transition_meta = dict((part or {}).get("transition_meta", {}) or {})
+    relaxation_meta = dict(transition_meta.get("constraint_relaxation", {}) or {})
+    relaxed_constraint = bool(
+        _enabled("V34_INPAINT_ON_RELAXED_CONSTRAINT", "1")
+        and (
+            bool((part or {}).get("constraint_relaxed", False))
+            or bool((part or {}).get("semantic_relaxed", False))
+            or bool((part or {}).get("compat_relaxed", False))
+            or bool((part or {}).get("contact_relaxed", False))
+            or bool(relaxation_meta.get("active", False))
+            or bool(relaxation_meta.get("used_due_to_empty_strict", False))
+        )
+    )
     fallback = bool((diffusion_meta or {}).get("fallback_to_c2_baseline", False))
     unsafe = not all(_absolute_checks(risk).values())
     reasons = {
@@ -91,12 +104,15 @@ def _should_inpaint(
         "risk_trigger": bool(score >= trigger),
         "compat_score": compat_score,
         "compat_trigger": bool(compat_score >= compat_trigger),
+        "relaxed_constraint": bool(relaxed_constraint),
+        "relaxation_reasons": list(relaxation_meta.get("reasons", [])),
         "diffusion_fallback": fallback,
         "absolute_unsafe": bool(unsafe),
     }
     return bool(
         reasons["risk_trigger"]
         or reasons["compat_trigger"]
+        or reasons["relaxed_constraint"]
         or reasons["diffusion_fallback"]
         or reasons["absolute_unsafe"]
     ), reasons
