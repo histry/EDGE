@@ -112,6 +112,10 @@ class V34SlotBoundaryCache:
     velocity_jump: np.ndarray
     acceleration_jump: np.ndarray
     contact_jump: np.ndarray
+    contact_binary_jump: np.ndarray
+    support_count_jump: np.ndarray
+    aerial_planted_switch: np.ndarray
+    stance_flip: np.ndarray
     yaw_gap_deg: np.ndarray
     transition_cost: np.ndarray
     transition_len: np.ndarray
@@ -134,6 +138,10 @@ class V34SlotBoundaryCache:
             "velocity_jump": float(self.velocity_jump[row, col]),
             "acceleration_jump": float(self.acceleration_jump[row, col]),
             "contact_jump": float(self.contact_jump[row, col]),
+            "contact_binary_jump": float(self.contact_binary_jump[row, col]),
+            "support_count_jump": float(self.support_count_jump[row, col]),
+            "aerial_planted_switch": float(self.aerial_planted_switch[row, col]),
+            "stance_flip": float(self.stance_flip[row, col]),
             "yaw_gap_deg": float(self.yaw_gap_deg[row, col]),
         }
         capped_from = int(self.slot_budget_capped_from[row, col])
@@ -156,6 +164,10 @@ class V34SlotBoundaryCache:
             "velocity_jump": boundary["velocity_jump"],
             "acceleration_jump": boundary["acceleration_jump"],
             "contact_jump": boundary["contact_jump"],
+            "contact_binary_jump": boundary["contact_binary_jump"],
+            "support_count_jump": boundary["support_count_jump"],
+            "aerial_planted_switch": boundary["aerial_planted_switch"],
+            "stance_flip": boundary["stance_flip"],
             "yaw_gap_deg": boundary["yaw_gap_deg"],
             "yaw_required_frames": int(self.yaw_required_frames[row, col]),
             "chosen_transition_frames": transition,
@@ -246,6 +258,35 @@ class V34GpuCandidateCache:
             torch.abs(prev_exit[:, None, CONTACT] - next_entry[None, :, CONTACT]),
             dim=-1,
         )
+        contact_threshold = float(os.getenv("V34_COMPAT_CONTACT_BINARY_THRESHOLD", "0.5"))
+        prev_contact_hard = (prev_exit[:, CONTACT] >= contact_threshold).to(torch.float32)
+        next_contact_hard = (next_entry[:, CONTACT] >= contact_threshold).to(torch.float32)
+        contact_binary = torch.mean(
+            torch.abs(prev_contact_hard[:, None, :] - next_contact_hard[None, :, :]),
+            dim=-1,
+        )
+        prev_support = torch.sum(prev_contact_hard, dim=-1)
+        next_support = torch.sum(next_contact_hard, dim=-1)
+        support_count = torch.abs(prev_support[:, None] - next_support[None, :]) / 4.0
+        prev_air = prev_support <= 0.5
+        next_air = next_support <= 0.5
+        prev_planted = prev_support >= 2.0
+        next_planted = next_support >= 2.0
+        aerial_planted = (
+            (prev_air[:, None] & next_planted[None, :])
+            | (prev_planted[:, None] & next_air[None, :])
+        ).to(torch.float32)
+        prev_left = prev_contact_hard[:, 0] + prev_contact_hard[:, 2]
+        prev_right = prev_contact_hard[:, 1] + prev_contact_hard[:, 3]
+        next_left = next_contact_hard[:, 0] + next_contact_hard[:, 2]
+        next_right = next_contact_hard[:, 1] + next_contact_hard[:, 3]
+        prev_side = torch.sign(prev_left - prev_right)
+        next_side = torch.sign(next_left - next_right)
+        stance_flip = (
+            (prev_side[:, None] * next_side[None, :] < 0.0)
+            & (prev_support[:, None] >= 1.0)
+            & (next_support[None, :] >= 1.0)
+        ).to(torch.float32)
 
         prev_root = rotation_6d_to_matrix(prev_exit[:, ROOT_ROT6D])
         next_root = rotation_6d_to_matrix(next_entry[:, ROOT_ROT6D])
@@ -316,6 +357,10 @@ class V34GpuCandidateCache:
             velocity_jump=to_cpu(velocity).astype(np.float32),
             acceleration_jump=to_cpu(acceleration).astype(np.float32),
             contact_jump=to_cpu(contact).astype(np.float32),
+            contact_binary_jump=to_cpu(contact_binary).astype(np.float32),
+            support_count_jump=to_cpu(support_count).astype(np.float32),
+            aerial_planted_switch=to_cpu(aerial_planted).astype(np.float32),
+            stance_flip=to_cpu(stance_flip).astype(np.float32),
             yaw_gap_deg=to_cpu(yaw_gap).astype(np.float32),
             transition_cost=to_cpu(transition_cost).astype(np.float32),
             transition_len=to_cpu(chosen).astype(np.int32),

@@ -31,6 +31,169 @@ def _enabled(name: str, default: str = "1") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _array_or(
+    source: Any,
+    key: str,
+    fallback: np.ndarray,
+    dtype=np.float32,
+) -> np.ndarray:
+    if source is None:
+        return np.asarray(fallback, dtype=dtype)
+    try:
+        if key in source:
+            return np.asarray(source[key], dtype=dtype)
+    except Exception:
+        pass
+    return np.asarray(fallback, dtype=dtype)
+
+
+def _soft_ratio(value: float, limit: float) -> float:
+    return float(max(0.0, value / max(limit, 1e-8) - 1.0))
+
+
+def _slot_reset_allow(phrase: Any) -> float:
+    boundary_strength = float(getattr(phrase, "boundary_accent_strength", 0.0))
+    music_event = str(getattr(phrase, "music_event", "neutral_flow"))
+    tension = float(getattr(phrase, "tension", 0.0))
+    calm = float(getattr(phrase, "calmness", 0.0))
+    return float(np.clip(
+        0.12 + 0.55 * boundary_strength + 0.20 * tension - 0.12 * calm
+        + (0.18 if music_event == "section_change" else 0.0),
+        0.0,
+        0.85,
+    ))
+
+
+def _semantic_continuity_penalty(
+    *,
+    selected: Sequence[int],
+    previous: int,
+    candidate: int,
+    phrase: Any,
+    event_types: Sequence[str],
+    families: Sequence[str],
+    natural: np.ndarray,
+    body_code: np.ndarray,
+    activity01: np.ndarray,
+    turn01: np.ndarray,
+) -> Dict[str, Any]:
+    if not _enabled("V34_SEMANTIC_EDGE", "1"):
+        return {"enabled": False, "score": 0.0, "hard_reject": False}
+
+    reset_allow = _slot_reset_allow(phrase)
+    prev_body = float(body_code[int(previous)])
+    next_body = float(body_code[int(candidate)])
+    body_jump = abs(next_body - prev_body) / 5.0
+    activity_jump = abs(float(activity01[int(candidate)]) - float(activity01[int(previous)]))
+    turn_jump = abs(float(turn01[int(candidate)]) - float(turn01[int(previous)]))
+    prev_event = str(event_types[int(previous)])
+    next_event = str(event_types[int(candidate)])
+    event_jump = 1.0 - float(scheduler.event_compatibility(prev_event, next_event))
+    duration_jump = abs(float(np.log(
+        max(float(natural[int(candidate)]), 1.0)
+        / max(float(natural[int(previous)]), 1.0)
+    )))
+
+    memory_window = max(1, _env_int("V34_MOTIF_MEMORY_WINDOW", 4))
+    recent = [int(x) for x in selected[-memory_window:]]
+    if recent:
+        memory_activity = abs(float(activity01[int(candidate)]) - float(np.mean(activity01[recent])))
+        memory_body = min(abs(float(body_code[int(candidate)]) - float(body_code[int(x)])) / 5.0 for x in recent)
+        recent_family_repeat = sum(1 for x in recent if str(families[int(x)]) == str(families[int(candidate)]))
+    else:
+        memory_activity = 0.0
+        memory_body = 0.0
+        recent_family_repeat = 0
+
+    body_allow = _env_float("V34_SEMANTIC_MAX_BODY_JUMP", 0.24) + 0.48 * reset_allow
+    activity_allow = _env_float("V34_SEMANTIC_MAX_ACTIVITY_JUMP", 0.18) + 0.42 * reset_allow
+    turn_allow = _env_float("V34_SEMANTIC_MAX_TURN_JUMP", 0.22) + 0.40 * reset_allow
+    event_allow = _env_float("V34_SEMANTIC_MAX_EVENT_JUMP", 0.48) + 0.35 * reset_allow
+    duration_allow = _env_float("V34_SEMANTIC_MAX_DURATION_LOG_JUMP", 0.42) + 0.35 * reset_allow
+    memory_activity_allow = _env_float("V34_MOTIF_MAX_MEMORY_ACTIVITY_JUMP", 0.26) + 0.35 * reset_allow
+    memory_body_allow = _env_float("V34_MOTIF_MAX_MEMORY_BODY_JUMP", 0.36) + 0.35 * reset_allow
+
+    terms = {
+        "body": _soft_ratio(body_jump, body_allow),
+        "activity": _soft_ratio(activity_jump, activity_allow),
+        "turn": _soft_ratio(turn_jump, turn_allow),
+        "event": _soft_ratio(event_jump, event_allow),
+        "duration": _soft_ratio(duration_jump, duration_allow),
+        "memory_activity": _soft_ratio(memory_activity, memory_activity_allow),
+        "memory_body": _soft_ratio(memory_body, memory_body_allow),
+    }
+    score = (
+        1.15 * terms["body"]
+        + 1.05 * terms["activity"]
+        + 0.55 * terms["turn"]
+        + 0.90 * terms["event"]
+        + 0.55 * terms["duration"]
+        + _env_float("V34_MOTIF_MEMORY_WEIGHT", 0.65)
+        * (0.65 * terms["memory_activity"] + 0.35 * terms["memory_body"])
+    )
+    hard_checks = {
+        "body": body_jump <= body_allow,
+        "activity": activity_jump <= activity_allow,
+        "turn": turn_jump <= turn_allow,
+        "event": event_jump <= event_allow,
+        "duration": duration_jump <= duration_allow,
+    }
+    if _enabled("V34_MOTIF_MEMORY_HARD_PRUNE", "0"):
+        hard_checks.update({
+            "memory_activity": memory_activity <= memory_activity_allow,
+            "memory_body": memory_body <= memory_body_allow,
+        })
+
+    return {
+        "enabled": True,
+        "score": float(score),
+        "hard_reject": bool(
+            _enabled("V34_SEMANTIC_EDGE_HARD_PRUNE", "1")
+            and not all(bool(x) for x in hard_checks.values())
+        ),
+        "checks": hard_checks,
+        "terms": {key: float(value) for key, value in terms.items()},
+        "metrics": {
+            "body_jump": float(body_jump),
+            "activity_jump": float(activity_jump),
+            "turn_jump": float(turn_jump),
+            "event_jump": float(event_jump),
+            "duration_log_jump": float(duration_jump),
+            "memory_activity_jump": float(memory_activity),
+            "memory_body_jump": float(memory_body),
+            "recent_family_repeat": int(recent_family_repeat),
+        },
+        "limits": {
+            "body_jump": float(body_allow),
+            "activity_jump": float(activity_allow),
+            "turn_jump": float(turn_allow),
+            "event_jump": float(event_allow),
+            "duration_log_jump": float(duration_allow),
+            "memory_activity_jump": float(memory_activity_allow),
+            "memory_body_jump": float(memory_body_allow),
+        },
+        "context": {
+            "reset_allow": float(reset_allow),
+            "previous_event": prev_event,
+            "candidate_event": next_event,
+        },
+    }
+
+
 def _broad_feasible_mask(
     natural: np.ndarray,
     *,
@@ -209,6 +372,21 @@ def choose_events_v34(
         np.asarray(arrays["turn_angle_deg"], dtype=np.float32)
         if "turn_angle_deg" in names else np.zeros_like(natural)
     )
+    hierarchy_body_fallback = np.full((len(natural),), 2.0, dtype=np.float32)
+    hierarchy_activity_fallback = (
+        motion_desc[:, 0].astype(np.float32)
+        if motion_desc.ndim == 2 and motion_desc.shape[1] > 0
+        else np.full((len(natural),), 0.5, dtype=np.float32)
+    )
+    body_code = _array_or(hierarchy, "body_code", hierarchy_body_fallback, dtype=np.float32)
+    activity01 = _array_or(hierarchy, "activity01", hierarchy_activity_fallback, dtype=np.float32)
+    turn01 = _array_or(hierarchy, "turn01", np.zeros((len(natural),), dtype=np.float32), dtype=np.float32)
+    if len(body_code) != len(natural):
+        body_code = hierarchy_body_fallback
+    if len(activity01) != len(natural):
+        activity01 = hierarchy_activity_fallback
+    if len(turn01) != len(natural):
+        turn01 = np.zeros((len(natural),), dtype=np.float32)
     entry_pose = np.asarray(arrays["entry_pose"], dtype=np.float32)
     exit_pose = np.asarray(arrays["exit_pose"], dtype=np.float32)
     entry_vel = np.asarray(arrays["entry_vel"], dtype=np.float32)
@@ -228,6 +406,8 @@ def choose_events_v34(
 
     minimum = float(os.getenv("V34_WARP_MIN", str(args.min_time_warp)))
     maximum = float(os.getenv("V34_WARP_MAX", str(args.max_time_warp)))
+    relaxed_minimum = float(os.getenv("V34_WARP_RELAX_MIN", str(args.min_time_warp)))
+    relaxed_maximum = float(os.getenv("V34_WARP_RELAX_MAX", str(args.max_time_warp)))
     tolerance = float(os.getenv("V34_WARP_TOLERANCE", "0.0"))
     hard_prune = _enabled("V34_WARP_HARD_PRUNE", "1")
     warp_weight = float(os.getenv("V34_WARP_PENALTY_WEIGHT", "1.25"))
@@ -238,6 +418,7 @@ def choose_events_v34(
     )
     compat_hard_prune = _enabled("V34_COMPAT_HARD_PRUNE", "1")
     compat_weight = float(os.getenv("V34_BOUNDARY_COMPAT_WEIGHT", "1.20"))
+    semantic_edge_weight = float(os.getenv("V34_SEMANTIC_EDGE_WEIGHT", "1.10"))
 
     beam = [scheduler.CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
@@ -366,6 +547,9 @@ def choose_events_v34(
         # The previous implementation ranked all 4,225 events first and only
         # then tested the top-K. Short events needed by a small slot could be
         # absent from that top-K even when they existed in the database.
+        slot_minimum = minimum
+        slot_maximum = maximum
+        warp_relaxed = False
         broad_feasible = _broad_feasible_mask(
             natural,
             slot_length=int(phrase.length),
@@ -378,12 +562,36 @@ def choose_events_v34(
             tolerance=tolerance,
         )
         feasible_indices = np.flatnonzero(broad_feasible)
+        if (
+            len(feasible_indices) == 0
+            and _enabled("V34_WARP_RELAX_ON_EMPTY", "1")
+            and (relaxed_minimum < minimum or relaxed_maximum > maximum)
+        ):
+            relaxed_mask = _broad_feasible_mask(
+                natural,
+                slot_length=int(phrase.length),
+                first_slot=(slot == 0),
+                min_content_frames=int(args.min_content_frames),
+                transition_min_frames=int(args.transition_min_frames),
+                transition_max_frames=int(args.transition_max_frames),
+                minimum_warp=relaxed_minimum,
+                maximum_warp=relaxed_maximum,
+                tolerance=tolerance,
+            )
+            relaxed_indices = np.flatnonzero(relaxed_mask)
+            if len(relaxed_indices) > 0:
+                broad_feasible = relaxed_mask
+                feasible_indices = relaxed_indices
+                slot_minimum = relaxed_minimum
+                slot_maximum = relaxed_maximum
+                warp_relaxed = True
         if len(feasible_indices) == 0:
             natural_min = float(np.min(natural)) if len(natural) else float("nan")
             natural_max = float(np.max(natural)) if len(natural) else float("nan")
             raise RuntimeError(
                 f"V34 slot has no globally warp-feasible event: slot={slot}, "
                 f"music_length={phrase.length}, bounds=[{minimum},{maximum}], "
+                f"relaxed_bounds=[{relaxed_minimum},{relaxed_maximum}], "
                 f"natural_range=[{natural_min},{natural_max}], "
                 f"min_content={args.min_content_frames}, "
                 f"transition_range=[{args.transition_min_frames},"
@@ -397,6 +605,7 @@ def choose_events_v34(
         expanded: List[Any] = []
         rejected_warp = 0
         compat_rejected = 0
+        semantic_rejected = 0
         negotiated_count = 0
         budget_penalty_weight = float(
             os.getenv("V34_TRANSITION_BUDGET_PENALTY_WEIGHT", "0.035")
@@ -447,6 +656,8 @@ def choose_events_v34(
                 gpu_boundary_cache_hit = False
                 boundary_compat_score = 0.0
                 boundary_compat_meta: Dict[str, Any] = {"enabled": False}
+                semantic_edge_score = 0.0
+                semantic_edge_meta: Dict[str, Any] = {"enabled": False}
                 if state.selected:
                     previous = state.selected[-1]
                     cached_boundary = (
@@ -549,6 +760,24 @@ def choose_events_v34(
                         transition_meta["boundary_compatibility"] = (
                             boundary_compat_meta
                         )
+                    semantic_edge_meta = _semantic_continuity_penalty(
+                        selected=state.selected,
+                        previous=int(previous),
+                        candidate=int(idx),
+                        phrase=phrase,
+                        event_types=event_types,
+                        families=families,
+                        natural=natural,
+                        body_code=body_code,
+                        activity01=activity01,
+                        turn01=turn01,
+                    )
+                    semantic_edge_score = float(semantic_edge_meta.get("score", 0.0))
+                    if bool(semantic_edge_meta.get("hard_reject", False)):
+                        semantic_rejected += 1
+                        continue
+                    transition_meta = dict(transition_meta)
+                    transition_meta["semantic_continuity"] = semantic_edge_meta
 
                 desired_transition_len = int(transition_len)
                 negotiated = _negotiate_transition_budget(
@@ -559,8 +788,8 @@ def choose_events_v34(
                     min_content_frames=int(args.min_content_frames),
                     transition_min_frames=int(args.transition_min_frames),
                     transition_max_frames=int(args.transition_max_frames),
-                    minimum_warp=minimum,
-                    maximum_warp=maximum,
+                    minimum_warp=slot_minimum,
+                    maximum_warp=slot_maximum,
                     tolerance=tolerance,
                 )
                 if negotiated is None:
@@ -628,6 +857,7 @@ def choose_events_v34(
                     * boundary_acceleration_penalty
                     - args.graph_edge_weight * graph_edge_cost
                     - compat_weight * boundary_compat_score
+                    - semantic_edge_weight * semantic_edge_score
                     - args.mmr_weight * mmr
                     - args.family_repeat_weight * same_family
                     - args.source_repeat_weight * same_source
@@ -667,6 +897,8 @@ def choose_events_v34(
                     "warp_ratio_at_retrieval": warp_ratio,
                     "warp_feasible": bool(feasible),
                     "warp_bounds": [minimum, maximum],
+                    "effective_warp_bounds": [slot_minimum, slot_maximum],
+                    "warp_relaxed": bool(warp_relaxed),
                     "warp_penalty": float(warp_penalty),
                     "transition_len": int(transition_len),
                     "transition_meta": transition_meta,
@@ -731,6 +963,9 @@ def choose_events_v34(
                     "boundary_compat_hard_prune": bool(compat_hard_prune),
                     "boundary_compat_score": float(boundary_compat_score),
                     "boundary_compat_meta": boundary_compat_meta,
+                    "semantic_edge_weight": float(semantic_edge_weight),
+                    "semantic_edge_score": float(semantic_edge_score),
+                    "semantic_edge_meta": semantic_edge_meta,
                     "gpu_boundary_cache": bool(gpu_boundary_cache_hit),
                     "mmr_penalty": float(mmr),
                     "score": float(score),
@@ -749,8 +984,10 @@ def choose_events_v34(
                 f"music_length={phrase.length}, bounds=[{minimum},{maximum}], "
                 f"warp_rejected={rejected_warp}, "
                 f"compat_rejected={compat_rejected}, "
+                f"semantic_rejected={semantic_rejected}, "
                 f"globally_feasible={len(feasible_indices)}, "
-                f"negotiated={negotiated_count}. The failure is now caused by "
+                f"negotiated={negotiated_count}, "
+                f"warp_relaxed={warp_relaxed}. The failure is now caused by "
                 "boundary compatibility, graph/family/duplicate constraints, "
                 "or an undersized shortlist rather than warp ranking. Increase "
                 "the feasible shortlist first; relax compatibility only for "

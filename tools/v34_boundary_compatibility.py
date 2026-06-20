@@ -40,6 +40,18 @@ def _soft_ratio(value: float, limit: float) -> float:
     return float(max(0.0, value / max(limit, 1e-8) - 1.0))
 
 
+def _hard_contact_value(
+    candidate_boundary: Mapping[str, float],
+    name: str,
+    fallback: float,
+) -> float:
+    value = candidate_boundary.get(name, fallback)
+    try:
+        return float(value)
+    except Exception:
+        return float(fallback)
+
+
 def evaluate_boundary_compatibility(
     *,
     previous_index: int,
@@ -62,6 +74,26 @@ def evaluate_boundary_compatibility(
     velocity = float(candidate_boundary.get("velocity_jump", 0.0))
     acceleration = float(candidate_boundary.get("acceleration_jump", 0.0))
     contact = float(candidate_boundary.get("contact_jump", 0.0))
+    contact_binary = _hard_contact_value(
+        candidate_boundary,
+        "contact_binary_jump",
+        min(1.0, 2.0 * contact),
+    )
+    support_count_jump = _hard_contact_value(
+        candidate_boundary,
+        "support_count_jump",
+        0.0,
+    )
+    aerial_planted_switch = _hard_contact_value(
+        candidate_boundary,
+        "aerial_planted_switch",
+        0.0,
+    )
+    stance_flip = _hard_contact_value(
+        candidate_boundary,
+        "stance_flip",
+        0.0,
+    )
     yaw = float(candidate_boundary.get("yaw_gap_deg", 0.0))
     transition = float(transition_cost)
 
@@ -82,6 +114,8 @@ def evaluate_boundary_compatibility(
     velocity_limit = _env_float("V34_COMPAT_MAX_VELOCITY_JUMP", 0.060) * (1.0 + 0.25 * reset_allow)
     acceleration_limit = _env_float("V34_COMPAT_MAX_ACCELERATION_JUMP", 0.120) * (1.0 + 0.25 * reset_allow)
     contact_limit = _env_float("V34_COMPAT_MAX_CONTACT_JUMP", 0.62) + 0.12 * reset_allow
+    contact_binary_limit = _env_float("V34_COMPAT_MAX_CONTACT_BINARY_JUMP", 0.50) + 0.10 * reset_allow
+    support_count_limit = _env_float("V34_COMPAT_MAX_SUPPORT_COUNT_JUMP", 0.50) + 0.15 * reset_allow
     yaw_limit = _env_float("V34_COMPAT_MAX_YAW_GAP_DEG", 62.0) + 28.0 * reset_allow
     transition_limit = _env_float("V34_COMPAT_MAX_TRANSITION_COST", 0.95) * (1.0 + 0.35 * reset_allow)
 
@@ -104,6 +138,10 @@ def evaluate_boundary_compatibility(
         "velocity": _soft_ratio(velocity, velocity_limit),
         "acceleration": _soft_ratio(acceleration, acceleration_limit),
         "contact": _soft_ratio(contact, contact_limit),
+        "contact_binary": _soft_ratio(contact_binary, contact_binary_limit),
+        "support_count": _soft_ratio(support_count_jump, support_count_limit),
+        "aerial_planted": float(aerial_planted_switch),
+        "stance_flip": 0.5 * float(stance_flip),
         "yaw": _soft_ratio(yaw, yaw_limit),
         "transition": _soft_ratio(transition, transition_limit),
         "body": _soft_ratio(body_jump, body_allow),
@@ -117,6 +155,10 @@ def evaluate_boundary_compatibility(
         + 0.95 * terms["yaw"]
         + 0.80 * terms["transition"]
         + 0.70 * terms["contact"]
+        + 1.15 * terms["contact_binary"]
+        + 0.90 * terms["support_count"]
+        + 1.40 * terms["aerial_planted"]
+        + 0.50 * terms["stance_flip"]
         + 0.45 * terms["body"]
         + 0.35 * terms["activity"]
         + 0.25 * terms["turn"]
@@ -127,9 +169,15 @@ def evaluate_boundary_compatibility(
         "velocity": velocity <= velocity_limit,
         "acceleration": acceleration <= acceleration_limit,
         "contact": contact <= contact_limit,
+        "contact_binary": contact_binary <= contact_binary_limit,
+        "support_count": support_count_jump <= support_count_limit,
         "yaw": yaw <= yaw_limit,
         "transition": transition <= transition_limit,
     }
+    if _enabled("V34_COMPAT_FORBID_AERIAL_PLANTED_SWITCH", "1"):
+        hard_checks["aerial_planted"] = aerial_planted_switch < 0.5
+    if _enabled("V34_COMPAT_FORBID_STANCE_FLIP", "0"):
+        hard_checks["stance_flip"] = stance_flip < 0.5
     if _enabled("V34_COMPAT_SEMANTIC_HARD_PRUNE", "0"):
         hard_checks.update({
             "body": body_jump <= body_allow,
@@ -149,6 +197,10 @@ def evaluate_boundary_compatibility(
             "velocity_jump": velocity,
             "acceleration_jump": acceleration,
             "contact_jump": contact,
+            "contact_binary_jump": float(contact_binary),
+            "support_count_jump": float(support_count_jump),
+            "aerial_planted_switch": float(aerial_planted_switch),
+            "stance_flip": float(stance_flip),
             "yaw_gap_deg": yaw,
             "transition_cost": transition,
             "body_jump": float(body_jump),
@@ -160,6 +212,8 @@ def evaluate_boundary_compatibility(
             "velocity_jump": float(velocity_limit),
             "acceleration_jump": float(acceleration_limit),
             "contact_jump": float(contact_limit),
+            "contact_binary_jump": float(contact_binary_limit),
+            "support_count_jump": float(support_count_limit),
             "yaw_gap_deg": float(yaw_limit),
             "transition_cost": float(transition_limit),
             "body_jump": float(body_allow),

@@ -542,6 +542,14 @@ def generate_one_v34(
             "handshake_fallback_on_unsafe": _enabled(
                 "V34_HANDSHAKE_FALLBACK_ON_UNSAFE", "1"
             ),
+            "semantic_contact_hard_prune": _enabled(
+                "V34_COMPAT_SEMANTIC_HARD_PRUNE", "0"
+            ),
+            "semantic_edge_router": _enabled("V34_SEMANTIC_EDGE", "1"),
+            "semantic_edge_hard_prune": _enabled(
+                "V34_SEMANTIC_EDGE_HARD_PRUNE", "1"
+            ),
+            "warp_relax_on_empty": _enabled("V34_WARP_RELAX_ON_EMPTY", "1"),
             "post_handshake_repair": _enabled(
                 "V34_POST_HANDSHAKE_REPAIR", "0"
             ),
