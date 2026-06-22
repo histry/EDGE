@@ -95,6 +95,9 @@ def _motion_rhythm_features(
             "max_energy": 0.0,
             "first1s_energy_ratio": 0.0,
             "tail_mean_energy": 0.0,
+            "late_energy_ratio": 0.0,
+            "tail_to_mean_energy": 0.0,
+            "low_energy_fraction": 1.0,
         }
 
     rot = x[:, 7:151] if x.shape[1] >= 151 else x
@@ -111,17 +114,29 @@ def _motion_rhythm_features(
             "max_energy": 0.0,
             "first1s_energy_ratio": 0.0,
             "tail_mean_energy": 0.0,
+            "late_energy_ratio": 0.0,
+            "tail_to_mean_energy": 0.0,
+            "low_energy_fraction": 1.0,
         }
 
     first = energy[: min(int(fps), len(energy))]
     tail = energy[len(energy) // 2:]
     total = float(np.sum(energy) + 1e-8)
+    mean_energy = float(np.mean(energy))
+    late_start = min(len(energy), max(0, int(round(0.40 * len(energy)))))
+    late = energy[late_start:]
+    low_threshold = _env_float("V34_LOW_ENERGY_FRAME_THRESHOLD", 0.010)
     return {
-        "mean_energy": float(np.mean(energy)),
+        "mean_energy": mean_energy,
         "p90_energy": float(np.percentile(energy, 90)),
         "max_energy": float(np.max(energy)),
         "first1s_energy_ratio": float(np.sum(first) / total),
         "tail_mean_energy": float(np.mean(tail)) if len(tail) else 0.0,
+        "late_energy_ratio": float(np.sum(late) / total) if len(late) else 0.0,
+        "tail_to_mean_energy": float(
+            (np.mean(tail) if len(tail) else 0.0) / max(mean_energy, 1e-8)
+        ),
+        "low_energy_fraction": float(np.mean(energy < low_threshold)),
     }
 
 
@@ -139,6 +154,9 @@ def _build_rhythm_feature_arrays(
             "max_energy": empty,
             "first1s_energy_ratio": empty,
             "tail_mean_energy": empty,
+            "late_energy_ratio": empty,
+            "tail_to_mean_energy": empty,
+            "low_energy_fraction": empty,
         }
     return {
         key: np.asarray([float(row[key]) for row in rows], dtype=np.float32)
@@ -186,9 +204,28 @@ def _rhythm_prior_penalty_arrays(
     mean_e = rhythm_features["mean_energy"]
     first_ratio = rhythm_features["first1s_energy_ratio"]
     tail_e = rhythm_features["tail_mean_energy"]
+    late_ratio = rhythm_features.get(
+        "late_energy_ratio",
+        np.zeros_like(mean_e, dtype=np.float32),
+    )
+    tail_to_mean = rhythm_features.get(
+        "tail_to_mean_energy",
+        np.zeros_like(mean_e, dtype=np.float32),
+    )
+    low_energy_fraction = rhythm_features.get(
+        "low_energy_fraction",
+        np.ones_like(mean_e, dtype=np.float32),
+    )
     zeros = np.zeros_like(mean_e, dtype=np.float32)
     if not _enabled("V34_RHYTHM_DEGRADATION_PENALTY", "0"):
-        return zeros, {"hold": zeros, "density": zeros}, {
+        return zeros, {
+            "hold": zeros,
+            "density": zeros,
+            "frontload": zeros,
+            "tail_ratio": zeros,
+            "coverage": zeros,
+            "low_energy": zeros,
+        }, {
             "enabled": 0.0,
             "music_motion_pressure": 0.0,
             "musical_silence": 0.0,
@@ -196,37 +233,82 @@ def _rhythm_prior_penalty_arrays(
 
     is_silence = _is_musical_silence(phrase)
     if is_silence:
-        return zeros, {"hold": zeros, "density": zeros}, {
+        return zeros, {
+            "hold": zeros,
+            "density": zeros,
+            "frontload": zeros,
+            "tail_ratio": zeros,
+            "coverage": zeros,
+            "low_energy": zeros,
+        }, {
             "enabled": 1.0,
             "music_motion_pressure": 0.0,
             "musical_silence": 1.0,
         }
 
     pressure = max(_env_float("V34_RHYTHM_MIN_PRESSURE", 0.45), _music_motion_pressure(phrase))
-    ratio_limit = _env_float("V34_HOLD_FIRST1S_RATIO_LIMIT", 0.65)
-    tail_limit = _env_float("V34_HOLD_TAIL_ENERGY_LIMIT", 0.020)
-    min_mean = _env_float("V34_MIN_SLOT_MEAN_ENERGY", 0.015)
+    ratio_limit = _env_float("V34_HOLD_FIRST1S_RATIO_LIMIT", 0.55)
+    tail_limit = _env_float("V34_HOLD_TAIL_ENERGY_LIMIT", 0.024)
+    min_mean = _env_float("V34_MIN_SLOT_MEAN_ENERGY", 0.018)
+    late_ratio_min = _env_float("V34_LATE_ENERGY_RATIO_MIN", 0.34)
+    tail_mean_ratio_min = _env_float("V34_TAIL_MEAN_RATIO_MIN", 0.55)
+    low_energy_fraction_max = _env_float("V34_LOW_ENERGY_FRACTION_MAX", 0.62)
     duration_min = _env_float("V34_DENSITY_SLOT_DURATION_MIN_SEC", 1.5)
-    hold_weight = _env_float("V34_HOLD_PENALTY_WEIGHT", 3.50)
-    density_weight = _env_float("V34_DENSITY_PENALTY_WEIGHT", 4.00)
-    global_weight = _env_float("V34_RHYTHM_WEIGHT", 1.0)
+    hold_weight = _env_float("V34_HOLD_PENALTY_WEIGHT", 4.00)
+    density_weight = _env_float("V34_DENSITY_PENALTY_WEIGHT", 4.50)
+    frontload_weight = _env_float("V34_FRONTLOAD_PENALTY_WEIGHT", 4.50)
+    tail_ratio_weight = _env_float("V34_TAIL_RATIO_PENALTY_WEIGHT", 3.00)
+    coverage_weight = _env_float("V34_COVERAGE_PENALTY_WEIGHT", 2.75)
+    low_energy_weight = _env_float("V34_LOW_ENERGY_PENALTY_WEIGHT", 2.00)
+    global_weight = _env_float("V34_RHYTHM_WEIGHT", 1.20)
 
-    ratio_excess = np.maximum(0.0, first_ratio - ratio_limit)
+    ratio_excess = np.maximum(0.0, (first_ratio - ratio_limit) / max(1.0 - ratio_limit, 1e-8))
+    frontload_penalty = frontload_weight * np.square(ratio_excess) * pressure
     tail_deficit = np.maximum(0.0, (tail_limit - tail_e) / max(tail_limit, 1e-8))
     hold_penalty = hold_weight * ratio_excess * tail_deficit * pressure
 
     if float(slot_duration_sec) > duration_min:
         density_deficit = np.maximum(0.0, (min_mean - mean_e) / max(min_mean, 1e-8))
         density_penalty = density_weight * np.square(density_deficit) * pressure
+        tail_ratio_deficit = np.maximum(
+            0.0,
+            (tail_mean_ratio_min - tail_to_mean) / max(tail_mean_ratio_min, 1e-8),
+        )
+        tail_ratio_penalty = tail_ratio_weight * np.square(tail_ratio_deficit) * pressure
+        coverage_deficit = np.maximum(
+            0.0,
+            (late_ratio_min - late_ratio) / max(late_ratio_min, 1e-8),
+        )
+        coverage_penalty = coverage_weight * np.square(coverage_deficit) * pressure
+        low_energy_excess = np.maximum(
+            0.0,
+            (low_energy_fraction - low_energy_fraction_max)
+            / max(1.0 - low_energy_fraction_max, 1e-8),
+        )
+        low_energy_penalty = low_energy_weight * np.square(low_energy_excess) * pressure
     else:
         density_penalty = zeros
+        tail_ratio_penalty = zeros
+        coverage_penalty = zeros
+        low_energy_penalty = zeros
 
-    total = global_weight * (hold_penalty + density_penalty)
+    total = global_weight * (
+        hold_penalty
+        + density_penalty
+        + frontload_penalty
+        + tail_ratio_penalty
+        + coverage_penalty
+        + low_energy_penalty
+    )
     return (
         np.asarray(total, dtype=np.float32),
         {
             "hold": np.asarray(global_weight * hold_penalty, dtype=np.float32),
             "density": np.asarray(global_weight * density_penalty, dtype=np.float32),
+            "frontload": np.asarray(global_weight * frontload_penalty, dtype=np.float32),
+            "tail_ratio": np.asarray(global_weight * tail_ratio_penalty, dtype=np.float32),
+            "coverage": np.asarray(global_weight * coverage_penalty, dtype=np.float32),
+            "low_energy": np.asarray(global_weight * low_energy_penalty, dtype=np.float32),
         },
         {
             "enabled": 1.0,
@@ -235,6 +317,9 @@ def _rhythm_prior_penalty_arrays(
             "first1s_ratio_limit": float(ratio_limit),
             "tail_energy_limit": float(tail_limit),
             "min_mean_energy": float(min_mean),
+            "late_energy_ratio_min": float(late_ratio_min),
+            "tail_mean_ratio_min": float(tail_mean_ratio_min),
+            "low_energy_fraction_max": float(low_energy_fraction_max),
         },
     )
 
@@ -260,8 +345,8 @@ def _rhythm_streak_penalty(
             else:
                 break
 
-    allowed = max(1, _env_int("V34_STATIC_STREAK_ALLOW", 2))
-    weight = _env_float("V34_STREAK_PENALTY_WEIGHT", 2.00)
+    allowed = max(1, _env_int("V34_STATIC_STREAK_ALLOW", 1))
+    weight = _env_float("V34_STREAK_PENALTY_WEIGHT", 3.00)
     score = 0.0
     if streak_count > allowed:
         score = weight * float((streak_count - allowed) ** 2)
@@ -754,6 +839,9 @@ def choose_events_v34(
             "max_energy": np.zeros_like(natural, dtype=np.float32),
             "first1s_energy_ratio": np.zeros_like(natural, dtype=np.float32),
             "tail_mean_energy": np.zeros_like(natural, dtype=np.float32),
+            "late_energy_ratio": np.zeros_like(natural, dtype=np.float32),
+            "tail_to_mean_energy": np.zeros_like(natural, dtype=np.float32),
+            "low_energy_fraction": np.ones_like(natural, dtype=np.float32),
         }
 
     minimum = float(os.getenv("V34_WARP_MIN", str(args.min_time_warp)))
@@ -1332,6 +1420,10 @@ def choose_events_v34(
                     "prior_penalty": float(rhythm_prior_penalty[idx]),
                     "hold_penalty": float(rhythm_prior_terms["hold"][idx]),
                     "density_penalty": float(rhythm_prior_terms["density"][idx]),
+                    "frontload_penalty": float(rhythm_prior_terms["frontload"][idx]),
+                    "tail_ratio_penalty": float(rhythm_prior_terms["tail_ratio"][idx]),
+                    "coverage_penalty": float(rhythm_prior_terms["coverage"][idx]),
+                    "low_energy_penalty": float(rhythm_prior_terms["low_energy"][idx]),
                     "streak_penalty": float(rhythm_streak_score),
                     "streak": rhythm_streak_meta,
                     "features": {
@@ -1343,6 +1435,15 @@ def choose_events_v34(
                         ),
                         "tail_mean_energy": float(
                             rhythm_features["tail_mean_energy"][idx]
+                        ),
+                        "late_energy_ratio": float(
+                            rhythm_features["late_energy_ratio"][idx]
+                        ),
+                        "tail_to_mean_energy": float(
+                            rhythm_features["tail_to_mean_energy"][idx]
+                        ),
+                        "low_energy_fraction": float(
+                            rhythm_features["low_energy_fraction"][idx]
                         ),
                     },
                     "slot_context": {
@@ -1453,6 +1554,18 @@ def choose_events_v34(
                     "rhythm_density_penalty": float(
                         rhythm_prior_terms["density"][idx]
                     ),
+                    "rhythm_frontload_penalty": float(
+                        rhythm_prior_terms["frontload"][idx]
+                    ),
+                    "rhythm_tail_ratio_penalty": float(
+                        rhythm_prior_terms["tail_ratio"][idx]
+                    ),
+                    "rhythm_coverage_penalty": float(
+                        rhythm_prior_terms["coverage"][idx]
+                    ),
+                    "rhythm_low_energy_penalty": float(
+                        rhythm_prior_terms["low_energy"][idx]
+                    ),
                     "rhythm_streak_penalty": float(rhythm_streak_score),
                     "rhythm_mean_energy": float(
                         rhythm_features["mean_energy"][idx]
@@ -1465,6 +1578,15 @@ def choose_events_v34(
                     ),
                     "rhythm_tail_mean_energy": float(
                         rhythm_features["tail_mean_energy"][idx]
+                    ),
+                    "rhythm_late_energy_ratio": float(
+                        rhythm_features["late_energy_ratio"][idx]
+                    ),
+                    "rhythm_tail_to_mean_energy": float(
+                        rhythm_features["tail_to_mean_energy"][idx]
+                    ),
+                    "rhythm_low_energy_fraction": float(
+                        rhythm_features["low_energy_fraction"][idx]
                     ),
                     "rhythm_meta": rhythm_meta,
                     "source_aware_rag_enabled": bool(

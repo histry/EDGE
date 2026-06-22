@@ -1,115 +1,104 @@
-# EDGE V34 Source-aware RAG Replacement
+# EDGE V34 Motion Quality Repair Replacement
 
-## 解决的问题
+## 目标问题
 
-你的 BVH 数据是 motion-only 动作库，不是音乐-动作配对数据。命名规则为：
+本包针对 `v34_rhythm_repair_infer_20260622_154221` 仍然暴露出的两个问题：
 
-```text
-dyl_002_Take_003.bvh
-│   │   │
-│   │   └── category_id = Take_003
-│   └────── repeat_id = 002
-└────────── dancer_id = dyl
-```
+1. 前 1 秒快速换到新姿势，后续 slot 动作密度不足；
+2. 接触脚在支撑态仍有水平滑动，渲染固定相机不够稳定。
 
-现有 Event-RAG 代码保留了这些信息，但主要把它们当成文件名字符串，并没有在构库和检索时正式使用。审计结果显示：
+根因不是单纯训练 epoch 不够。代码层面主要有三点：
 
-```text
-dynamic event 原始库：min=119, max=687, max/min=5.8
-V34 shared index：min=4, max=134, max/min=33.5
-```
+- 调度器虽然已有 hold/density/streak penalty，但 `mean_energy` 会被第一秒高能量抬高，导致“前动后停”的片段漏判；
+- Dense Boundary 使搜索器偏好物理安全片段，低资源库中安全片段常常也是低动态片段；
+- 接触标签只参与评分和训练，不等于输出世界坐标被零速度约束锁死。
 
-这说明不均衡从动态切分阶段已经存在，并在 shared index / V34 quality filtering 中被放大。该替换包的目标是：
-
-1. 显式解析 `dancer_id / repeat_id / category_id / source_uid`；
-2. 构建 JSON+NPZ 对齐的 source-aware balanced index；
-3. 重建匹配的 hierarchy NPZ，避免数组长度错位；
-4. 在 V34 检索打分中加入 source/category/dancer/repeat 约束；
-5. 保留 Dense Boundary、Dynamic Relax、Rhythm Repair、Inpainting 和 Latent Blending。
-
-## 需要替换/新增的文件
+## 替换/新增文件
 
 将本目录中的文件复制到 EDGE 根目录同名路径：
 
 ```text
-tools/v34_source_aware_rag.py                 新增
-tools/build_v34_source_aware_index.py         新增
-tools/build_v21_shared_event_index.py         替换
-tools/v34_warp_aware_retrieval.py             替换
-scripts/launch_v34_source_aware_rag.sh        新增
-scripts/resume_v34_inference_v33ckpt.sh       替换
+tools/v34_source_aware_rag.py                  新增/保留
+tools/build_v34_source_aware_index.py          新增/保留
+tools/build_v21_shared_event_index.py          替换
+tools/v34_warp_aware_retrieval.py              替换
+tools/v34_motion_quality_postprocess.py        新增
+scripts/launch_v34_source_aware_rag.sh         替换
+scripts/launch_v34_motion_quality_repair.sh    新增
+scripts/resume_v34_inference_v33ckpt.sh        替换
+scripts/run_v34_full_research.sh               替换
+render_from_npy.py                             替换
+vis.py                                         替换
 ```
 
-## 主要机制
+## 新增机制
 
-### 1. Source metadata 结构化
+### 1. 持续运动密度约束
 
-每个 event 会补充：
-
-```json
-{
-  "dancer_id": "dyl",
-  "repeat_id": "002",
-  "category_id": "Take_003",
-  "source_uid": "dyl_002_Take_003",
-  "dancer_category_group": "dyl_Take_003",
-  "category_repeat_group": "Take_003_002"
-}
-```
-
-### 2. Source-aware balanced index
-
-`tools/build_v34_source_aware_index.py` 会读取：
+`tools/v34_warp_aware_retrieval.py` 新增/强化以下指标：
 
 ```text
-data/v34_shared_event_index.json
-data/v26_music_dominant_duration_index.npz
+first1s_energy_ratio
+late_energy_ratio
+tail_to_mean_energy
+low_energy_fraction
 ```
 
-输出对齐的新文件：
+新增惩罚项：
 
 ```text
-data/v34_source_aware/v34_shared_event_index_source_aware.json
-data/v34_source_aware/v34_shared_event_index_source_aware.npz
-data/v34_source_aware/v34_shared_event_index_source_aware.audit.json
+V34_FRONTLOAD_PENALTY_WEIGHT
+V34_TAIL_RATIO_PENALTY_WEIGHT
+V34_COVERAGE_PENALTY_WEIGHT
+V34_LOW_ENERGY_PENALTY_WEIGHT
 ```
 
-它不是只改 JSON，而是同步过滤 NPZ 中所有第一维等于事件数的数组，避免 schedule 时 metadata 和 tensor 错位。
+它们解决旧版漏判：如果第一秒能量占比极高，即使均值能量不低，也会被 frontload penalty 和 late coverage penalty 压下去。
 
-### 3. V34 检索约束
+### 2. 静态片段连续惩罚
 
-`tools/v34_warp_aware_retrieval.py` 新增：
+默认把：
 
 ```text
-V34_SOURCE_AWARE_RAG
-V34_SOURCE_AWARE_WEIGHT
-V34_SOURCE_AWARE_WINDOW
-V34_SOURCE_UID_REPEAT_WEIGHT
-V34_DANCER_CATEGORY_REPEAT_WEIGHT
-V34_CATEGORY_REPEAT_WEIGHT
-V34_DANCER_REPEAT_WEIGHT
-V34_REPEAT_ID_REPEAT_WEIGHT
-V34_CATEGORY_PRIOR_BALANCE_WEIGHT
-V34_DANCER_PRIOR_BALANCE_WEIGHT
-V34_REPEAT_PRIOR_BALANCE_WEIGHT
+V34_STATIC_STREAK_ALLOW=1
+V34_STREAK_PENALTY_WEIGHT=3.00
 ```
 
-每个 schedule part 会写入：
+即 `pose_hold / calm_flow / neutral_flow` 可以偶尔出现，但不允许连续堆叠造成 8-15 秒观感静止。
 
-```json
-{
-  "source_uid": "...",
-  "dancer_id": "...",
-  "repeat_id": "...",
-  "category_id": "...",
-  "source_aware_transition_penalty": 0.0,
-  "source_aware_meta": {}
-}
+### 3. 接触脚 root-lock 后处理
+
+新增：
+
+```text
+tools/v34_motion_quality_postprocess.py
 ```
 
-## 推荐运行：纯推理重建库
+它读取 `*_v26.npy` 的 contact channels，找到连续接触脚段，把 root 的 X/Z 平移反向校正，使支撑脚尽量固定在该接触段的中位锚点上。
 
-替换文件后执行：
+默认不会覆盖原始文件，而是生成：
+
+```text
+*_v26_motion_quality.npy
+*.motion_quality_postprocess.json
+```
+
+`scripts/run_v34_full_research.sh` 会优先对修复后的 motion 做 metrics 和 scientific render。
+
+### 4. 固定渲染坐标盒
+
+`vis.py` 新增：
+
+```text
+EDGE_RENDER_FIXED_BOUNDS=1
+EDGE_RENDER_XLIM=-1.8,1.8
+EDGE_RENDER_YLIM=-1.8,1.8
+EDGE_RENDER_ZLIM=-0.05,2.25
+```
+
+它用于消除 Matplotlib 3D box 的视觉缩放干扰。该改动只影响展示，不改变 motion 数据。
+
+## 推荐纯推理命令
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
@@ -117,17 +106,20 @@ cd /home/disk/lsm/storage/EDGE
 python -m py_compile \
   tools/v34_source_aware_rag.py \
   tools/build_v34_source_aware_index.py \
-  tools/build_v21_shared_event_index.py \
-  tools/v34_warp_aware_retrieval.py
+  tools/v34_warp_aware_retrieval.py \
+  tools/v34_motion_quality_postprocess.py \
+  render_from_npy.py \
+  vis.py
 
 bash -n \
   scripts/launch_v34_source_aware_rag.sh \
-  scripts/launch_v34_rhythm_repair.sh \
-  scripts/resume_v34_inference_v33ckpt.sh
+  scripts/launch_v34_motion_quality_repair.sh \
+  scripts/resume_v34_inference_v33ckpt.sh \
+  scripts/run_v34_full_research.sh
 
-tmux kill-session -t v34_source_aware_rag 2>/dev/null || true
+tmux kill-session -t v34_motion_quality_repair 2>/dev/null || true
 
-tmux new-session -d -s v34_source_aware_rag "bash -lc '
+tmux new-session -d -s v34_motion_quality_repair "bash -lc '
 set -euo pipefail
 cd /home/disk/lsm/storage/EDGE
 
@@ -139,72 +131,82 @@ export CUDA_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
 
 export V34_TRAIN=0
-export V34_SOURCE_AWARE_REBUILD=1
-export V34_SOURCE_AWARE_REBUILD_HIERARCHY=1
+export V34_SOURCE_AWARE_REBUILD=0
+export V34_SOURCE_AWARE_REBUILD_HIERARCHY=0
 
-export V34_SOURCE_CAP_PER_SOURCE_UID=64
-export V34_SOURCE_CATEGORY_CAP_FACTOR=1.35
-export V34_SOURCE_REPEAT_CAP_FACTOR=1.60
-export V34_SOURCE_DANCER_CAP_FACTOR=1.50
-
-export V34_SOURCE_AWARE_RAG=1
-export V34_SOURCE_AWARE_WEIGHT=1.0
-export V34_SOURCE_AWARE_WINDOW=8
-
-export V34_BOUNDARY_COMPAT=1
-export V34_COMPAT_DENSE_SCORE=1
 export V34_RHYTHM_DEGRADATION_PENALTY=1
-export V34_BOUNDARY_INPAINT=1
-export V34_LATENT_SNIPPET_BLEND=1
-export V34_USE_GPU_RETRIEVAL=1
+export V34_RHYTHM_WEIGHT=1.20
+export V34_HOLD_FIRST1S_RATIO_LIMIT=0.55
+export V34_HOLD_TAIL_ENERGY_LIMIT=0.024
+export V34_MIN_SLOT_MEAN_ENERGY=0.018
+export V34_LATE_ENERGY_RATIO_MIN=0.34
+export V34_TAIL_MEAN_RATIO_MIN=0.55
+export V34_LOW_ENERGY_FRACTION_MAX=0.62
+export V34_FRONTLOAD_PENALTY_WEIGHT=4.50
+export V34_TAIL_RATIO_PENALTY_WEIGHT=3.00
+export V34_COVERAGE_PENALTY_WEIGHT=2.75
+export V34_STATIC_STREAK_ALLOW=1
+export V34_STREAK_PENALTY_WEIGHT=3.00
 
-export RUN_ID=v34_source_aware_rag_infer_\$(date +%Y%m%d_%H%M%S)
+export V34_MOTION_QUALITY_POSTPROCESS=1
+export V34_CONTACT_LOCK_POSTPROCESS=1
+export V34_CONTACT_LOCK_STRENGTH=0.85
+export V34_OUTPUT_SMOOTH=1
+
+export RUN_ID=v34_motion_quality_repair_\$(date +%Y%m%d_%H%M%S)
 export RUN_ROOT=output/\$RUN_ID
 mkdir -p \"\$RUN_ROOT\"
 
-bash scripts/launch_v34_source_aware_rag.sh 2>&1 | tee -a \"\$RUN_ROOT/outer.log\"
+bash scripts/launch_v34_motion_quality_repair.sh 2>&1 | tee -a \"\$RUN_ROOT/outer.log\"
 '"
 
 sleep 5
-RUN_ROOT=$(cat output/LATEST_V34_SOURCE_AWARE_RAG.txt)
+RUN_ROOT=$(cat output/LATEST_V34_MOTION_QUALITY_REPAIR.txt)
 echo "RUN_ROOT=$RUN_ROOT"
 tail -80 "$RUN_ROOT/outer.log"
 ```
 
-## 完整训练
+## 完整长训
 
-如果要完整训练 Contact-INR / diffusion transition：
-
-```bash
-export V34_TRAIN=1
-bash scripts/launch_v34_source_aware_rag.sh
-```
-
-注意：完整训练会显著更慢。建议先跑纯推理验证 source-aware 检索和 schedule report。
-
-## 结果检查
+如果要在 source-aware transition dataset 上完整训练：
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
 
-RUN_ROOT=$(cat output/LATEST_V34_SOURCE_AWARE_RAG.txt)
+export EDGE_ROOT=/home/disk/lsm/storage/EDGE
+export EDGE_ENV=/home/disk/lsm/conda_envs/edge
+export PATH=$EDGE_ENV/bin:$PATH
+export PYTHONPATH=$EDGE_ROOT
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONUNBUFFERED=1
 
-cat data/v34_source_aware/v34_shared_event_index_source_aware.audit.json | head -120
+export V34_TRAIN=1
+export V34_SOURCE_AWARE_REBUILD=0
+export V34_SOURCE_AWARE_REBUILD_HIERARCHY=0
+
+bash scripts/launch_v34_motion_quality_repair.sh
+```
+
+## 检查输出
+
+```bash
+cd /home/disk/lsm/storage/EDGE
+RUN_ROOT=$(cat output/LATEST_V34_MOTION_QUALITY_REPAIR.txt)
 
 find "$RUN_ROOT" -type f \
-  \( -name "*.schedule_report.json" \
-     -o -name "*.boundary_v34.json" \
+  \( -name "*motion_quality.npy" \
+     -o -name "*.motion_quality_postprocess.json" \
+     -o -name "*.schedule_report.json" \
      -o -name "*.contact_metrics.json" \
      -o -name "*.jitter.json" \
-     -o -name "*.mp4" \
-     -o -name "*SUMMARY.json" \) | sort
+     -o -name "*.mp4" \) | sort
 
-grep -nE "source_aware|V34 SOURCE-AWARE|V34-RELAX|PASS|DONE|Traceback|RuntimeError|ERROR" \
+grep -nE "rhythm_degradation|frontload|tail_ratio|motion_quality|PASS|DONE|Traceback|RuntimeError|ERROR" \
   "$RUN_ROOT/run.log" "$RUN_ROOT/outer.log" 2>/dev/null | tail -200
 ```
 
-## 论文表述
+## 科研表述
 
-可以写成：
+这次改动可以定义为第三篇长程调度问题的工程落地：
 
-> 由于原始敦煌舞 BVH 数据是无音乐配对的 motion-only 低资源动作库，且源文件包含舞者、重复次数和动作类别结构，本文将 Event-RAG 数据库从 event-level flat pool 升级为 source-aware, category-balanced, quality-weighted memory bank。该机制保留舞者习惯作为风格多样性，同时通过质量加权和来源约束抑制动作失误、类别偏置和近重复检索。
+> Dense Boundary 解决了片段接缝的物理突变，但会暴露低资源 Event-RAG 的安全片段偏置。搜索器倾向于选择边界风险低、动作密度低、前置能量释放过快的片段。为此，本文引入 motion-density preserving retrieval field，通过 frontload risk、late-energy coverage、tail-to-mean ratio 与 static streak penalty，把全局搜索轨迹从安全静态流形推回持续运动流形；同时利用 contact-aware root locking 在输出层约束支撑脚零速度，降低 foot skating。

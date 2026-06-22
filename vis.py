@@ -142,6 +142,25 @@ def smooth_sequence(sequence, window=5):
 
 def compute_camera_track(vis_poses, mode="follow"):
     mode = (mode or "follow").lower()
+    if mode == "fixed" and os.getenv("EDGE_RENDER_FIXED_BOUNDS", "0") == "1":
+        def _bounds(name, default):
+            raw = os.getenv(name, default)
+            parts = [float(x.strip()) for x in raw.split(",") if x.strip()]
+            if len(parts) != 2 or parts[0] >= parts[1]:
+                raise ValueError(f"{name} must be 'min,max', got {raw!r}")
+            return parts[0], parts[1]
+
+        xlim = _bounds("EDGE_RENDER_XLIM", "-1.8,1.8")
+        ylim = _bounds("EDGE_RENDER_YLIM", "-1.8,1.8")
+        zlim = _bounds("EDGE_RENDER_ZLIM", "-0.05,2.25")
+        center = np.asarray(
+            [(xlim[0] + xlim[1]) * 0.5, (ylim[0] + ylim[1]) * 0.5],
+            dtype=vis_poses.dtype,
+        )
+        camera_radius = float(max(xlim[1] - xlim[0], ylim[1] - ylim[0]) * 0.5)
+        frame_centers = np.repeat(center[None, :], vis_poses.shape[0], axis=0)
+        return frame_centers, camera_radius, zlim
+
     # 用根节点(骨盆)作为跟拍中心，比包围盒中心更稳定，不会因为甩手/抬腿把人“挤”到坐标盒边缘。
     root_centers = vis_poses[:, 0, :2]
     if mode == "fixed":

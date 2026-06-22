@@ -69,6 +69,7 @@ python -m py_compile \
   tools/v32_contact_inr.py \
   tools/v32_transition_quality.py \
   tools/v27_transition_diffusion.py \
+  tools/v34_motion_quality_postprocess.py \
   tools/schedule_v34_whole_song.py \
   tools/evaluate_v34_boundary_dynamics.py \
   train_v27_transition_diffusion.py
@@ -225,11 +226,30 @@ evaluate_directory() {
   local label="$2"
   IFS=';' read -ra KEYS <<< "$V32_KEYS"
   for key in "${KEYS[@]}"; do
-    local motion="$directory/${key}_v26.npy"
+    local raw_motion="$directory/${key}_v26.npy"
+    local motion="$raw_motion"
     local report="$directory/${key}_v26.schedule_report.json"
     local audio="test_music_bank/${key}.wav"
-    [[ -f "$motion" ]] || { echo "[ERROR] Missing $motion" >&2; return 3; }
+    [[ -f "$raw_motion" ]] || { echo "[ERROR] Missing $raw_motion" >&2; return 3; }
     [[ -f "$report" ]] || { echo "[ERROR] Missing $report" >&2; return 3; }
+
+    if [[ "${V34_MOTION_QUALITY_POSTPROCESS:-1}" == "1" ]]; then
+      motion="$directory/${key}_v26_motion_quality.npy"
+      python tools/v34_motion_quality_postprocess.py \
+        --motion "$raw_motion" \
+        --out "$motion" \
+        --summary_json "$directory/${key}_${label}.motion_quality_postprocess.json" \
+        --contact_lock "${V34_CONTACT_LOCK_POSTPROCESS:-1}" \
+        --contact_threshold "${V34_CONTACT_LOCK_THRESHOLD:-0.65}" \
+        --min_contact_frames "${V34_CONTACT_LOCK_MIN_FRAMES:-8}" \
+        --contact_lock_strength "${V34_CONTACT_LOCK_STRENGTH:-0.85}" \
+        --contact_smooth_window "${V34_CONTACT_LOCK_SMOOTH_WINDOW:-11}" \
+        --max_root_correction "${V34_CONTACT_LOCK_MAX_ROOT_CORRECTION:-0.18}" \
+        --smooth "${V34_OUTPUT_SMOOTH:-1}" \
+        --rotation_smooth_window "${V34_OUTPUT_ROT_SMOOTH_WINDOW:-3}" \
+        --root_y_smooth_window "${V34_OUTPUT_ROOT_Y_SMOOTH_WINDOW:-5}" \
+        --smooth_strength "${V34_OUTPUT_SMOOTH_STRENGTH:-0.35}"
+    fi
 
     python tools/evaluate_v26_long_dance.py \
       --motion "$motion" --schedule_report "$report" \
