@@ -74,6 +74,70 @@ def _risk_score(risk: Mapping[str, float]) -> float:
     ))
 
 
+def _boundary_compatibility_meta(part: Mapping[str, Any] | None) -> Dict[str, Any]:
+    part_dict = dict(part or {})
+    transition_meta = dict(part_dict.get("transition_meta", {}) or {})
+    meta = transition_meta.get("boundary_compatibility", None)
+    if meta is None:
+        meta = part_dict.get("boundary_compat_meta", {})
+    return dict(meta or {})
+
+
+def _ratio_from_meta(
+    meta: Mapping[str, Any],
+    metric_key: str,
+    limit_key: str | None = None,
+) -> float:
+    metrics = dict(meta.get("metrics", {}) or {})
+    limits = dict(meta.get("limits", {}) or {})
+    limit_key = limit_key or metric_key
+    try:
+        value = float(metrics.get(metric_key, 0.0))
+        limit = float(limits.get(limit_key, 0.0))
+    except Exception:
+        return 0.0
+    if limit <= 1e-8:
+        return 0.0
+    return float(value / limit)
+
+
+def _visual_trigger_terms(meta: Mapping[str, Any]) -> Dict[str, Any]:
+    pose_ratio = _ratio_from_meta(meta, "pose_jump")
+    yaw_ratio = _ratio_from_meta(meta, "yaw_gap_deg")
+    transition_ratio = _ratio_from_meta(meta, "transition_cost")
+    contact_ratio = max(
+        _ratio_from_meta(meta, "contact_jump"),
+        _ratio_from_meta(meta, "contact_binary_jump"),
+        _ratio_from_meta(meta, "support_count_jump"),
+    )
+    thresholds = {
+        "pose_ratio": _env_float("V34_INPAINT_VISUAL_POSE_RATIO", 0.80),
+        "yaw_ratio": _env_float("V34_INPAINT_VISUAL_YAW_RATIO", 0.80),
+        "transition_ratio": _env_float("V34_INPAINT_VISUAL_TRANSITION_RATIO", 0.80),
+        "contact_ratio": _env_float("V34_INPAINT_VISUAL_CONTACT_RATIO", 0.80),
+    }
+    ratios = {
+        "pose_ratio": float(pose_ratio),
+        "yaw_ratio": float(yaw_ratio),
+        "transition_ratio": float(transition_ratio),
+        "contact_ratio": float(contact_ratio),
+    }
+    fired = {
+        key: bool(ratios[key] >= thresholds[key])
+        for key in ratios
+    }
+    return {
+        "enabled": _enabled("V34_INPAINT_VISUAL_HEURISTIC", "1"),
+        "ratios": ratios,
+        "thresholds": thresholds,
+        "fired": fired,
+        "active": bool(
+            _enabled("V34_INPAINT_VISUAL_HEURISTIC", "1")
+            and any(fired.values())
+        ),
+    }
+
+
 def _should_inpaint(
     *,
     risk: Mapping[str, float],
@@ -82,10 +146,11 @@ def _should_inpaint(
 ) -> Tuple[bool, Dict[str, Any]]:
     score = _risk_score(risk)
     trigger = _env_float("V34_INPAINT_TRIGGER_RATIO", 0.72)
-    compat_trigger = _env_float("V34_INPAINT_COMPAT_SCORE_TRIGGER", 0.10)
+    compat_trigger = _env_float("V34_INPAINT_COMPAT_SCORE_TRIGGER", 0.45)
     compat_score = float((part or {}).get("boundary_compat_score", 0.0))
     transition_meta = dict((part or {}).get("transition_meta", {}) or {})
     relaxation_meta = dict(transition_meta.get("constraint_relaxation", {}) or {})
+    visual_terms = _visual_trigger_terms(_boundary_compatibility_meta(part))
     relaxed_constraint = bool(
         _enabled("V34_INPAINT_ON_RELAXED_CONSTRAINT", "1")
         and (
@@ -104,6 +169,8 @@ def _should_inpaint(
         "risk_trigger": bool(score >= trigger),
         "compat_score": compat_score,
         "compat_trigger": bool(compat_score >= compat_trigger),
+        "visual_heuristic": bool(visual_terms.get("active", False)),
+        "visual_heuristic_terms": visual_terms,
         "relaxed_constraint": bool(relaxed_constraint),
         "relaxation_reasons": list(relaxation_meta.get("reasons", [])),
         "diffusion_fallback": fallback,
@@ -112,6 +179,7 @@ def _should_inpaint(
     return bool(
         reasons["risk_trigger"]
         or reasons["compat_trigger"]
+        or reasons["visual_heuristic"]
         or reasons["relaxed_constraint"]
         or reasons["diffusion_fallback"]
         or reasons["absolute_unsafe"]

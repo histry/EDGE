@@ -24,6 +24,20 @@ def _enabled(name: str, default: str = "1") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default))))
+    except Exception:
+        return int(default)
+
+
 def _absolute_boundary_checks(risk: Dict[str, float]) -> Dict[str, bool]:
     return {
         "boundary_jerk": risk["boundary_joint_jerk_max"]
@@ -530,6 +544,17 @@ def generate_one_v34(
             "regularised_septic_so3": True,
             "c3_zero_inr_envelope": True,
             "masked_boundary_inpainting": _enabled("V34_BOUNDARY_INPAINT", "0"),
+            "dense_boundary_score": _enabled("V34_COMPAT_DENSE_SCORE", "1"),
+            "dense_boundary_power": _env_float("V34_COMPAT_DENSE_POWER", 2.0),
+            "dense_boundary_cap": _env_float("V34_COMPAT_DENSE_CAP", 4.0),
+            "dense_semantic_score": _enabled("V34_COMPAT_DENSE_SEMANTIC_SCORE", "0"),
+            "inpaint_compat_score_trigger": _env_float(
+                "V34_INPAINT_COMPAT_SCORE_TRIGGER", 0.45
+            ),
+            "inpaint_visual_heuristic": _enabled(
+                "V34_INPAINT_VISUAL_HEURISTIC", "1"
+            ),
+            "relax_rescue_top_k": _env_int("V34_RELAX_RESCUE_TOP_K", 768),
             "latent_snippet_blending": _enabled("V34_LATENT_SNIPPET_BLEND", "0"),
             "latent_snippet_blending_status": (
                 "transition_sampler_latent_mixture"

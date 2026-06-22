@@ -36,8 +36,37 @@ def _array_value(hierarchy: Mapping[str, Any] | None, name: str, index: int, def
     return float(arr[int(index)])
 
 
-def _soft_ratio(value: float, limit: float) -> float:
-    return float(max(0.0, value / max(limit, 1e-8) - 1.0))
+def _excess_ratio(value: float, limit: float) -> float:
+    """Threshold-excess ratio used only for hard-gate-compatible semantics."""
+    return float(max(0.0, float(value) / max(float(limit), 1e-8) - 1.0))
+
+
+def _dense_ratio(
+    value: float,
+    limit: float,
+    *,
+    power: float = 2.0,
+    cap: float = 4.0,
+) -> float:
+    """Dense convex risk potential for ranking near-boundary stitches.
+
+    This is intentionally not a mathematical barrier. It does not change the
+    hard feasible set; it only makes beam search prefer safer interior points
+    before a visible jump reaches the hard rejection threshold.
+    """
+    r = max(0.0, float(value) / max(float(limit), 1e-8))
+    return float(min(r ** float(power), float(cap)))
+
+
+def _ranking_ratio(value: float, limit: float) -> float:
+    if not _enabled("V34_COMPAT_DENSE_SCORE", "1"):
+        return _excess_ratio(value, limit)
+    return _dense_ratio(
+        value,
+        limit,
+        power=_env_float("V34_COMPAT_DENSE_POWER", 2.0),
+        cap=_env_float("V34_COMPAT_DENSE_CAP", 4.0),
+    )
 
 
 def _hard_contact_value(
@@ -133,20 +162,40 @@ def evaluate_boundary_compatibility(
     activity_allow = 0.22 + 0.45 * reset_allow
     turn_allow = 0.25 + 0.45 * reset_allow
 
+    semantic_ratio = (
+        _ranking_ratio
+        if _enabled("V34_COMPAT_DENSE_SEMANTIC_SCORE", "0")
+        else _excess_ratio
+    )
     terms = {
-        "pose": _soft_ratio(pose, pose_limit),
-        "velocity": _soft_ratio(velocity, velocity_limit),
-        "acceleration": _soft_ratio(acceleration, acceleration_limit),
-        "contact": _soft_ratio(contact, contact_limit),
-        "contact_binary": _soft_ratio(contact_binary, contact_binary_limit),
-        "support_count": _soft_ratio(support_count_jump, support_count_limit),
+        "pose": _ranking_ratio(pose, pose_limit),
+        "velocity": _ranking_ratio(velocity, velocity_limit),
+        "acceleration": _ranking_ratio(acceleration, acceleration_limit),
+        "contact": _ranking_ratio(contact, contact_limit),
+        "contact_binary": _ranking_ratio(contact_binary, contact_binary_limit),
+        "support_count": _ranking_ratio(support_count_jump, support_count_limit),
         "aerial_planted": float(aerial_planted_switch),
         "stance_flip": 0.5 * float(stance_flip),
-        "yaw": _soft_ratio(yaw, yaw_limit),
-        "transition": _soft_ratio(transition, transition_limit),
-        "body": _soft_ratio(body_jump, body_allow),
-        "activity": _soft_ratio(activity_jump, activity_allow),
-        "turn": _soft_ratio(turn_jump, turn_allow),
+        "yaw": _ranking_ratio(yaw, yaw_limit),
+        "transition": _ranking_ratio(transition, transition_limit),
+        "body": semantic_ratio(body_jump, body_allow),
+        "activity": semantic_ratio(activity_jump, activity_allow),
+        "turn": semantic_ratio(turn_jump, turn_allow),
+    }
+    excess_terms = {
+        "pose": _excess_ratio(pose, pose_limit),
+        "velocity": _excess_ratio(velocity, velocity_limit),
+        "acceleration": _excess_ratio(acceleration, acceleration_limit),
+        "contact": _excess_ratio(contact, contact_limit),
+        "contact_binary": _excess_ratio(contact_binary, contact_binary_limit),
+        "support_count": _excess_ratio(support_count_jump, support_count_limit),
+        "aerial_planted": float(aerial_planted_switch),
+        "stance_flip": 0.5 * float(stance_flip),
+        "yaw": _excess_ratio(yaw, yaw_limit),
+        "transition": _excess_ratio(transition, transition_limit),
+        "body": _excess_ratio(body_jump, body_allow),
+        "activity": _excess_ratio(activity_jump, activity_allow),
+        "turn": _excess_ratio(turn_jump, turn_allow),
     }
     score = (
         1.25 * terms["pose"]
@@ -192,6 +241,17 @@ def evaluate_boundary_compatibility(
         "hard_reject": bool(hard_reject),
         "checks": hard_checks,
         "terms": {key: float(value) for key, value in terms.items()},
+        "excess_terms": {
+            key: float(value) for key, value in excess_terms.items()
+        },
+        "score_mode": (
+            "dense_convex_risk"
+            if _enabled("V34_COMPAT_DENSE_SCORE", "1")
+            else "excess_ratio"
+        ),
+        "dense_power": _env_float("V34_COMPAT_DENSE_POWER", 2.0),
+        "dense_cap": _env_float("V34_COMPAT_DENSE_CAP", 4.0),
+        "dense_semantic_score": _enabled("V34_COMPAT_DENSE_SEMANTIC_SCORE", "0"),
         "metrics": {
             "pose_jump": pose,
             "velocity_jump": velocity,

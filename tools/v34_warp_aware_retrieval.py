@@ -61,8 +61,8 @@ def _array_or(
     return np.asarray(fallback, dtype=dtype)
 
 
-def _soft_ratio(value: float, limit: float) -> float:
-    return float(max(0.0, value / max(limit, 1e-8) - 1.0))
+def _excess_ratio(value: float, limit: float) -> float:
+    return float(max(0.0, float(value) / max(float(limit), 1e-8) - 1.0))
 
 
 def _slot_reset_allow(phrase: Any) -> float:
@@ -128,13 +128,13 @@ def _semantic_continuity_penalty(
     memory_body_allow = _env_float("V34_MOTIF_MAX_MEMORY_BODY_JUMP", 0.36) + 0.35 * reset_allow
 
     terms = {
-        "body": _soft_ratio(body_jump, body_allow),
-        "activity": _soft_ratio(activity_jump, activity_allow),
-        "turn": _soft_ratio(turn_jump, turn_allow),
-        "event": _soft_ratio(event_jump, event_allow),
-        "duration": _soft_ratio(duration_jump, duration_allow),
-        "memory_activity": _soft_ratio(memory_activity, memory_activity_allow),
-        "memory_body": _soft_ratio(memory_body, memory_body_allow),
+        "body": _excess_ratio(body_jump, body_allow),
+        "activity": _excess_ratio(activity_jump, activity_allow),
+        "turn": _excess_ratio(turn_jump, turn_allow),
+        "event": _excess_ratio(event_jump, event_allow),
+        "duration": _excess_ratio(duration_jump, duration_allow),
+        "memory_activity": _excess_ratio(memory_activity, memory_activity_allow),
+        "memory_body": _excess_ratio(memory_body, memory_body_allow),
     }
     score = (
         1.15 * terms["body"]
@@ -440,6 +440,7 @@ def choose_events_v34(
         "V34_RELAX_CONTACT_PENALTY_WEIGHT",
         2.0,
     )
+    relax_rescue_top_k = max(1, _env_int("V34_RELAX_RESCUE_TOP_K", 768))
 
     beam = [scheduler.CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
@@ -1091,20 +1092,32 @@ def choose_events_v34(
         if strict_expanded:
             expanded = strict_expanded
         elif relaxed_expanded and relax_constraints_on_empty:
-            expanded = relaxed_expanded
+            relaxed_pool_size = len(relaxed_expanded)
+            relaxed_expanded.sort(
+                key=lambda state: (
+                    float(state.parts[-1].get("constraint_relaxation_penalty", 0.0))
+                    if state.parts else 0.0,
+                    -float(state.score),
+                )
+            )
+            expanded = relaxed_expanded[: min(relax_rescue_top_k, relaxed_pool_size)]
             print(
                 "[V34-RELAX] "
                 f"slot={slot} strict feasible set empty; "
-                f"using {len(expanded)} relaxed candidates "
+                f"using {len(expanded)}/{relaxed_pool_size} relaxed candidates "
+                f"after minimum-violation rescue top-k={relax_rescue_top_k} "
                 f"(compat_deferred={compat_deferred}, "
                 f"semantic_deferred={semantic_deferred}, "
                 f"contact_deferred={contact_deferred})."
             )
-            for relaxed_state in expanded:
+            for rescue_rank, relaxed_state in enumerate(expanded):
                 if not relaxed_state.parts:
                     continue
                 relaxed_part = relaxed_state.parts[-1]
                 relaxed_part["constraint_relaxation_used"] = True
+                relaxed_part["constraint_relaxation_rescue_rank"] = int(rescue_rank)
+                relaxed_part["constraint_relaxation_rescue_pool_size"] = int(relaxed_pool_size)
+                relaxed_part["constraint_relaxation_rescue_top_k"] = int(relax_rescue_top_k)
                 relaxed_transition_meta = dict(
                     relaxed_part.get("transition_meta", {})
                 )
@@ -1112,6 +1125,9 @@ def choose_events_v34(
                     relaxed_transition_meta.get("constraint_relaxation", {})
                 )
                 relax_meta["used_due_to_empty_strict"] = True
+                relax_meta["rescue_rank"] = int(rescue_rank)
+                relax_meta["rescue_pool_size_before_top_k"] = int(relaxed_pool_size)
+                relax_meta["rescue_top_k"] = int(relax_rescue_top_k)
                 relaxed_transition_meta["constraint_relaxation"] = relax_meta
                 relaxed_transition_meta["semantic_relaxed"] = bool(
                     relaxed_part.get("semantic_relaxed", False)
