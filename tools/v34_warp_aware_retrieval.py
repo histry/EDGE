@@ -9,7 +9,7 @@ beam when its exact locked-slot warp lies outside the allowed interval.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -63,6 +63,216 @@ def _array_or(
 
 def _excess_ratio(value: float, limit: float) -> float:
     return float(max(0.0, float(value) / max(float(limit), 1e-8) - 1.0))
+
+
+def _csv_set(name: str, default: str) -> set:
+    raw = os.getenv(name, default)
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _motion_rhythm_features(
+    motion: Any,
+    *,
+    fps: int = 30,
+) -> Dict[str, float]:
+    """Compact rhythm-density descriptors for one snippet.
+
+    These features are intentionally computed from the already-loaded motion
+    tensors, so rhythm repair is a pure retrieval-time policy and does not
+    require rebuilding the event database.
+    """
+    try:
+        x = np.asarray(motion, dtype=np.float32)
+    except Exception:
+        x = np.zeros((0, 151), dtype=np.float32)
+    if x.ndim == 3:
+        x = x[0]
+    if x.ndim != 2 or len(x) < 3:
+        return {
+            "mean_energy": 0.0,
+            "p90_energy": 0.0,
+            "max_energy": 0.0,
+            "first1s_energy_ratio": 0.0,
+            "tail_mean_energy": 0.0,
+        }
+
+    rot = x[:, 7:151] if x.shape[1] >= 151 else x
+    if x.shape[1] > 6:
+        root = x[:, [4, 5, 6]] * 3.0
+        feat = np.concatenate([rot, root], axis=1)
+    else:
+        feat = rot
+    energy = np.linalg.norm(np.diff(feat, axis=0), axis=1)
+    if len(energy) == 0:
+        return {
+            "mean_energy": 0.0,
+            "p90_energy": 0.0,
+            "max_energy": 0.0,
+            "first1s_energy_ratio": 0.0,
+            "tail_mean_energy": 0.0,
+        }
+
+    first = energy[: min(int(fps), len(energy))]
+    tail = energy[len(energy) // 2:]
+    total = float(np.sum(energy) + 1e-8)
+    return {
+        "mean_energy": float(np.mean(energy)),
+        "p90_energy": float(np.percentile(energy, 90)),
+        "max_energy": float(np.max(energy)),
+        "first1s_energy_ratio": float(np.sum(first) / total),
+        "tail_mean_energy": float(np.mean(tail)) if len(tail) else 0.0,
+    }
+
+
+def _build_rhythm_feature_arrays(
+    motions: Sequence[np.ndarray],
+    *,
+    fps: int = 30,
+) -> Dict[str, np.ndarray]:
+    rows = [_motion_rhythm_features(motion, fps=fps) for motion in motions]
+    if not rows:
+        empty = np.zeros((0,), dtype=np.float32)
+        return {
+            "mean_energy": empty,
+            "p90_energy": empty,
+            "max_energy": empty,
+            "first1s_energy_ratio": empty,
+            "tail_mean_energy": empty,
+        }
+    return {
+        key: np.asarray([float(row[key]) for row in rows], dtype=np.float32)
+        for key in rows[0].keys()
+    }
+
+
+def _music_motion_pressure(phrase: Any) -> float:
+    return float(np.clip(
+        0.45 * float(getattr(phrase, "energy", 0.0))
+        + 0.25 * float(getattr(phrase, "beat_density", 0.0))
+        + 0.20 * float(getattr(phrase, "onset", 0.0))
+        + 0.10 * float(getattr(phrase, "tension", 0.0))
+        - 0.25 * float(getattr(phrase, "calmness", 0.0)),
+        0.0,
+        1.0,
+    ))
+
+
+def _is_musical_silence(phrase: Any) -> bool:
+    event = str(getattr(phrase, "music_event", "neutral_flow"))
+    silence_events = _csv_set(
+        "V34_RHYTHM_SILENCE_EVENTS",
+        "silence,rest,ending,cadence,settle,section_end",
+    )
+    if event in silence_events:
+        return True
+    return bool(
+        float(getattr(phrase, "energy", 0.0))
+        <= _env_float("V34_RHYTHM_SILENCE_ENERGY_MAX", 0.12)
+        and float(getattr(phrase, "beat_density", 0.0))
+        <= _env_float("V34_RHYTHM_SILENCE_BEAT_MAX", 0.10)
+        and float(getattr(phrase, "calmness", 0.0))
+        >= _env_float("V34_RHYTHM_SILENCE_CALM_MIN", 0.72)
+    )
+
+
+def _rhythm_prior_penalty_arrays(
+    *,
+    rhythm_features: Dict[str, np.ndarray],
+    phrase: Any,
+    slot_duration_sec: float,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, float]]:
+    """Candidate-local motion-density penalties used before top-k pruning."""
+    mean_e = rhythm_features["mean_energy"]
+    first_ratio = rhythm_features["first1s_energy_ratio"]
+    tail_e = rhythm_features["tail_mean_energy"]
+    zeros = np.zeros_like(mean_e, dtype=np.float32)
+    if not _enabled("V34_RHYTHM_DEGRADATION_PENALTY", "0"):
+        return zeros, {"hold": zeros, "density": zeros}, {
+            "enabled": 0.0,
+            "music_motion_pressure": 0.0,
+            "musical_silence": 0.0,
+        }
+
+    is_silence = _is_musical_silence(phrase)
+    if is_silence:
+        return zeros, {"hold": zeros, "density": zeros}, {
+            "enabled": 1.0,
+            "music_motion_pressure": 0.0,
+            "musical_silence": 1.0,
+        }
+
+    pressure = max(_env_float("V34_RHYTHM_MIN_PRESSURE", 0.45), _music_motion_pressure(phrase))
+    ratio_limit = _env_float("V34_HOLD_FIRST1S_RATIO_LIMIT", 0.65)
+    tail_limit = _env_float("V34_HOLD_TAIL_ENERGY_LIMIT", 0.020)
+    min_mean = _env_float("V34_MIN_SLOT_MEAN_ENERGY", 0.015)
+    duration_min = _env_float("V34_DENSITY_SLOT_DURATION_MIN_SEC", 1.5)
+    hold_weight = _env_float("V34_HOLD_PENALTY_WEIGHT", 3.50)
+    density_weight = _env_float("V34_DENSITY_PENALTY_WEIGHT", 4.00)
+    global_weight = _env_float("V34_RHYTHM_WEIGHT", 1.0)
+
+    ratio_excess = np.maximum(0.0, first_ratio - ratio_limit)
+    tail_deficit = np.maximum(0.0, (tail_limit - tail_e) / max(tail_limit, 1e-8))
+    hold_penalty = hold_weight * ratio_excess * tail_deficit * pressure
+
+    if float(slot_duration_sec) > duration_min:
+        density_deficit = np.maximum(0.0, (min_mean - mean_e) / max(min_mean, 1e-8))
+        density_penalty = density_weight * np.square(density_deficit) * pressure
+    else:
+        density_penalty = zeros
+
+    total = global_weight * (hold_penalty + density_penalty)
+    return (
+        np.asarray(total, dtype=np.float32),
+        {
+            "hold": np.asarray(global_weight * hold_penalty, dtype=np.float32),
+            "density": np.asarray(global_weight * density_penalty, dtype=np.float32),
+        },
+        {
+            "enabled": 1.0,
+            "music_motion_pressure": float(pressure),
+            "musical_silence": 0.0,
+            "first1s_ratio_limit": float(ratio_limit),
+            "tail_energy_limit": float(tail_limit),
+            "min_mean_energy": float(min_mean),
+        },
+    )
+
+
+def _rhythm_streak_penalty(
+    *,
+    selected: Sequence[int],
+    candidate: int,
+    event_types: Sequence[str],
+) -> Tuple[float, Dict[str, Any]]:
+    if not _enabled("V34_RHYTHM_DEGRADATION_PENALTY", "0"):
+        return 0.0, {"enabled": False, "score": 0.0}
+    static_tags = _csv_set(
+        "V34_STATIC_EVENT_TAGS",
+        "pose_hold,calm_flow,neutral_flow",
+    )
+    current_event = str(event_types[int(candidate)])
+    streak_count = 1 if current_event in static_tags else 0
+    if streak_count:
+        for previous in reversed(selected):
+            if str(event_types[int(previous)]) in static_tags:
+                streak_count += 1
+            else:
+                break
+
+    allowed = max(1, _env_int("V34_STATIC_STREAK_ALLOW", 2))
+    weight = _env_float("V34_STREAK_PENALTY_WEIGHT", 2.00)
+    score = 0.0
+    if streak_count > allowed:
+        score = weight * float((streak_count - allowed) ** 2)
+    return float(score), {
+        "enabled": True,
+        "score": float(score),
+        "current_event": current_event,
+        "static_tags": sorted(static_tags),
+        "streak_count": int(streak_count),
+        "allowed_streak": int(allowed),
+        "weight": float(weight),
+    }
 
 
 def _slot_reset_allow(phrase: Any) -> float:
@@ -403,6 +613,18 @@ def choose_events_v34(
     gpu_cache = None
     if build_v34_gpu_candidate_cache is not None:
         gpu_cache = build_v34_gpu_candidate_cache(arrays, motions, device)
+    rhythm_features = _build_rhythm_feature_arrays(
+        motions,
+        fps=int(getattr(args, "fps", 30)),
+    )
+    if len(rhythm_features["mean_energy"]) != len(natural):
+        rhythm_features = {
+            "mean_energy": np.zeros_like(natural, dtype=np.float32),
+            "p90_energy": np.zeros_like(natural, dtype=np.float32),
+            "max_energy": np.zeros_like(natural, dtype=np.float32),
+            "first1s_energy_ratio": np.zeros_like(natural, dtype=np.float32),
+            "tail_mean_energy": np.zeros_like(natural, dtype=np.float32),
+        }
 
     minimum = float(os.getenv("V34_WARP_MIN", str(args.min_time_warp)))
     maximum = float(os.getenv("V34_WARP_MAX", str(args.max_time_warp)))
@@ -444,6 +666,7 @@ def choose_events_v34(
 
     beam = [scheduler.CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
+        slot_duration_sec = float(phrase.length) / max(float(getattr(args, "fps", 30)), 1.0)
         predicted_event = scheduler.EVENT_TYPES[
             int(predictions["event_ids"][slot])
         ]
@@ -559,6 +782,14 @@ def choose_events_v34(
             - args.turn_peak_penalty_weight * turn_penalty
             - 0.35 * warp_weight * approximate_warp_penalty
         )
+        rhythm_prior_penalty, rhythm_prior_terms, rhythm_slot_context = (
+            _rhythm_prior_penalty_arrays(
+                rhythm_features=rhythm_features,
+                phrase=phrase,
+                slot_duration_sec=slot_duration_sec,
+            )
+        )
+        base = base - rhythm_prior_penalty
 
         node_top_k = min(
             int(args.candidate_top_k),
@@ -942,6 +1173,46 @@ def choose_events_v34(
                         float(mmr_embed[idx] @ mmr_embed[previous])
                         for previous in state.selected
                     )
+                rhythm_streak_score, rhythm_streak_meta = _rhythm_streak_penalty(
+                    selected=state.selected,
+                    candidate=idx,
+                    event_types=event_types,
+                )
+                rhythm_penalty = float(rhythm_prior_penalty[idx]) + float(
+                    rhythm_streak_score
+                )
+                rhythm_meta = {
+                    "enabled": bool(
+                        _enabled("V34_RHYTHM_DEGRADATION_PENALTY", "0")
+                    ),
+                    "score": float(rhythm_penalty),
+                    "prior_penalty": float(rhythm_prior_penalty[idx]),
+                    "hold_penalty": float(rhythm_prior_terms["hold"][idx]),
+                    "density_penalty": float(rhythm_prior_terms["density"][idx]),
+                    "streak_penalty": float(rhythm_streak_score),
+                    "streak": rhythm_streak_meta,
+                    "features": {
+                        "mean_energy": float(rhythm_features["mean_energy"][idx]),
+                        "p90_energy": float(rhythm_features["p90_energy"][idx]),
+                        "max_energy": float(rhythm_features["max_energy"][idx]),
+                        "first1s_energy_ratio": float(
+                            rhythm_features["first1s_energy_ratio"][idx]
+                        ),
+                        "tail_mean_energy": float(
+                            rhythm_features["tail_mean_energy"][idx]
+                        ),
+                    },
+                    "slot_context": {
+                        key: (
+                            bool(value)
+                            if key == "musical_silence"
+                            else float(value)
+                        )
+                        for key, value in rhythm_slot_context.items()
+                    },
+                }
+                transition_meta = dict(transition_meta)
+                transition_meta["rhythm_degradation"] = rhythm_meta
                 score = (
                     state.score
                     + float(base[idx])
@@ -959,6 +1230,7 @@ def choose_events_v34(
                     - warp_weight * warp_penalty
                     - transition_budget_penalty
                     - relaxation_penalty
+                    - rhythm_streak_score
                 )
                 part = {
                     "slot": slot,
@@ -1020,6 +1292,31 @@ def choose_events_v34(
                     "turn_peak_dps": float(turn_peak_dps[idx]),
                     "turn_angle_deg": float(turn_angle_deg[idx]),
                     "turn_penalty": float(turn_penalty[idx]),
+                    "rhythm_degradation_enabled": bool(
+                        _enabled("V34_RHYTHM_DEGRADATION_PENALTY", "0")
+                    ),
+                    "rhythm_degradation_penalty": float(rhythm_penalty),
+                    "rhythm_prior_penalty": float(rhythm_prior_penalty[idx]),
+                    "rhythm_hold_penalty": float(
+                        rhythm_prior_terms["hold"][idx]
+                    ),
+                    "rhythm_density_penalty": float(
+                        rhythm_prior_terms["density"][idx]
+                    ),
+                    "rhythm_streak_penalty": float(rhythm_streak_score),
+                    "rhythm_mean_energy": float(
+                        rhythm_features["mean_energy"][idx]
+                    ),
+                    "rhythm_p90_energy": float(
+                        rhythm_features["p90_energy"][idx]
+                    ),
+                    "rhythm_first1s_energy_ratio": float(
+                        rhythm_features["first1s_energy_ratio"][idx]
+                    ),
+                    "rhythm_tail_mean_energy": float(
+                        rhythm_features["tail_mean_energy"][idx]
+                    ),
+                    "rhythm_meta": rhythm_meta,
                     "candidate_top_k": int(args.candidate_top_k),
                     "graph_node_top_k": int(node_top_k),
                     "hierarchy_enabled": bool(args.hierarchical_retrieval),

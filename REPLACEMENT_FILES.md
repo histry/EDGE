@@ -1,173 +1,101 @@
-# EDGE V34 Dense Boundary Risk Replacement - 2026-06-21
+﻿# EDGE V34 Rhythm Repair Replacement Files
 
-This replacement package is based on the previous dynamic-relax package and the
-current `histry/EDGE` V34 code path.  It targets the failure found in the
-Dunhuang whole-song boundary clips: visually bad boundaries can still receive a
-zero retrieval risk when every metric remains just inside its hard threshold.
+Base repo checked: https://github.com/histry/EDGE.git
+Base commit: a224308bf0cc60ccaf571ffc58612e1eec62d634
 
-## Core Diagnosis
+## Why this patch exists
 
-The old boundary score used a ReLU/excess ratio:
+Dense Boundary fixed many hard physical seam failures, but the generated full-song result exposed a new retrieval-level failure: safe low-motion snippets dominate the beam. The typical symptom is: the dancer moves quickly during the first second of a slot, then holds a pose for the remaining slot; several `pose_hold`, `calm_flow`, and `neutral_flow` slots in a row look like 6-15 seconds of visual stagnation.
 
-```python
-max(0.0, value / limit - 1.0)
-```
+This patch adds a pure inference-time rhythm degradation penalty. It does not require rebuilding the V34 event library and does not require retraining.
 
-That is correct for hard rejection, but wrong for ranking.  It makes `0.01 *
-limit` and `0.99 * limit` both score `0.0`.  Beam search therefore cannot prefer
-a safe interior stitch over a near-threshold stitch.
+## Files to replace/copy
 
-This package decouples the two roles:
+Copy these files into `/home/disk/lsm/storage/EDGE` preserving paths:
 
-- hard feasibility gate: still uses direct threshold checks, e.g. `pose <= pose_limit`.
-- ranking score: uses dense convex risk potential, `min((value / limit) ** gamma, cap)`.
-- semantic continuity: remains excess/ReLU by default, so natural style flow is not over-penalized.
-- inpainting trigger: uses both dense score and near-threshold visual ratios.
+- `tools/v34_warp_aware_retrieval.py`
+- `scripts/launch_v34_inpaint_blend.sh`
+- `scripts/launch_v34_graceful_pipeline.sh`
+- `scripts/launch_v34_semantic_router.sh`
+- `scripts/launch_v34_rhythm_repair.sh`  (new file)
 
-## Files To Replace On Server
+## Main code changes
 
-Copy these files into `/home/disk/lsm/storage/EDGE`:
+### 1. Retrieval-time rhythm descriptors
 
-```text
-tools/v34_boundary_compatibility.py
-tools/v34_warp_aware_retrieval.py
-tools/v34_boundary_inpainting.py
-tools/schedule_v34_whole_song.py
-tools/v34_gpu_candidate_cache.py
-scripts/launch_v34_semantic_router.sh
-scripts/launch_v34_graceful_pipeline.sh
-scripts/launch_v34_inpaint_blend.sh
-scripts/resume_v34_inference_v33ckpt.sh
-```
+`tools/v34_warp_aware_retrieval.py` now computes, for each candidate snippet:
 
-## What Changed
+- `rhythm_mean_energy`
+- `rhythm_p90_energy`
+- `rhythm_first1s_energy_ratio`
+- `rhythm_tail_mean_energy`
 
-### `tools/v34_boundary_compatibility.py`
+These are computed from already-loaded motion tensors, so no database rebuild is needed.
 
-- Adds `_excess_ratio()` for hard-gate-compatible excess scoring.
-- Adds `_dense_ratio()` and `_ranking_ratio()` for physical boundary ranking.
-- Physical terms now use dense score by default:
-  - pose
-  - velocity
-  - acceleration
-  - contact
-  - contact_binary
-  - support_count
-  - yaw
-  - transition
-- Semantic terms use `_excess_ratio()` by default:
-  - body
-  - activity
-  - turn
-- Keeps hard checks unchanged.
-- Writes diagnostic fields into schedule reports:
-  - `score_mode`
-  - `dense_power`
-  - `dense_cap`
-  - `dense_semantic_score`
-  - `terms`
-  - `excess_terms`
+### 2. Motion density preserving penalty
 
-### `tools/v34_warp_aware_retrieval.py`
+The score receives three anti-collapse terms:
 
-- Makes semantic scoring explicitly use `_excess_ratio()`.
-- Keeps adaptive relax-on-empty from the previous package.
-- Adds minimum-violation rescue top-k for relaxed candidates:
-  - `V34_RELAX_RESCUE_TOP_K=768`
-- This prevents an empty strict feasible set from reintroducing thousands of bad relaxed branches into the beam.
+- `hold_penalty`: penalizes candidates with high first-second energy ratio and low tail energy.
+- `density_penalty`: penalizes long slots whose mean motion energy is too low.
+- `streak_penalty`: penalizes consecutive static tags: `pose_hold,calm_flow,neutral_flow`.
 
-### `tools/v34_boundary_inpainting.py`
+The schedule report records all debug fields under both top-level slot fields and `transition_meta.rhythm_degradation`.
 
-- Changes default `V34_INPAINT_COMPAT_SCORE_TRIGGER` from `0.10` to `0.45`.
-- Adds visual heuristic triggers based on boundary metric ratios:
-  - pose ratio
-  - yaw ratio
-  - contact ratio
-  - transition-cost ratio
-- Default trigger ratio is `0.80`, so near-threshold bad boundaries are sent to masked boundary inpainting even when hard checks pass.
+### 3. Shortlist-level and beam-level protection
 
-### `tools/schedule_v34_whole_song.py`
+The candidate-local `hold_penalty` and `density_penalty` are subtracted before top-k shortlist pruning, preventing static snippets from blocking better candidates before the beam search loop.
 
-Adds policy fields to `schedule_report.json`:
+The history-dependent `streak_penalty` is applied during beam expansion, so repeated pose-hold chains are penalized path-wise.
 
-```json
-"dense_boundary_score": true,
-"dense_boundary_power": 2.0,
-"dense_boundary_cap": 4.0,
-"dense_semantic_score": false,
-"inpaint_compat_score_trigger": 0.45,
-"inpaint_visual_heuristic": true,
-"relax_rescue_top_k": 768
-```
+## Important environment variables
 
-### Launch scripts
-
-The four scripts now default to:
+Default launcher values:
 
 ```bash
-export V34_COMPAT_DENSE_SCORE=1
-export V34_COMPAT_DENSE_POWER=2.0
-export V34_COMPAT_DENSE_CAP=4.0
-export V34_COMPAT_DENSE_SEMANTIC_SCORE=0
-export V34_RELAX_RESCUE_TOP_K=768
-export V34_INPAINT_COMPAT_SCORE_TRIGGER=0.45
-export V34_INPAINT_VISUAL_HEURISTIC=1
-export V34_INPAINT_VISUAL_POSE_RATIO=0.80
-export V34_INPAINT_VISUAL_YAW_RATIO=0.80
-export V34_INPAINT_VISUAL_CONTACT_RATIO=0.80
-export V34_INPAINT_VISUAL_TRANSITION_RATIO=0.80
+export V34_RHYTHM_DEGRADATION_PENALTY=1
+export V34_RHYTHM_WEIGHT=1.0
+export V34_HOLD_PENALTY_WEIGHT=3.50
+export V34_STREAK_PENALTY_WEIGHT=2.00
+export V34_DENSITY_PENALTY_WEIGHT=4.00
+export V34_HOLD_FIRST1S_RATIO_LIMIT=0.65
+export V34_HOLD_TAIL_ENERGY_LIMIT=0.020
+export V34_MIN_SLOT_MEAN_ENERGY=0.015
+export V34_STATIC_STREAK_ALLOW=2
+export V34_STATIC_EVENT_TAGS=pose_hold,calm_flow,neutral_flow
 ```
 
-## Replace Commands
+For the dedicated rhythm-repair inference launcher, boundary weight defaults to:
 
-Run these on the server after copying this package directory there, or copy the
-listed files manually.
+```bash
+export V34_BOUNDARY_COMPAT_WEIGHT=1.15
+```
+
+This keeps Dense Boundary active but reduces its tendency to over-prefer low-motion safe snippets.
+
+## Verify after replacement
+
+On the Linux EDGE server:
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
 
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/tools/v34_boundary_compatibility.py tools/v34_boundary_compatibility.py
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/tools/v34_warp_aware_retrieval.py tools/v34_warp_aware_retrieval.py
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/tools/v34_boundary_inpainting.py tools/v34_boundary_inpainting.py
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/tools/schedule_v34_whole_song.py tools/schedule_v34_whole_song.py
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/tools/v34_gpu_candidate_cache.py tools/v34_gpu_candidate_cache.py
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/scripts/launch_v34_semantic_router.sh scripts/launch_v34_semantic_router.sh
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/scripts/launch_v34_graceful_pipeline.sh scripts/launch_v34_graceful_pipeline.sh
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/scripts/launch_v34_inpaint_blend.sh scripts/launch_v34_inpaint_blend.sh
-cp -f /PATH/TO/EDGE_V34_DENSE_BOUNDARY_REPLACEMENT_20260621/scripts/resume_v34_inference_v33ckpt.sh scripts/resume_v34_inference_v33ckpt.sh
-```
-
-## Verify After Replacement
-
-```bash
-cd /home/disk/lsm/storage/EDGE
-
-python -m py_compile \
-  tools/v34_boundary_compatibility.py \
-  tools/v34_warp_aware_retrieval.py \
-  tools/v34_boundary_inpainting.py \
-  tools/schedule_v34_whole_song.py \
-  tools/v34_gpu_candidate_cache.py
-
+python -m py_compile tools/v34_warp_aware_retrieval.py
 bash -n \
-  scripts/launch_v34_semantic_router.sh \
-  scripts/launch_v34_graceful_pipeline.sh \
   scripts/launch_v34_inpaint_blend.sh \
-  scripts/resume_v34_inference_v33ckpt.sh
+  scripts/launch_v34_graceful_pipeline.sh \
+  scripts/launch_v34_semantic_router.sh \
+  scripts/launch_v34_rhythm_repair.sh
 ```
 
-## Recommended Overnight Inference Run
-
-This first run reuses the current event library and checkpoint.  Do this before
-full retraining because the current failure is a retrieval/inpainting routing
-issue, not a proven training-capacity issue.
+## Recommended first run: pure inference rhythm repair
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
 
-tmux kill-session -t v34_dense_boundary_overnight 2>/dev/null || true
+tmux kill-session -t v34_rhythm_repair 2>/dev/null || true
 
-tmux new-session -d -s v34_dense_boundary_overnight "bash -lc '
+tmux new-session -d -s v34_rhythm_repair "bash -lc '
 set -euo pipefail
 cd /home/disk/lsm/storage/EDGE
 
@@ -178,128 +106,31 @@ export PYTHONPATH=\$EDGE_ROOT
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
 
-export V34_TRAIN=0
-export V34_BUILD_EVENT_LIBRARY=0
-export V34_OVERWRITE_EVENT_LIBRARY=0
-
-export V34_BOUNDARY_COMPAT=1
-export V34_COMPAT_HARD_PRUNE=1
-export V34_COMPAT_SEMANTIC_HARD_PRUNE=1
-export V34_SEMANTIC_EDGE=1
-export V34_SEMANTIC_EDGE_HARD_PRUNE=1
-
-export V34_COMPAT_DENSE_SCORE=1
-export V34_COMPAT_DENSE_POWER=2.0
-export V34_COMPAT_DENSE_CAP=4.0
-export V34_COMPAT_DENSE_SEMANTIC_SCORE=0
-export V34_BOUNDARY_COMPAT_WEIGHT=1.50
-export V34_SEMANTIC_EDGE_WEIGHT=1.25
-
-export V34_RELAX_CONSTRAINTS_ON_EMPTY=1
-export V34_RELAX_COMPAT_ON_EMPTY=1
-export V34_RELAX_SEMANTIC_ON_EMPTY=1
-export V34_RELAX_COMPAT_PENALTY_WEIGHT=5.00
-export V34_RELAX_SEMANTIC_PENALTY_WEIGHT=4.50
-export V34_RELAX_CONTACT_PENALTY_WEIGHT=2.00
-export V34_RELAX_RESCUE_TOP_K=768
-
-export V34_WARP_HARD_PRUNE=1
-export V34_WARP_MIN=0.92
-export V34_WARP_MAX=1.12
-export V34_WARP_RELAX_ON_EMPTY=1
-export V34_WARP_RELAX_MIN=0.82
-export V34_WARP_RELAX_MAX=1.30
-
-export V34_BOUNDARY_INPAINT=1
-export V34_INPAINT_ON_RELAXED_CONSTRAINT=1
-export V34_INPAINT_COMPAT_SCORE_TRIGGER=0.45
-export V34_INPAINT_VISUAL_HEURISTIC=1
-export V34_INPAINT_VISUAL_POSE_RATIO=0.80
-export V34_INPAINT_VISUAL_YAW_RATIO=0.80
-export V34_INPAINT_VISUAL_CONTACT_RATIO=0.80
-export V34_INPAINT_VISUAL_TRANSITION_RATIO=0.80
-
-export V34_LATENT_SNIPPET_BLEND=1
-export V34_USE_GPU_RETRIEVAL=1
-export V34_FAIL_ON_UNSAFE_BOUNDARY=0
-export V34_DEFER_UNSAFE_BOUNDARY=1
-export V34_HANDSHAKE_FALLBACK_ON_UNSAFE=1
-
-export RUN_ID=v34_dense_boundary_overnight_\$(date +%Y%m%d_%H%M%S)
+export RUN_ID=v34_rhythm_repair_infer_\$(date +%Y%m%d_%H%M%S)
 export RUN_ROOT=output/\$RUN_ID
-mkdir -p "\$RUN_ROOT"
-echo "\$RUN_ROOT" > output/LATEST_V34_DENSE_BOUNDARY_OVERNIGHT.txt
+mkdir -p \"\$RUN_ROOT\"
+echo \"\$RUN_ROOT\" > output/LATEST_V34_RHYTHM_REPAIR.txt
 
-echo "[DENSE BOUNDARY START] \$(date) RUN_ROOT=\$RUN_ROOT" | tee -a "\$RUN_ROOT/outer.log"
-bash scripts/launch_v34_semantic_router.sh 2>&1 | tee -a "\$RUN_ROOT/outer.log"
+bash scripts/launch_v34_rhythm_repair.sh 2>&1 | tee -a \"\$RUN_ROOT/outer.log\"
 '"
 
-sleep 5
-RUN_ROOT=$(cat output/LATEST_V34_DENSE_BOUNDARY_OVERNIGHT.txt)
+RUN_ROOT=$(cat output/LATEST_V34_RHYTHM_REPAIR.txt)
 echo "RUN_ROOT=$RUN_ROOT"
 tail -f "$RUN_ROOT/outer.log"
 ```
 
-## Morning Inspection
+## Morning inspection
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
-RUN_ROOT=$(cat output/LATEST_V34_DENSE_BOUNDARY_OVERNIGHT.txt)
-echo "RUN_ROOT=$RUN_ROOT"
-
-grep -nE "DENSE|V34-RELAX|constraint_relax|visual_heuristic|compat_trigger|PASS|DONE|ERROR|Traceback|RuntimeError|SAVED" \
-  "$RUN_ROOT/run.log" "$RUN_ROOT/outer.log" 2>/dev/null | tail -260
+RUN_ROOT=$(cat output/LATEST_V34_RHYTHM_REPAIR.txt)
 
 find "$RUN_ROOT" -type f \
   \( -name "*.schedule_report.json" \
      -o -name "*.boundary_v34.json" \
-     -o -name "*.public_metrics.json" \
-     -o -name "*.frequency_foot.json" \
      -o -name "*.contact_metrics.json" \
      -o -name "*.jitter.json" \
-     -o -name "*.mp4" \
-     -o -name "*SUMMARY.json" \) | sort
+     -o -name "*.mp4" \) | sort
 ```
 
-## Quantile Check For Trigger Tuning
-
-Use this after the run to decide whether `V34_INPAINT_COMPAT_SCORE_TRIGGER=0.45`
-should move toward `0.35` or `0.60`.
-
-```bash
-cd /home/disk/lsm/storage/EDGE
-RUN_ROOT=$(cat output/LATEST_V34_DENSE_BOUNDARY_OVERNIGHT.txt)
-
-python - <<'PY'
-import json, pathlib, statistics
-run = pathlib.Path(open("output/LATEST_V34_DENSE_BOUNDARY_OVERNIGHT.txt").read().strip())
-for rpt in sorted(run.glob("**/*.schedule_report.json")):
-    data = json.loads(rpt.read_text())
-    scores, visual = [], []
-    for part in data.get("schedule", []):
-        scores.append(float(part.get("boundary_compat_score", 0.0)))
-    for i, metrics in enumerate(data.get("boundary_metrics", []), start=1):
-        inpaint = metrics.get("v34_boundary_inpainting", {}) or {}
-        trig = inpaint.get("trigger", {}) or {}
-        if trig.get("visual_heuristic"):
-            visual.append(i)
-    if not scores:
-        continue
-    vals = sorted(scores)
-    def q(p):
-        return vals[min(len(vals)-1, int(round((len(vals)-1)*p)))]
-    print("\n==", rpt, "==")
-    print("n", len(vals), "q50", round(q(0.50), 4), "q75", round(q(0.75), 4), "q90", round(q(0.90), 4), "q95", round(q(0.95), 4), "max", round(vals[-1], 4))
-    print("visual_heuristic_slots", visual[:80], "count", len(visual))
-PY
-```
-
-## Expected Effect
-
-- The bad-boundary class where `pose/yaw/contact` are close to the limit but still below it should no longer receive `boundary_compat_score=0.0`.
-- Some problematic boundaries should be avoided directly by beam search.
-- Unavoidable near-threshold boundaries should be sent to masked inpainting through `compat_trigger` or `visual_heuristic`.
-- If many slots still trigger visual inpainting, tune in this order:
-  1. Lower `V34_BOUNDARY_COMPAT_WEIGHT` from `1.50` to `1.20` if motion becomes too conservative.
-  2. Raise `V34_INPAINT_VISUAL_*_RATIO` from `0.80` to `0.88` if inpainting is over-triggered.
-  3. Lower `V34_INPAINT_COMPAT_SCORE_TRIGGER` from `0.45` to `0.35` if bad boundary clips remain but are not inpainted.
+Check whether the previously bad ranges are now lower in `rhythm_first1s_energy_ratio`, `rhythm_degradation_penalty`, and static streak count.

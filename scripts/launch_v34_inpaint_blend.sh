@@ -56,6 +56,20 @@ export V34_RELAX_COMPAT_PENALTY_WEIGHT="${V34_RELAX_COMPAT_PENALTY_WEIGHT:-5.00}
 export V34_RELAX_SEMANTIC_PENALTY_WEIGHT="${V34_RELAX_SEMANTIC_PENALTY_WEIGHT:-4.50}"
 export V34_RELAX_CONTACT_PENALTY_WEIGHT="${V34_RELAX_CONTACT_PENALTY_WEIGHT:-2.00}"
 
+# Rhythm repair prevents the search solver from exploiting the strict boundary
+# metric by selecting snippets that spend most energy in the first second and
+# then collapse into low-motion pose holds.
+export V34_RHYTHM_DEGRADATION_PENALTY="${V34_RHYTHM_DEGRADATION_PENALTY:-1}"
+export V34_RHYTHM_WEIGHT="${V34_RHYTHM_WEIGHT:-1.0}"
+export V34_HOLD_PENALTY_WEIGHT="${V34_HOLD_PENALTY_WEIGHT:-3.50}"
+export V34_STREAK_PENALTY_WEIGHT="${V34_STREAK_PENALTY_WEIGHT:-2.00}"
+export V34_DENSITY_PENALTY_WEIGHT="${V34_DENSITY_PENALTY_WEIGHT:-4.00}"
+export V34_HOLD_FIRST1S_RATIO_LIMIT="${V34_HOLD_FIRST1S_RATIO_LIMIT:-0.65}"
+export V34_HOLD_TAIL_ENERGY_LIMIT="${V34_HOLD_TAIL_ENERGY_LIMIT:-0.020}"
+export V34_MIN_SLOT_MEAN_ENERGY="${V34_MIN_SLOT_MEAN_ENERGY:-0.015}"
+export V34_STATIC_STREAK_ALLOW="${V34_STATIC_STREAK_ALLOW:-2}"
+export V34_STATIC_EVENT_TAGS="${V34_STATIC_EVENT_TAGS:-pose_hold,calm_flow,neutral_flow}"
+
 # GPU cache accelerates candidate-pair boundary metrics.  Disable only for CPU
 # debugging or if CUDA/PyTorch3D is unavailable.
 export V34_USE_GPU_RETRIEVAL="${V34_USE_GPU_RETRIEVAL:-1}"
@@ -67,8 +81,12 @@ export V34_INPAINT_TRIGGER_RATIO="${V34_INPAINT_TRIGGER_RATIO:-0.72}"
 export V34_INPAINT_TAIL_FRAMES="${V34_INPAINT_TAIL_FRAMES:-6}"
 export V34_INPAINT_HEAD_FRAMES="${V34_INPAINT_HEAD_FRAMES:-6}"
 export V34_INPAINT_CONTEXT_FRAMES="${V34_INPAINT_CONTEXT_FRAMES:-4}"
-export V34_INPAINT_BLEND="${V34_INPAINT_BLEND:-${V32_INR_TRUST:-0.35}}"
-export V34_INPAINT_STEPS="${V34_INPAINT_STEPS:-${V32_INFERENCE_STEPS:-40}}"
+if [[ -z "${V34_INPAINT_BLEND:-}" ]]; then
+  export V34_INPAINT_BLEND="${V32_INR_TRUST:-0.35}"
+fi
+if [[ -z "${V34_INPAINT_STEPS:-}" ]]; then
+  export V34_INPAINT_STEPS="${V32_INFERENCE_STEPS:-40}"
+fi
 export V34_INPAINT_MAX_RISK_RATIO="${V34_INPAINT_MAX_RISK_RATIO:-1.03}"
 export V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES="${V34_INPAINT_ACCEPT_IF_ABSOLUTE_IMPROVES:-1}"
 export V34_INPAINT_IMPROVE_JERK_TOL="${V34_INPAINT_IMPROVE_JERK_TOL:-1.05}"
@@ -88,10 +106,14 @@ export V34_LATENT_BLEND_KEEP_RATIO="${V34_LATENT_BLEND_KEEP_RATIO:-1.01}"
 
 if [[ "${V34_TRAIN:-0}" == "1" ]]; then
   export V34_TRAIN=1
-  export RUN_ID="${RUN_ID:-v34_inpaint_blend_full_$(date +%Y%m%d_%H%M%S)}"
+  if [[ -z "${RUN_ID:-}" ]]; then
+    export RUN_ID="v34_inpaint_blend_full_$(date +%Y%m%d_%H%M%S)"
+  fi
   bash scripts/launch_v34_full_overnight.sh "$@"
 else
   export V34_TRAIN=0
-  export RUN_ID="${RUN_ID:-v34_inpaint_blend_infer_$(date +%Y%m%d_%H%M%S)}"
+  if [[ -z "${RUN_ID:-}" ]]; then
+    export RUN_ID="v34_inpaint_blend_infer_$(date +%Y%m%d_%H%M%S)"
+  fi
   bash scripts/resume_v34_inference_v33ckpt.sh "$@"
 fi
