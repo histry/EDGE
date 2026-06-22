@@ -1,4 +1,4 @@
-# EDGE V34 Motion Quality Repair Replacement
+﻿# EDGE V34 Motion Quality Repair Replacement
 
 ## 目标问题
 
@@ -74,7 +74,7 @@ V34_STREAK_PENALTY_WEIGHT=3.00
 tools/v34_motion_quality_postprocess.py
 ```
 
-它读取 `*_v26.npy` 的 contact channels，找到连续接触脚段，把 root 的 X/Z 平移反向校正，使支撑脚尽量固定在该接触段的中位锚点上。
+它读取 `*_v26.npy` 的 contact channels，先按接触分段约束 Root-Y：双脚离地段拟合重力抛物线，落地段加入短时下沉阻尼；再对上肢 6D rotation 做轻量 collision-aware IK；最后做接触脚 root X/Z 锁定，降低支撑脚滑步。
 
 默认不会覆盖原始文件，而是生成：
 
@@ -98,6 +98,26 @@ EDGE_RENDER_ZLIM=-0.05,2.25
 
 它用于消除 Matplotlib 3D box 的视觉缩放干扰。该改动只影响展示，不改变 motion 数据。
 
+
+### 5. Root-Y 物理网关与碰撞 IK
+
+`tools/v34_motion_quality_postprocess.py` 不再默认平滑 Root-Y。新增环境变量：
+
+```text
+V34_ROOT_Y_PHYSICS
+V34_PARABOLA_STRENGTH
+V34_LANDING_STRENGTH
+V34_COLLISION_IK
+V34_COLLISION_RADIUS
+V34_COLLISION_STEPS
+```
+
+作用：
+
+- 双脚离地段：Root-Y 使用端点连续的抛物线弧线，避免匀速漂浮；
+- 落地段：Root-Y 加入短时下沉冲击吸收，保留重量感；
+- 自穿模段：只优化上肢相关 6D rotation，利用胶囊/关节距离排斥降低手臂穿躯干；
+- 支撑段：contact root-lock 约束支撑脚水平速度。
 ## 推荐纯推理命令
 
 ```bash
@@ -151,7 +171,12 @@ export V34_STREAK_PENALTY_WEIGHT=3.00
 export V34_MOTION_QUALITY_POSTPROCESS=1
 export V34_CONTACT_LOCK_POSTPROCESS=1
 export V34_CONTACT_LOCK_STRENGTH=0.85
-export V34_OUTPUT_SMOOTH=1
+export V34_ROOT_Y_PHYSICS=1
+export V34_PARABOLA_STRENGTH=0.60
+export V34_LANDING_STRENGTH=0.75
+export V34_COLLISION_IK=1
+export V34_COLLISION_STEPS=24
+export V34_OUTPUT_SMOOTH=0
 
 export RUN_ID=v34_motion_quality_repair_\$(date +%Y%m%d_%H%M%S)
 export RUN_ROOT=output/\$RUN_ID
@@ -207,6 +232,8 @@ grep -nE "rhythm_degradation|frontload|tail_ratio|motion_quality|PASS|DONE|Trace
 
 ## 科研表述
 
-这次改动可以定义为第三篇长程调度问题的工程落地：
+这次改动横跨第一篇和第三篇：调度层属于第三篇长程运筹，Root-Y/contact/collision 后处理属于第一篇物理可信修复。
 
-> Dense Boundary 解决了片段接缝的物理突变，但会暴露低资源 Event-RAG 的安全片段偏置。搜索器倾向于选择边界风险低、动作密度低、前置能量释放过快的片段。为此，本文引入 motion-density preserving retrieval field，通过 frontload risk、late-energy coverage、tail-to-mean ratio 与 static streak penalty，把全局搜索轨迹从安全静态流形推回持续运动流形；同时利用 contact-aware root locking 在输出层约束支撑脚零速度，降低 foot skating。
+> Dense Boundary 解决了片段接缝的物理突变，但会暴露低资源 Event-RAG 的安全片段偏置。搜索器倾向于选择边界风险低、动作密度低、前置能量释放过快的片段。为此，本文引入 motion-density preserving retrieval field，通过 frontload risk、late-energy coverage、tail-to-mean ratio 与 static streak penalty，把全局搜索轨迹从安全静态流形推回持续运动流形；同时利用 physics-plausible post-optimization gateway 在输出层执行接触脚 root-lock、飞行期 Root-Y 抛物线约束、落地阻尼冲击吸收和轻量 collision-aware IK，降低 foot skating、floating 和显性上肢穿模。
+
+

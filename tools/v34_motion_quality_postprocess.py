@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Post-process V34 151D motions for contact locking and light jitter control.
+"""Physics-plausible post-optimization for V34 151D motion.
 
-This tool is intentionally conservative: it does not change event selection or
-network weights.  It only applies a root-translation correction when a foot is
-already marked as contacting the ground, then optionally smooths high-frequency
-rotation noise with a short symmetric filter.
+The previous "smooth everything" style of post-processing can hide jitter but
+also destroys landing impulse and makes the root look buoyant.  This module is
+structured as a conservative physical gateway:
+
+1. contact-aware root X/Z lock for support-foot sliding;
+2. contact-segmented root-Y gravity arc and landing shock absorption;
+3. lightweight collision-aware IK on upper-body rotations only.
+
+The original *_v26.npy is never overwritten unless the caller explicitly points
+--out to the same path.
 """
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+
+try:
+    import torch
+except Exception:  # pragma: no cover - CPU-only environments still get root fixes.
+    torch = None
 
 
 PARENTS = np.array([
@@ -54,6 +65,14 @@ OFFSETS = np.array([
 ], dtype=np.float32)
 
 FOOT_JOINTS = np.array([7, 8, 10, 11], dtype=np.int64)
+UPPER_BODY_JOINTS = np.array([13, 14, 16, 17, 18, 19, 20, 21, 22, 23], dtype=np.int64)
+COLLISION_PAIRS = (
+    (18, 3), (19, 3), (20, 3), (21, 3), (22, 3), (23, 3),
+    (18, 6), (19, 6), (20, 6), (21, 6), (22, 6), (23, 6),
+    (18, 9), (19, 9), (20, 9), (21, 9), (22, 9), (23, 9),
+    (20, 12), (21, 12), (22, 12), (23, 12),
+    (20, 21), (22, 23),
+)
 
 
 def _load_motion(path: Path) -> np.ndarray:
@@ -69,7 +88,7 @@ def _load_motion(path: Path) -> np.ndarray:
     return x
 
 
-def _rot6d_to_matrix(x: np.ndarray) -> np.ndarray:
+def _rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
     a1 = x[..., 0:3]
     a2 = x[..., 3:6]
     b1 = a1 / np.maximum(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-8)
@@ -80,10 +99,10 @@ def _rot6d_to_matrix(x: np.ndarray) -> np.ndarray:
     return np.stack([b1, b2, b3], axis=-1).astype(np.float32)
 
 
-def _fk_from_t151(motion: np.ndarray) -> np.ndarray:
+def _fk_from_t151_np(motion: np.ndarray) -> np.ndarray:
     t = motion.shape[0]
     root = motion[:, [4, 5, 6]].astype(np.float32)
-    local_r = _rot6d_to_matrix(motion[:, 7:151].reshape(t, 24, 6))
+    local_r = _rot6d_to_matrix_np(motion[:, 7:151].reshape(t, 24, 6))
     joints = np.zeros((t, 24, 3), dtype=np.float32)
     global_r = np.zeros((t, 24, 3, 3), dtype=np.float32)
     joints[:, 0] = root
@@ -119,7 +138,7 @@ def _segments(mask: np.ndarray, min_len: int) -> List[Tuple[int, int]]:
         if flag and start is None:
             start = i
         elif not flag and start is not None:
-            if i - start >= min_len:
+            if i - start >= int(min_len):
                 rows.append((start, i))
             start = None
     return rows
@@ -142,6 +161,21 @@ def _mean_contact_speed(joints: np.ndarray, contact: np.ndarray) -> float:
     return float(np.mean(speed[active]))
 
 
+def _collision_stats(joints: np.ndarray, radius: float) -> Dict[str, float]:
+    dists = []
+    for a, b in COLLISION_PAIRS:
+        dists.append(np.linalg.norm(joints[:, a] - joints[:, b], axis=-1))
+    if not dists:
+        return {"risk": 0.0, "min_distance": 1.0, "bad_frames": 0}
+    dist = np.stack(dists, axis=1)
+    pen = np.maximum(0.0, float(radius) - dist)
+    return {
+        "risk": float(np.mean(np.square(pen / max(float(radius), 1e-8)))),
+        "min_distance": float(np.min(dist)),
+        "bad_frames": int(np.sum(np.any(pen > 0, axis=1))),
+    }
+
+
 def contact_lock_root(
     motion: np.ndarray,
     *,
@@ -152,12 +186,11 @@ def contact_lock_root(
     max_correction: float,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     out = motion.astype(np.float32, copy=True)
-    joints = _fk_from_t151(out)
+    joints = _fk_from_t151_np(out)
     contact = _contact_mask(out, contact_threshold)
     correction = np.zeros((len(out), 2), dtype=np.float32)
     counts = np.zeros((len(out), 1), dtype=np.float32)
     segment_count = 0
-
     feet = joints[:, FOOT_JOINTS, :]
     for local_foot in range(4):
         for start, end in _segments(contact[:, local_foot], min_contact_frames):
@@ -166,19 +199,17 @@ def contact_lock_root(
             correction[start:end] += anchor[None, :] - segment
             counts[start:end] += 1.0
             segment_count += 1
-
     active = counts[:, 0] > 0
     correction[active] /= np.maximum(counts[active], 1.0)
     if max_correction > 0:
         norm = np.linalg.norm(correction, axis=1, keepdims=True)
-        scale = np.minimum(1.0, float(max_correction) / np.maximum(norm, 1e-8))
-        correction *= scale
+        correction *= np.minimum(1.0, float(max_correction) / np.maximum(norm, 1e-8))
     correction = _moving_average(correction, smooth_window)
     out[:, 4] += float(strength) * correction[:, 0]
     out[:, 6] += float(strength) * correction[:, 1]
-
-    after_joints = _fk_from_t151(out)
-    summary = {
+    after_joints = _fk_from_t151_np(out)
+    return out, {
+        "enabled": True,
         "contact_segments": int(segment_count),
         "active_contact_frames": int(np.sum(active)),
         "mean_contact_speed_before": _mean_contact_speed(joints, contact),
@@ -187,14 +218,75 @@ def contact_lock_root(
         "contact_threshold": float(contact_threshold),
         "strength": float(strength),
     }
-    return out, summary
 
 
-def smooth_motion(
+def enforce_root_y_physics(
+    motion: np.ndarray,
+    *,
+    contact_threshold: float,
+    min_flight_frames: int,
+    parabola_strength: float,
+    min_arc_lift: float,
+    max_arc_lift: float,
+    landing_frames: int,
+    landing_max_drop: float,
+    landing_strength: float,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    out = motion.astype(np.float32, copy=True)
+    contact = _contact_mask(out, contact_threshold)
+    support = np.any(contact, axis=1)
+    flight_segments = _segments(~support, min_flight_frames)
+    y = out[:, 5].copy()
+    corrected = y.copy()
+
+    for start, end in flight_segments:
+        n = end - start
+        if n < 2:
+            continue
+        u = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        y0 = float(y[start])
+        y1 = float(y[end - 1])
+        linear = (1.0 - u) * y0 + u * y1
+        observed_lift = float(np.max(y[start:end]) - max(y0, y1))
+        lift = float(np.clip(max(observed_lift, min_arc_lift), 0.0, max_arc_lift))
+        parabola = linear + lift * 4.0 * u * (1.0 - u)
+        corrected[start:end] = (
+            (1.0 - float(parabola_strength)) * corrected[start:end]
+            + float(parabola_strength) * parabola
+        )
+
+    landing_count = 0
+    if landing_frames > 2 and landing_strength > 0:
+        transitions = np.flatnonzero((support[1:] == True) & (support[:-1] == False)) + 1
+        for t in transitions:
+            end = min(len(out), t + int(landing_frames))
+            n = end - t
+            if n < 3:
+                continue
+            pre = max(0, t - 3)
+            downward_speed = max(0.0, float(np.mean(y[pre:t]) - y[t]))
+            amp = float(np.clip(0.35 * downward_speed + 0.012, 0.0, landing_max_drop))
+            u = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            shock = -amp * np.sin(np.pi * u) * np.exp(-1.35 * u)
+            corrected[t:end] += float(landing_strength) * shock
+            landing_count += 1
+
+    out[:, 5] = corrected.astype(np.float32)
+    return out, {
+        "enabled": True,
+        "flight_segments": int(len(flight_segments)),
+        "landing_events": int(landing_count),
+        "root_y_delta_mean": float(np.mean(np.abs(corrected - y))) if len(y) else 0.0,
+        "root_y_delta_max": float(np.max(np.abs(corrected - y))) if len(y) else 0.0,
+        "parabola_strength": float(parabola_strength),
+        "landing_strength": float(landing_strength),
+    }
+
+
+def smooth_rotations_only(
     motion: np.ndarray,
     *,
     rotation_window: int,
-    root_y_window: int,
     strength: float,
 ) -> np.ndarray:
     out = motion.astype(np.float32, copy=True)
@@ -202,10 +294,107 @@ def smooth_motion(
     if rotation_window > 1 and strength > 0:
         smoothed = _moving_average(out[:, 7:151], rotation_window)
         out[:, 7:151] = (1.0 - strength) * out[:, 7:151] + strength * smoothed
-    if root_y_window > 1 and strength > 0:
-        smoothed_y = _moving_average(out[:, 5:6], root_y_window)
-        out[:, 5:6] = (1.0 - strength) * out[:, 5:6] + strength * smoothed_y
     return out
+
+
+def _rot6d_to_matrix_torch(x: "torch.Tensor") -> "torch.Tensor":
+    a1 = x[..., 0:3]
+    a2 = x[..., 3:6]
+    b1 = a1 / torch.clamp(torch.linalg.norm(a1, dim=-1, keepdim=True), min=1e-8)
+    proj = torch.sum(b1 * a2, dim=-1, keepdim=True) * b1
+    b2 = a2 - proj
+    b2 = b2 / torch.clamp(torch.linalg.norm(b2, dim=-1, keepdim=True), min=1e-8)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)
+
+
+def _fk_torch(motion: "torch.Tensor") -> "torch.Tensor":
+    t = motion.shape[0]
+    root = motion[:, [4, 5, 6]]
+    local_r = _rot6d_to_matrix_torch(motion[:, 7:151].reshape(t, 24, 6))
+    joints = []
+    global_r = []
+    offsets = torch.as_tensor(OFFSETS, dtype=motion.dtype, device=motion.device)
+    for j in range(24):
+        if j == 0:
+            joints.append(root)
+            global_r.append(local_r[:, 0])
+        else:
+            p = int(PARENTS[j])
+            r = torch.matmul(global_r[p], local_r[:, j])
+            off = offsets[j].view(1, 3, 1)
+            pos = joints[p] + torch.matmul(global_r[p], off).squeeze(-1)
+            joints.append(pos)
+            global_r.append(r)
+    return torch.stack(joints, dim=1)
+
+
+def collision_aware_ik(
+    motion: np.ndarray,
+    *,
+    enabled: bool,
+    radius: float,
+    steps: int,
+    lr: float,
+    collision_weight: float,
+    reg_weight: float,
+    temporal_weight: float,
+    device: str,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    before = _collision_stats(_fk_from_t151_np(motion), radius)
+    if not enabled or torch is None or before["bad_frames"] == 0 or steps <= 0:
+        before["enabled"] = bool(enabled and torch is not None)
+        before["skipped"] = True
+        return motion.astype(np.float32, copy=True), before
+
+    dev = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
+    base = torch.as_tensor(motion.astype(np.float32), device=dev)
+    upper_idx = torch.as_tensor(UPPER_BODY_JOINTS, dtype=torch.long, device=dev)
+    original_upper = base[:, 7:151].reshape(-1, 24, 6)[:, upper_idx].detach()
+    var = original_upper.clone().detach().requires_grad_(True)
+    opt = torch.optim.Adam([var], lr=float(lr))
+    pairs = [(int(a), int(b)) for a, b in COLLISION_PAIRS]
+
+    for _ in range(int(steps)):
+        opt.zero_grad(set_to_none=True)
+        full_rot = base[:, 7:151].reshape(-1, 24, 6).clone()
+        full_rot[:, upper_idx] = var
+        candidate = base.clone()
+        candidate[:, 7:151] = full_rot.reshape(-1, 144)
+        joints = _fk_torch(candidate)
+        losses = []
+        for a, b in pairs:
+            d = torch.linalg.norm(joints[:, a] - joints[:, b], dim=-1)
+            losses.append(torch.relu(float(radius) - d) ** 2)
+        collision_loss = torch.stack(losses, dim=1).mean()
+        reg_loss = torch.mean((var - original_upper) ** 2)
+        if var.shape[0] > 2:
+            temporal_loss = torch.mean((var[1:] - var[:-1]) ** 2)
+        else:
+            temporal_loss = torch.zeros((), dtype=var.dtype, device=var.device)
+        loss = (
+            float(collision_weight) * collision_loss
+            + float(reg_weight) * reg_loss
+            + float(temporal_weight) * temporal_loss
+        )
+        loss.backward()
+        opt.step()
+
+    out = motion.astype(np.float32, copy=True)
+    final_upper = var.detach().cpu().numpy()
+    rot = out[:, 7:151].reshape(-1, 24, 6)
+    rot[:, UPPER_BODY_JOINTS] = final_upper
+    out[:, 7:151] = rot.reshape(-1, 144)
+    after = _collision_stats(_fk_from_t151_np(out), radius)
+    return out, {
+        "enabled": True,
+        "skipped": False,
+        "device": str(dev),
+        "steps": int(steps),
+        "radius": float(radius),
+        "before": before,
+        "after": after,
+    }
 
 
 def process_file(args: argparse.Namespace) -> Dict[str, object]:
@@ -213,6 +402,33 @@ def process_file(args: argparse.Namespace) -> Dict[str, object]:
     out_path = Path(args.out)
     motion = _load_motion(src)
     original = motion.copy()
+
+    physics_summary: Dict[str, object] = {"enabled": False}
+    if args.root_y_physics:
+        motion, physics_summary = enforce_root_y_physics(
+            motion,
+            contact_threshold=args.contact_threshold,
+            min_flight_frames=args.min_flight_frames,
+            parabola_strength=args.parabola_strength,
+            min_arc_lift=args.min_arc_lift,
+            max_arc_lift=args.max_arc_lift,
+            landing_frames=args.landing_frames,
+            landing_max_drop=args.landing_max_drop,
+            landing_strength=args.landing_strength,
+        )
+
+    collision_summary: Dict[str, object]
+    motion, collision_summary = collision_aware_ik(
+        motion,
+        enabled=bool(args.collision_ik),
+        radius=args.collision_radius,
+        steps=args.collision_steps,
+        lr=args.collision_lr,
+        collision_weight=args.collision_weight,
+        reg_weight=args.collision_reg_weight,
+        temporal_weight=args.collision_temporal_weight,
+        device=args.device,
+    )
 
     contact_summary: Dict[str, object] = {"enabled": False}
     if args.contact_lock:
@@ -224,13 +440,11 @@ def process_file(args: argparse.Namespace) -> Dict[str, object]:
             smooth_window=args.contact_smooth_window,
             max_correction=args.max_root_correction,
         )
-        contact_summary["enabled"] = True
 
     if args.smooth:
-        motion = smooth_motion(
+        motion = smooth_rotations_only(
             motion,
             rotation_window=args.rotation_smooth_window,
-            root_y_window=args.root_y_smooth_window,
             strength=args.smooth_strength,
         )
 
@@ -238,19 +452,23 @@ def process_file(args: argparse.Namespace) -> Dict[str, object]:
     np.save(out_path, motion.astype(np.float32))
 
     summary = {
-        "version": "v34_motion_quality_postprocess",
+        "version": "v34_physics_plausible_postprocess",
         "input": str(src),
         "output": str(out_path),
         "frames": int(len(motion)),
+        "root_y_physics": physics_summary,
+        "collision_aware_ik": collision_summary,
         "contact_lock": contact_summary,
-        "smooth": {
+        "rotation_smooth": {
             "enabled": bool(args.smooth),
             "rotation_window": int(args.rotation_smooth_window),
-            "root_y_window": int(args.root_y_smooth_window),
             "strength": float(args.smooth_strength),
+            "note": "root_y and endpoint coordinates are not blindly smoothed",
         },
         "root_xz_delta_mean": float(np.mean(np.linalg.norm(motion[:, [4, 6]] - original[:, [4, 6]], axis=1))) if len(motion) else 0.0,
         "root_xz_delta_max": float(np.max(np.linalg.norm(motion[:, [4, 6]] - original[:, [4, 6]], axis=1))) if len(motion) else 0.0,
+        "root_y_delta_mean": float(np.mean(np.abs(motion[:, 5] - original[:, 5]))) if len(motion) else 0.0,
+        "root_y_delta_max": float(np.max(np.abs(motion[:, 5] - original[:, 5]))) if len(motion) else 0.0,
     }
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
@@ -267,16 +485,36 @@ def main() -> None:
     parser.add_argument("--motion", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--summary_json", default="")
-    parser.add_argument("--contact_lock", type=int, default=1)
+    parser.add_argument("--device", default="cuda")
+
     parser.add_argument("--contact_threshold", type=float, default=0.65)
+
+    parser.add_argument("--root_y_physics", type=int, default=1)
+    parser.add_argument("--min_flight_frames", type=int, default=6)
+    parser.add_argument("--parabola_strength", type=float, default=0.60)
+    parser.add_argument("--min_arc_lift", type=float, default=0.012)
+    parser.add_argument("--max_arc_lift", type=float, default=0.10)
+    parser.add_argument("--landing_frames", type=int, default=8)
+    parser.add_argument("--landing_max_drop", type=float, default=0.035)
+    parser.add_argument("--landing_strength", type=float, default=0.75)
+
+    parser.add_argument("--collision_ik", type=int, default=1)
+    parser.add_argument("--collision_radius", type=float, default=0.16)
+    parser.add_argument("--collision_steps", type=int, default=24)
+    parser.add_argument("--collision_lr", type=float, default=0.025)
+    parser.add_argument("--collision_weight", type=float, default=8.0)
+    parser.add_argument("--collision_reg_weight", type=float, default=0.45)
+    parser.add_argument("--collision_temporal_weight", type=float, default=0.02)
+
+    parser.add_argument("--contact_lock", type=int, default=1)
     parser.add_argument("--min_contact_frames", type=int, default=8)
     parser.add_argument("--contact_lock_strength", type=float, default=0.85)
     parser.add_argument("--contact_smooth_window", type=int, default=11)
     parser.add_argument("--max_root_correction", type=float, default=0.18)
-    parser.add_argument("--smooth", type=int, default=1)
+
+    parser.add_argument("--smooth", type=int, default=0)
     parser.add_argument("--rotation_smooth_window", type=int, default=3)
-    parser.add_argument("--root_y_smooth_window", type=int, default=5)
-    parser.add_argument("--smooth_strength", type=float, default=0.35)
+    parser.add_argument("--smooth_strength", type=float, default=0.20)
     args = parser.parse_args()
     process_file(args)
 

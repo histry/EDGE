@@ -241,14 +241,28 @@ evaluate_directory() {
         --summary_json "$directory/${key}_${label}.motion_quality_postprocess.json" \
         --contact_lock "${V34_CONTACT_LOCK_POSTPROCESS:-1}" \
         --contact_threshold "${V34_CONTACT_LOCK_THRESHOLD:-0.65}" \
+        --root_y_physics "${V34_ROOT_Y_PHYSICS:-1}" \
+        --min_flight_frames "${V34_MIN_FLIGHT_FRAMES:-6}" \
+        --parabola_strength "${V34_PARABOLA_STRENGTH:-0.60}" \
+        --min_arc_lift "${V34_MIN_ARC_LIFT:-0.012}" \
+        --max_arc_lift "${V34_MAX_ARC_LIFT:-0.10}" \
+        --landing_frames "${V34_LANDING_FRAMES:-8}" \
+        --landing_max_drop "${V34_LANDING_MAX_DROP:-0.035}" \
+        --landing_strength "${V34_LANDING_STRENGTH:-0.75}" \
+        --collision_ik "${V34_COLLISION_IK:-1}" \
+        --collision_radius "${V34_COLLISION_RADIUS:-0.16}" \
+        --collision_steps "${V34_COLLISION_STEPS:-24}" \
+        --collision_lr "${V34_COLLISION_LR:-0.025}" \
+        --collision_weight "${V34_COLLISION_WEIGHT:-8.0}" \
+        --collision_reg_weight "${V34_COLLISION_REG_WEIGHT:-0.45}" \
+        --collision_temporal_weight "${V34_COLLISION_TEMPORAL_WEIGHT:-0.02}" \
         --min_contact_frames "${V34_CONTACT_LOCK_MIN_FRAMES:-8}" \
         --contact_lock_strength "${V34_CONTACT_LOCK_STRENGTH:-0.85}" \
         --contact_smooth_window "${V34_CONTACT_LOCK_SMOOTH_WINDOW:-11}" \
         --max_root_correction "${V34_CONTACT_LOCK_MAX_ROOT_CORRECTION:-0.18}" \
-        --smooth "${V34_OUTPUT_SMOOTH:-1}" \
+        --smooth "${V34_OUTPUT_SMOOTH:-0}" \
         --rotation_smooth_window "${V34_OUTPUT_ROT_SMOOTH_WINDOW:-3}" \
-        --root_y_smooth_window "${V34_OUTPUT_ROOT_Y_SMOOTH_WINDOW:-5}" \
-        --smooth_strength "${V34_OUTPUT_SMOOTH_STRENGTH:-0.35}"
+        --smooth_strength "${V34_OUTPUT_SMOOTH_STRENGTH:-0.20}"
     fi
 
     python tools/evaluate_v26_long_dance.py \

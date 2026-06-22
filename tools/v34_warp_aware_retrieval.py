@@ -71,6 +71,79 @@ def _csv_set(name: str, default: str) -> set:
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
+_FK_PARENTS = np.array([
+    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+    9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21,
+], dtype=np.int64)
+
+_FK_OFFSETS = np.array([
+    [0.00, 0.00, 0.00], [-0.10, -0.10, 0.00],
+    [0.10, -0.10, 0.00], [0.00, 0.13, 0.00],
+    [0.00, -0.42, 0.00], [0.00, -0.42, 0.00],
+    [0.00, 0.14, 0.00], [0.00, -0.40, 0.00],
+    [0.00, -0.40, 0.00], [0.00, 0.14, 0.00],
+    [0.00, -0.08, 0.12], [0.00, -0.08, 0.12],
+    [0.00, 0.14, 0.00], [-0.10, 0.08, 0.00],
+    [0.10, 0.08, 0.00], [0.00, 0.16, 0.00],
+    [-0.18, 0.00, 0.00], [0.18, 0.00, 0.00],
+    [-0.28, 0.00, 0.00], [0.28, 0.00, 0.00],
+    [-0.25, 0.00, 0.00], [0.25, 0.00, 0.00],
+    [-0.08, 0.00, 0.00], [0.08, 0.00, 0.00],
+], dtype=np.float32)
+
+_COLLISION_PAIRS = (
+    (18, 3), (19, 3), (20, 3), (21, 3), (22, 3), (23, 3),
+    (18, 6), (19, 6), (20, 6), (21, 6), (22, 6), (23, 6),
+    (18, 9), (19, 9), (20, 9), (21, 9), (22, 9), (23, 9),
+    (20, 12), (21, 12), (22, 12), (23, 12),
+    (20, 21), (22, 23),
+)
+
+
+def _rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
+    a1 = x[..., 0:3]
+    a2 = x[..., 3:6]
+    b1 = a1 / np.maximum(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-8)
+    proj = np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2 = a2 - proj
+    b2 = b2 / np.maximum(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-8)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-1).astype(np.float32)
+
+
+def _fk_collision_risk(motion: np.ndarray) -> Dict[str, float]:
+    try:
+        x = np.asarray(motion, dtype=np.float32)
+        if x.ndim == 3:
+            x = x[0]
+        if x.ndim != 2 or x.shape[1] < 151 or len(x) < 2:
+            return {"self_collision_risk": 0.0, "self_collision_min_distance": 1.0}
+        t = x.shape[0]
+        root = x[:, [4, 5, 6]]
+        local_r = _rot6d_to_matrix_np(x[:, 7:151].reshape(t, 24, 6))
+        joints = np.zeros((t, 24, 3), dtype=np.float32)
+        global_r = np.zeros((t, 24, 3, 3), dtype=np.float32)
+        joints[:, 0] = root
+        global_r[:, 0] = local_r[:, 0]
+        for j in range(1, 24):
+            p = int(_FK_PARENTS[j])
+            global_r[:, j] = np.matmul(global_r[:, p], local_r[:, j])
+            off = _FK_OFFSETS[j][None, :, None]
+            joints[:, j] = joints[:, p] + np.matmul(global_r[:, p], off)[..., 0]
+        radius = _env_float("V34_SELF_COLLISION_RADIUS", 0.16)
+        dists = []
+        for a, b in _COLLISION_PAIRS:
+            dists.append(np.linalg.norm(joints[:, a] - joints[:, b], axis=-1))
+        dist = np.stack(dists, axis=1)
+        penetration = np.maximum(0.0, radius - dist) / max(radius, 1e-8)
+        return {
+            "self_collision_risk": float(np.mean(np.square(penetration))),
+            "self_collision_min_distance": float(np.min(dist)),
+        }
+    except Exception:
+        return {"self_collision_risk": 0.0, "self_collision_min_distance": 1.0}
+
+
 def _motion_rhythm_features(
     motion: Any,
     *,
@@ -98,6 +171,8 @@ def _motion_rhythm_features(
             "late_energy_ratio": 0.0,
             "tail_to_mean_energy": 0.0,
             "low_energy_fraction": 1.0,
+            "self_collision_risk": 0.0,
+            "self_collision_min_distance": 1.0,
         }
 
     rot = x[:, 7:151] if x.shape[1] >= 151 else x
@@ -117,6 +192,8 @@ def _motion_rhythm_features(
             "late_energy_ratio": 0.0,
             "tail_to_mean_energy": 0.0,
             "low_energy_fraction": 1.0,
+            "self_collision_risk": 0.0,
+            "self_collision_min_distance": 1.0,
         }
 
     first = energy[: min(int(fps), len(energy))]
@@ -126,6 +203,10 @@ def _motion_rhythm_features(
     late_start = min(len(energy), max(0, int(round(0.40 * len(energy)))))
     late = energy[late_start:]
     low_threshold = _env_float("V34_LOW_ENERGY_FRAME_THRESHOLD", 0.010)
+    collision = _fk_collision_risk(x) if _enabled("V34_SELF_COLLISION_RETRIEVAL", "1") else {
+        "self_collision_risk": 0.0,
+        "self_collision_min_distance": 1.0,
+    }
     return {
         "mean_energy": mean_energy,
         "p90_energy": float(np.percentile(energy, 90)),
@@ -137,6 +218,7 @@ def _motion_rhythm_features(
             (np.mean(tail) if len(tail) else 0.0) / max(mean_energy, 1e-8)
         ),
         "low_energy_fraction": float(np.mean(energy < low_threshold)),
+        **collision,
     }
 
 
@@ -157,6 +239,8 @@ def _build_rhythm_feature_arrays(
             "late_energy_ratio": empty,
             "tail_to_mean_energy": empty,
             "low_energy_fraction": empty,
+            "self_collision_risk": empty,
+            "self_collision_min_distance": empty,
         }
     return {
         key: np.asarray([float(row[key]) for row in rows], dtype=np.float32)
@@ -216,6 +300,10 @@ def _rhythm_prior_penalty_arrays(
         "low_energy_fraction",
         np.ones_like(mean_e, dtype=np.float32),
     )
+    self_collision_risk = rhythm_features.get(
+        "self_collision_risk",
+        np.zeros_like(mean_e, dtype=np.float32),
+    )
     zeros = np.zeros_like(mean_e, dtype=np.float32)
     if not _enabled("V34_RHYTHM_DEGRADATION_PENALTY", "0"):
         return zeros, {
@@ -225,6 +313,7 @@ def _rhythm_prior_penalty_arrays(
             "tail_ratio": zeros,
             "coverage": zeros,
             "low_energy": zeros,
+            "self_collision": zeros,
         }, {
             "enabled": 0.0,
             "music_motion_pressure": 0.0,
@@ -240,6 +329,7 @@ def _rhythm_prior_penalty_arrays(
             "tail_ratio": zeros,
             "coverage": zeros,
             "low_energy": zeros,
+            "self_collision": zeros,
         }, {
             "enabled": 1.0,
             "music_motion_pressure": 0.0,
@@ -260,6 +350,7 @@ def _rhythm_prior_penalty_arrays(
     tail_ratio_weight = _env_float("V34_TAIL_RATIO_PENALTY_WEIGHT", 3.00)
     coverage_weight = _env_float("V34_COVERAGE_PENALTY_WEIGHT", 2.75)
     low_energy_weight = _env_float("V34_LOW_ENERGY_PENALTY_WEIGHT", 2.00)
+    self_collision_weight = _env_float("V34_SELF_COLLISION_PENALTY_WEIGHT", 1.75)
     global_weight = _env_float("V34_RHYTHM_WEIGHT", 1.20)
 
     ratio_excess = np.maximum(0.0, (first_ratio - ratio_limit) / max(1.0 - ratio_limit, 1e-8))
@@ -291,6 +382,7 @@ def _rhythm_prior_penalty_arrays(
         tail_ratio_penalty = zeros
         coverage_penalty = zeros
         low_energy_penalty = zeros
+    self_collision_penalty = self_collision_weight * self_collision_risk
 
     total = global_weight * (
         hold_penalty
@@ -299,6 +391,7 @@ def _rhythm_prior_penalty_arrays(
         + tail_ratio_penalty
         + coverage_penalty
         + low_energy_penalty
+        + self_collision_penalty
     )
     return (
         np.asarray(total, dtype=np.float32),
@@ -309,6 +402,7 @@ def _rhythm_prior_penalty_arrays(
             "tail_ratio": np.asarray(global_weight * tail_ratio_penalty, dtype=np.float32),
             "coverage": np.asarray(global_weight * coverage_penalty, dtype=np.float32),
             "low_energy": np.asarray(global_weight * low_energy_penalty, dtype=np.float32),
+            "self_collision": np.asarray(global_weight * self_collision_penalty, dtype=np.float32),
         },
         {
             "enabled": 1.0,
@@ -842,6 +936,8 @@ def choose_events_v34(
             "late_energy_ratio": np.zeros_like(natural, dtype=np.float32),
             "tail_to_mean_energy": np.zeros_like(natural, dtype=np.float32),
             "low_energy_fraction": np.ones_like(natural, dtype=np.float32),
+            "self_collision_risk": np.zeros_like(natural, dtype=np.float32),
+            "self_collision_min_distance": np.ones_like(natural, dtype=np.float32),
         }
 
     minimum = float(os.getenv("V34_WARP_MIN", str(args.min_time_warp)))
@@ -1424,6 +1520,9 @@ def choose_events_v34(
                     "tail_ratio_penalty": float(rhythm_prior_terms["tail_ratio"][idx]),
                     "coverage_penalty": float(rhythm_prior_terms["coverage"][idx]),
                     "low_energy_penalty": float(rhythm_prior_terms["low_energy"][idx]),
+                    "self_collision_penalty": float(
+                        rhythm_prior_terms["self_collision"][idx]
+                    ),
                     "streak_penalty": float(rhythm_streak_score),
                     "streak": rhythm_streak_meta,
                     "features": {
@@ -1444,6 +1543,12 @@ def choose_events_v34(
                         ),
                         "low_energy_fraction": float(
                             rhythm_features["low_energy_fraction"][idx]
+                        ),
+                        "self_collision_risk": float(
+                            rhythm_features["self_collision_risk"][idx]
+                        ),
+                        "self_collision_min_distance": float(
+                            rhythm_features["self_collision_min_distance"][idx]
                         ),
                     },
                     "slot_context": {
@@ -1566,6 +1671,9 @@ def choose_events_v34(
                     "rhythm_low_energy_penalty": float(
                         rhythm_prior_terms["low_energy"][idx]
                     ),
+                    "rhythm_self_collision_penalty": float(
+                        rhythm_prior_terms["self_collision"][idx]
+                    ),
                     "rhythm_streak_penalty": float(rhythm_streak_score),
                     "rhythm_mean_energy": float(
                         rhythm_features["mean_energy"][idx]
@@ -1587,6 +1695,12 @@ def choose_events_v34(
                     ),
                     "rhythm_low_energy_fraction": float(
                         rhythm_features["low_energy_fraction"][idx]
+                    ),
+                    "rhythm_self_collision_risk": float(
+                        rhythm_features["self_collision_risk"][idx]
+                    ),
+                    "rhythm_self_collision_min_distance": float(
+                        rhythm_features["self_collision_min_distance"][idx]
                     ),
                     "rhythm_meta": rhythm_meta,
                     "source_aware_rag_enabled": bool(
