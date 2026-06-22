@@ -26,6 +26,7 @@ from tools.v21_common import (
     motion_mmr_embedding,
     robust_scale,
 )
+from tools.v34_source_aware_rag import enrich_item_with_source_identity, source_aware_select
 
 
 def get_value(item: Dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -122,6 +123,11 @@ def main() -> None:
     ap.add_argument("--min_safety", type=float, default=0.0)
     ap.add_argument("--family_span", type=int, default=600)
     ap.add_argument("--mmr_dim", type=int, default=64)
+    ap.add_argument("--source_aware_balance", type=int, default=0)
+    ap.add_argument("--cap_per_source_uid", type=int, default=64)
+    ap.add_argument("--category_cap_factor", type=float, default=1.35)
+    ap.add_argument("--repeat_cap_factor", type=float, default=1.60)
+    ap.add_argument("--dancer_cap_factor", type=float, default=1.50)
     args = ap.parse_args()
 
     source_meta, source_items = load_json_items(args.input_db)
@@ -138,14 +144,25 @@ def main() -> None:
         safety = get_value(item, "safety_score", quality)
         if style < style_threshold or quality < args.min_quality or safety < args.min_safety:
             continue
-        record = dict(item)
+        record = enrich_item_with_source_identity(item)
         record["_v21_style"] = float(style)
         record["_v21_quality"] = float(quality)
         record["_v21_safety"] = float(safety)
         record["family_id"] = str(item.get("motion_family_id", family_id(item, args.family_span)))
         prepared.append(record)
 
-    prepared = balanced_top(prepared, max(1, args.max_events))
+    source_aware_report = None
+    if bool(args.source_aware_balance):
+        prepared, source_aware_report = source_aware_select(
+            prepared,
+            cap_per_source_uid=max(1, int(args.cap_per_source_uid)),
+            category_cap_factor=float(args.category_cap_factor),
+            repeat_cap_factor=float(args.repeat_cap_factor),
+            dancer_cap_factor=float(args.dancer_cap_factor),
+            max_events=max(1, int(args.max_events)),
+        )
+    else:
+        prepared = balanced_top(prepared, max(1, args.max_events))
     if not prepared:
         raise RuntimeError("No events survived the shared-index gate")
 
@@ -230,7 +247,12 @@ def main() -> None:
         "num_indexed": len(kept_meta),
         "style_threshold": style_threshold,
         "family_span": int(args.family_span),
+        "source_aware_balancing": source_aware_report,
         "event_type_counts": dict(Counter(x["event_type"] for x in kept_meta)),
+        "source_uid_counts": dict(Counter(str(x.get("source_uid", "unknown")) for x in kept_meta)),
+        "category_counts": dict(Counter(str(x.get("category_id", "unknown")) for x in kept_meta)),
+        "repeat_counts": dict(Counter(str(x.get("repeat_id", "unknown")) for x in kept_meta)),
+        "dancer_counts": dict(Counter(str(x.get("dancer_id", "unknown")) for x in kept_meta)),
         "descriptor_dims": [
             "energy", "upper", "torso", "lower", "tension", "calmness",
             "support", "build_up", "release", "accent", "phrase_change", "duration",

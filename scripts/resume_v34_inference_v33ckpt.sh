@@ -119,8 +119,10 @@ export V26_BEAM_SIZE=48
 export V26_CANDIDATE_TOP_K=768
 export V26_GRAPH_NODE_TOP_K=512
 
-# Use the same hierarchy index as the V33 diagnostic experiment.
-export V26_HIERARCHY_INDEX_NPZ=output/v28_diffusion_retrain_musicclap_20260610_024828/v28_hyperbolic_hierarchical_event_index.npz
+# Use the same hierarchy index as the V33 diagnostic experiment unless a
+# source-aware launcher already supplied a hierarchy rebuilt for a filtered
+# JSON+NPZ index.  Overwriting here would silently mismatch metadata and arrays.
+export V26_HIERARCHY_INDEX_NPZ="${V26_HIERARCHY_INDEX_NPZ:-output/v28_diffusion_retrain_musicclap_20260610_024828/v28_hyperbolic_hierarchical_event_index.npz}"
 
 echo "============================================================"
 echo "[V34.2 EFFECTIVE TIMING]"

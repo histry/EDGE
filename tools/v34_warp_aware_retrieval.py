@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 import tools.schedule_v26_whole_song as scheduler
+from tools.v34_source_aware_rag import identity_lists
 
 try:
     from tools.v34_gpu_candidate_cache import build_v34_gpu_candidate_cache
@@ -272,6 +273,123 @@ def _rhythm_streak_penalty(
         "streak_count": int(streak_count),
         "allowed_streak": int(allowed),
         "weight": float(weight),
+    }
+
+
+def _source_prior_penalty_arrays(
+    *,
+    source_ids: Sequence[str],
+    dancer_ids: Sequence[str],
+    repeat_ids: Sequence[str],
+    category_ids: Sequence[str],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    n = len(source_ids)
+    zeros = np.zeros((n,), dtype=np.float32)
+    if not _enabled("V34_SOURCE_AWARE_RAG", "1") or n == 0:
+        return zeros, {"enabled": False}
+
+    def over_rep_penalty(values: Sequence[str], weight_name: str, default: float) -> np.ndarray:
+        weight = _env_float(weight_name, default)
+        if weight <= 0:
+            return zeros.copy()
+        counts: Dict[str, int] = {}
+        for value in values:
+            counts[str(value)] = counts.get(str(value), 0) + 1
+        mean = float(n / max(len(counts), 1))
+        out = np.zeros((n,), dtype=np.float32)
+        for i, value in enumerate(values):
+            ratio = float(counts.get(str(value), 0)) / max(mean, 1e-8)
+            out[i] = float(weight * max(0.0, np.log(max(ratio, 1e-8))))
+        return out
+
+    category_pen = over_rep_penalty(category_ids, "V34_CATEGORY_PRIOR_BALANCE_WEIGHT", 0.20)
+    dancer_pen = over_rep_penalty(dancer_ids, "V34_DANCER_PRIOR_BALANCE_WEIGHT", 0.08)
+    repeat_pen = over_rep_penalty(repeat_ids, "V34_REPEAT_PRIOR_BALANCE_WEIGHT", 0.06)
+    total = category_pen + dancer_pen + repeat_pen
+    return np.asarray(total, dtype=np.float32), {
+        "enabled": True,
+        "category_prior_weight": _env_float("V34_CATEGORY_PRIOR_BALANCE_WEIGHT", 0.20),
+        "dancer_prior_weight": _env_float("V34_DANCER_PRIOR_BALANCE_WEIGHT", 0.08),
+        "repeat_prior_weight": _env_float("V34_REPEAT_PRIOR_BALANCE_WEIGHT", 0.06),
+    }
+
+
+def _source_aware_transition_penalty(
+    *,
+    selected: Sequence[int],
+    candidate: int,
+    phrase: Any,
+    source_uids: Sequence[str],
+    dancer_ids: Sequence[str],
+    repeat_ids: Sequence[str],
+    category_ids: Sequence[str],
+    dancer_category_groups: Sequence[str],
+) -> Tuple[float, Dict[str, Any]]:
+    if not _enabled("V34_SOURCE_AWARE_RAG", "1"):
+        return 0.0, {"enabled": False, "score": 0.0}
+    if not selected:
+        return 0.0, {"enabled": True, "score": 0.0, "window": 0}
+
+    window = max(1, _env_int("V34_SOURCE_AWARE_WINDOW", 8))
+    recent = [int(x) for x in selected[-window:]]
+    cand = int(candidate)
+
+    source = str(source_uids[cand])
+    dancer = str(dancer_ids[cand])
+    repeat = str(repeat_ids[cand])
+    category = str(category_ids[cand])
+    dancer_category = str(dancer_category_groups[cand])
+
+    same_source = sum(1 for x in recent if str(source_uids[int(x)]) == source)
+    same_dancer = sum(1 for x in recent if str(dancer_ids[int(x)]) == dancer)
+    same_repeat = sum(1 for x in recent if str(repeat_ids[int(x)]) == repeat)
+    same_category = sum(1 for x in recent if str(category_ids[int(x)]) == category)
+    same_dancer_category = sum(
+        1 for x in recent
+        if str(dancer_category_groups[int(x)]) == dancer_category
+    )
+
+    reset_allow = _slot_reset_allow(phrase)
+    # Structural changes may intentionally revisit a category; exact same
+    # source and dancer-category repeats remain expensive.
+    category_relief = 1.0 - 0.55 * float(reset_allow)
+    dancer_relief = 1.0 - 0.35 * float(reset_allow)
+
+    score = (
+        _env_float("V34_SOURCE_UID_REPEAT_WEIGHT", 2.50) * float(same_source)
+        + _env_float("V34_DANCER_CATEGORY_REPEAT_WEIGHT", 1.20) * float(same_dancer_category)
+        + _env_float("V34_CATEGORY_REPEAT_WEIGHT", 0.35) * category_relief * float(same_category)
+        + _env_float("V34_DANCER_REPEAT_WEIGHT", 0.25) * dancer_relief * float(same_dancer)
+        + _env_float("V34_REPEAT_ID_REPEAT_WEIGHT", 0.12) * float(same_repeat)
+    )
+    score *= _env_float("V34_SOURCE_AWARE_WEIGHT", 1.0)
+    return float(score), {
+        "enabled": True,
+        "score": float(score),
+        "window": int(window),
+        "reset_allow": float(reset_allow),
+        "candidate": {
+            "source_uid": source,
+            "dancer_id": dancer,
+            "repeat_id": repeat,
+            "category_id": category,
+            "dancer_category_group": dancer_category,
+        },
+        "recent_counts": {
+            "same_source_uid": int(same_source),
+            "same_dancer": int(same_dancer),
+            "same_repeat": int(same_repeat),
+            "same_category": int(same_category),
+            "same_dancer_category": int(same_dancer_category),
+        },
+        "weights": {
+            "source_uid": _env_float("V34_SOURCE_UID_REPEAT_WEIGHT", 2.50),
+            "dancer_category": _env_float("V34_DANCER_CATEGORY_REPEAT_WEIGHT", 1.20),
+            "category": _env_float("V34_CATEGORY_REPEAT_WEIGHT", 0.35),
+            "dancer": _env_float("V34_DANCER_REPEAT_WEIGHT", 0.25),
+            "repeat": _env_float("V34_REPEAT_ID_REPEAT_WEIGHT", 0.12),
+            "global": _env_float("V34_SOURCE_AWARE_WEIGHT", 1.0),
+        },
     }
 
 
@@ -605,6 +723,18 @@ def choose_events_v34(
         str(item.get("event_type", "neutral_flow")) for item in items
     ]
     families = [str(item.get("family_id", "")) for item in items]
+    source_identity = identity_lists(items)
+    dancer_ids = source_identity["dancer_id"]
+    repeat_ids = source_identity["repeat_id"]
+    category_ids = source_identity["category_id"]
+    source_uids = source_identity["source_uid"]
+    dancer_category_groups = source_identity["dancer_category_group"]
+    source_prior_penalty, source_prior_meta = _source_prior_penalty_arrays(
+        source_ids=source_uids,
+        dancer_ids=dancer_ids,
+        repeat_ids=repeat_ids,
+        category_ids=category_ids,
+    )
     queries = [np.asarray(phrase.query, np.float32) for phrase in phrases]
     similarities = scheduler.precompute_music_similarity(
         router, queries, motion_desc, device
@@ -790,6 +920,8 @@ def choose_events_v34(
             )
         )
         base = base - rhythm_prior_penalty
+        if len(source_prior_penalty) == len(base):
+            base = base - source_prior_penalty
 
         node_top_k = min(
             int(args.candidate_top_k),
@@ -898,8 +1030,7 @@ def choose_events_v34(
                 )
                 same_source = sum(
                     1 for previous in state.selected
-                    if int(items[previous].get("source_id", -1))
-                    == int(items[idx].get("source_id", -2))
+                    if str(source_uids[int(previous)]) == str(source_uids[idx])
                 )
                 if args.hard_family_unique and same_family > 0:
                     continue
@@ -1178,6 +1309,18 @@ def choose_events_v34(
                     candidate=idx,
                     event_types=event_types,
                 )
+                source_aware_penalty, source_aware_meta = (
+                    _source_aware_transition_penalty(
+                        selected=state.selected,
+                        candidate=idx,
+                        phrase=phrase,
+                        source_uids=source_uids,
+                        dancer_ids=dancer_ids,
+                        repeat_ids=repeat_ids,
+                        category_ids=category_ids,
+                        dancer_category_groups=dancer_category_groups,
+                    )
+                )
                 rhythm_penalty = float(rhythm_prior_penalty[idx]) + float(
                     rhythm_streak_score
                 )
@@ -1213,6 +1356,7 @@ def choose_events_v34(
                 }
                 transition_meta = dict(transition_meta)
                 transition_meta["rhythm_degradation"] = rhythm_meta
+                transition_meta["source_aware_rag"] = source_aware_meta
                 score = (
                     state.score
                     + float(base[idx])
@@ -1231,6 +1375,7 @@ def choose_events_v34(
                     - transition_budget_penalty
                     - relaxation_penalty
                     - rhythm_streak_score
+                    - source_aware_penalty
                 )
                 part = {
                     "slot": slot,
@@ -1248,6 +1393,11 @@ def choose_events_v34(
                     "event_index": idx,
                     "event_id": str(items[idx].get("event_id", idx)),
                     "family_id": family,
+                    "source_uid": str(source_uids[idx]),
+                    "dancer_id": str(dancer_ids[idx]),
+                    "repeat_id": str(repeat_ids[idx]),
+                    "category_id": str(category_ids[idx]),
+                    "dancer_category_group": str(dancer_category_groups[idx]),
                     "motion_event": event_types[idx],
                     "natural_duration": float(natural[idx]),
                     "slot_content_target": float(slot_content_target),
@@ -1317,6 +1467,18 @@ def choose_events_v34(
                         rhythm_features["tail_mean_energy"][idx]
                     ),
                     "rhythm_meta": rhythm_meta,
+                    "source_aware_rag_enabled": bool(
+                        _enabled("V34_SOURCE_AWARE_RAG", "1")
+                    ),
+                    "source_aware_prior_penalty": float(
+                        source_prior_penalty[idx]
+                        if len(source_prior_penalty) == len(base) else 0.0
+                    ),
+                    "source_aware_transition_penalty": float(
+                        source_aware_penalty
+                    ),
+                    "source_aware_meta": source_aware_meta,
+                    "source_aware_prior_meta": source_prior_meta,
                     "candidate_top_k": int(args.candidate_top_k),
                     "graph_node_top_k": int(node_top_k),
                     "hierarchy_enabled": bool(args.hierarchical_retrieval),
