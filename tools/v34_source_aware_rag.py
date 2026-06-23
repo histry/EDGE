@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """Source-aware metadata and balancing utilities for Dunhuang Event-RAG.
 
-The Dunhuang BVH corpus used by this project is motion-only and low-resource.
-Each original sequence name follows:
+The Dunhuang BVH corpus is motion-only and low-resource.  File names encode the
+source structure:
 
     <dancer>_<repeat>_Take_<category>.bvh
 
-For example ``dyl_002_Take_003.bvh`` means dancer ``dyl``, repeat ``002``,
-and category ``Take_003``.  Older Event-RAG code preserved this information in
-file names and event ids, but did not expose it as structured metadata.  This
-module makes the source structure explicit so database construction and
-retrieval can separate dancer style diversity from source/repeat/category bias.
+Example: ``dyl_002_Take_003.bvh`` means dancer ``dyl``, repeat ``002`` and
+category ``Take_003``.  Treating these fields as plain text creates two
+problems: over-represented dancers dominate the RAG bank, and repeated takes of
+the same posture leak near-duplicates into train/validation/evaluation routes.
+
+This module exposes the source structure as explicit metadata and provides
+quality-aware balancing functions used by both database construction and
+retrieval.
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -68,8 +71,7 @@ def _source_text(item: Mapping[str, Any]) -> str:
 
 def parse_source_identity(item: Mapping[str, Any]) -> SourceIdentity:
     """Parse dancer/repeat/category metadata from an item or return unknown."""
-    # Prefer already-normalized fields when present.
-    dancer = str(item.get("dancer_id", "")).strip()
+    dancer = str(item.get("dancer_id", "")).strip().lower()
     repeat = str(item.get("repeat_id", "")).strip()
     category = str(item.get("category_id", "")).strip()
     if dancer and repeat and category:
@@ -115,30 +117,58 @@ def enrich_item_with_source_identity(item: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def source_quality_score(item: Mapping[str, Any]) -> float:
-    """Quality-aware score used only for downsampling within a source group."""
-    def get(key: str, default: float = 0.0) -> float:
+def _float_value(item: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+    if key in item:
         try:
-            return float(item.get(key, default))
-        except Exception:
-            return float(default)
+            return float(item[key])
+        except (TypeError, ValueError):
+            pass
+    desc = item.get("descriptor", {})
+    if isinstance(desc, Mapping) and key in desc:
+        try:
+            return float(desc[key])
+        except (TypeError, ValueError):
+            pass
+    return float(default)
 
+
+def source_quality_score(item: Mapping[str, Any]) -> float:
+    """Quality-aware score used for downsampling within a source group."""
     style = max(
-        get("v21_style_score"),
-        get("dunhuang_style_score_v20f3"),
-        get("dunhuang_style_score"),
-        get("dunhuang_style_proxy"),
-        get("visual_score"),
-        get("quality_score"),
+        _float_value(item, "v21_style_score"),
+        _float_value(item, "dunhuang_style_score_v20f3"),
+        _float_value(item, "dunhuang_style_score"),
+        _float_value(item, "dunhuang_style_proxy"),
+        _float_value(item, "visual_score"),
+        _float_value(item, "quality_score"),
     )
-    quality = max(get("v21_quality_score"), get("original_quality_score"), get("quality_score"))
-    safety = max(get("v21_safety_score"), get("safety_score"), quality)
-    length = get("event_length", get("length", 0.0))
-    # Prefer usable snippets; extremely short events often become static glue.
-    length_prior = float(np.clip((length - 18.0) / max(72.0 - 18.0, 1.0), 0.0, 1.0))
+    quality = max(
+        _float_value(item, "v21_quality_score"),
+        _float_value(item, "original_quality_score"),
+        _float_value(item, "segment_quality"),
+        _float_value(item, "quality_score"),
+    )
+    safety = max(_float_value(item, "v21_safety_score"), _float_value(item, "safety_score"), quality)
+    density = _float_value(item, "mean_activity", _float_value(item, "motion_density", 0.0))
+    boundary = _float_value(item, "boundary_quality", 0.5)
+    hold = _float_value(item, "static_hold_score", 0.0)
+    first_ratio = _float_value(item, "first1s_energy_ratio", 0.0)
+    length = _float_value(item, "event_length", _float_value(item, "length", 0.0))
+    length_prior = float(np.exp(-abs(length - 48.0) / 48.0))
     event_type = str(item.get("event_type", "neutral_flow"))
-    static_discount = 0.10 if event_type == "pose_hold" else 0.0
-    return float(0.42 * style + 0.34 * quality + 0.18 * safety + 0.06 * length_prior - static_discount)
+    static_discount = 0.18 if event_type == "pose_hold" else 0.0
+    frontload_discount = 0.10 * max(0.0, first_ratio - 0.75)
+    return float(
+        0.30 * style
+        + 0.28 * quality
+        + 0.16 * safety
+        + 0.10 * density
+        + 0.08 * boundary
+        + 0.08 * length_prior
+        - 0.18 * hold
+        - static_discount
+        - frontload_discount
+    )
 
 
 def source_distribution(items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -164,17 +194,13 @@ def source_distribution(items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _cap_group(
-    rows: Sequence[Dict[str, Any]],
-    key: str,
-    cap: int,
-) -> List[Dict[str, Any]]:
+def _cap_group(rows: Sequence[Dict[str, Any]], key: str, cap: int) -> list[Dict[str, Any]]:
     if cap <= 0:
         return list(rows)
-    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    grouped: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row.get(key, "unknown"))].append(row)
-    out: List[Dict[str, Any]] = []
+    out: list[Dict[str, Any]] = []
     for group_rows in grouped.values():
         group_rows.sort(key=source_quality_score, reverse=True)
         out.extend(group_rows[:cap])
@@ -185,18 +211,16 @@ def _cap_by_uniform_factor(
     rows: Sequence[Dict[str, Any]],
     key: str,
     factor: float,
-) -> List[Dict[str, Any]]:
+) -> list[Dict[str, Any]]:
     if factor <= 0 or not rows:
         return list(rows)
-    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    grouped: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        groups[str(row.get(key, "unknown"))].append(row)
-    if not groups:
-        return list(rows)
-    target = int(math.ceil((len(rows) / max(len(groups), 1)) * float(factor)))
+        grouped[str(row.get(key, "unknown"))].append(row)
+    target = int(math.ceil((len(rows) / max(len(grouped), 1)) * float(factor)))
     target = max(1, target)
-    out: List[Dict[str, Any]] = []
-    for group_rows in groups.values():
+    out: list[Dict[str, Any]] = []
+    for group_rows in grouped.values():
         group_rows.sort(key=source_quality_score, reverse=True)
         out.extend(group_rows[:target])
     return out
@@ -205,18 +229,13 @@ def _cap_by_uniform_factor(
 def source_aware_select(
     items: Sequence[Mapping[str, Any]],
     *,
-    cap_per_source_uid: int = 64,
+    cap_per_source_uid: int = 72,
     category_cap_factor: float = 1.35,
-    repeat_cap_factor: float = 1.60,
-    dancer_cap_factor: float = 1.50,
+    repeat_cap_factor: float = 1.55,
+    dancer_cap_factor: float = 1.45,
     max_events: int = 0,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Return a quality-weighted, source-aware subset.
-
-    The selector never fabricates events.  Rare sources keep all valid snippets;
-    over-represented sources/categories/repeats are downsampled by quality.  The
-    output preserves the selected item dictionaries and appends source metadata.
-    """
+) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """Return a quality-weighted, source-aware subset."""
     before = [enrich_item_with_source_identity(item) for item in items]
     for idx, row in enumerate(before):
         row["_source_aware_original_index"] = int(idx)
@@ -251,7 +270,7 @@ def source_aware_select(
     return rows, report
 
 
-def identity_lists(items: Sequence[Mapping[str, Any]]) -> Dict[str, List[str]]:
+def identity_lists(items: Sequence[Mapping[str, Any]]) -> Dict[str, list[str]]:
     enriched = [enrich_item_with_source_identity(item) for item in items]
     return {
         "dancer_id": [str(x["dancer_id"]) for x in enriched],

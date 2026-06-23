@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build a single scalable shared Event-RAG index for arbitrary music queries.
+"""Build a source-aware shared Event-RAG index for arbitrary music queries.
 
-This script does NOT split the database by music. It enriches a style-safe event
-JSON with compact motion descriptors, MMR embeddings, endpoint signatures and
-family identifiers. The result is one JSON + one NPZ shared by all songs.
+This replacement keeps the V21 JSON+NPZ contract but adds structured
+dancer/repeat/category/source_uid arrays.  The selector is no longer only
+event-type balanced; it also prevents over-represented sources from dominating
+the RAG bank.
 """
 from __future__ import annotations
 
@@ -12,12 +13,11 @@ import argparse
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 
 from tools.v21_common import (
-    EVENT_TYPES,
     family_id,
     json_safe,
     load_json_items,
@@ -26,17 +26,34 @@ from tools.v21_common import (
     motion_mmr_embedding,
     robust_scale,
 )
-from tools.v34_source_aware_rag import enrich_item_with_source_identity, source_aware_select
+from tools.v34_source_aware_rag import (
+    enrich_item_with_source_identity,
+    identity_lists,
+    source_distribution,
+    source_quality_score,
+)
 
 
-def get_value(item: Dict[str, Any], key: str, default: float = 0.0) -> float:
+EVENT_TYPE_WEIGHTS = {
+    "neutral_flow": 0.22,
+    "calm_flow": 0.14,
+    "support_shift": 0.16,
+    "build_up": 0.14,
+    "high_tension": 0.12,
+    "arm_flourish": 0.10,
+    "release": 0.08,
+    "pose_hold": 0.04,
+}
+
+
+def get_value(item: Mapping[str, Any], key: str, default: float = 0.0) -> float:
     if key in item:
         try:
             return float(item[key])
         except (TypeError, ValueError):
             pass
     desc = item.get("descriptor", {})
-    if isinstance(desc, dict) and key in desc:
+    if isinstance(desc, Mapping) and key in desc:
         try:
             return float(desc[key])
         except (TypeError, ValueError):
@@ -44,7 +61,7 @@ def get_value(item: Dict[str, Any], key: str, default: float = 0.0) -> float:
     return float(default)
 
 
-def choose_style_score(item: Dict[str, Any]) -> float:
+def choose_style_score(item: Mapping[str, Any]) -> float:
     for key in (
         "dunhuang_style_score_v20f3",
         "dunhuang_style_score",
@@ -52,6 +69,7 @@ def choose_style_score(item: Dict[str, Any]) -> float:
         "prototype_similarity_norm",
         "prototype_similarity",
         "visual_score",
+        "segment_quality",
         "quality_score",
     ):
         if key in item:
@@ -62,54 +80,103 @@ def choose_style_score(item: Dict[str, Any]) -> float:
     return 0.0
 
 
-def balanced_top(items: List[Dict[str, Any]], max_events: int) -> List[Dict[str, Any]]:
+def _cap_by_key(rows: Sequence[Dict[str, Any]], key: str, cap: int) -> List[Dict[str, Any]]:
+    if cap <= 0:
+        return list(rows)
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(key, "unknown"))].append(row)
+    out: List[Dict[str, Any]] = []
+    for group_rows in grouped.values():
+        group_rows.sort(key=source_quality_score, reverse=True)
+        out.extend(group_rows[:cap])
+    return out
+
+
+def _cap_by_factor(rows: Sequence[Dict[str, Any]], key: str, factor: float) -> List[Dict[str, Any]]:
+    if factor <= 0 or not rows:
+        return list(rows)
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(key, "unknown"))].append(row)
+    target = max(1, int(np.ceil((len(rows) / max(len(grouped), 1)) * float(factor))))
+    out: List[Dict[str, Any]] = []
+    for group_rows in grouped.values():
+        group_rows.sort(key=source_quality_score, reverse=True)
+        out.extend(group_rows[:target])
+    return out
+
+
+def source_balanced_top(
+    items: Sequence[Dict[str, Any]],
+    max_events: int,
+    *,
+    cap_per_source_uid: int,
+    category_cap_factor: float,
+    repeat_cap_factor: float,
+    dancer_cap_factor: float,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if max_events <= 0:
+        max_events = len(items)
+    before = [enrich_item_with_source_identity(item) for item in items]
+    for idx, row in enumerate(before):
+        row["_v21_original_index"] = int(idx)
+
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in before:
+        groups[str(item.get("event_type", "neutral_flow"))].append(item)
+
+    selected: List[Dict[str, Any]] = []
+    leftovers: List[Dict[str, Any]] = []
+    for event_type, group in groups.items():
+        quota = max(1, int(round(max_events * EVENT_TYPE_WEIGHTS.get(event_type, 0.05))))
+        group = _cap_by_key(group, "source_uid", cap_per_source_uid)
+        group = _cap_by_factor(group, "category_id", category_cap_factor)
+        group = _cap_by_factor(group, "repeat_id", repeat_cap_factor)
+        group = _cap_by_factor(group, "dancer_id", dancer_cap_factor)
+        group.sort(key=source_quality_score, reverse=True)
+        selected.extend(group[:quota])
+        leftovers.extend(group[quota:])
+
+    if len(selected) < max_events:
+        leftovers = _cap_by_key(leftovers, "source_uid", cap_per_source_uid)
+        leftovers = _cap_by_factor(leftovers, "category_id", category_cap_factor)
+        leftovers = _cap_by_factor(leftovers, "repeat_id", repeat_cap_factor)
+        leftovers = _cap_by_factor(leftovers, "dancer_id", dancer_cap_factor)
+        leftovers.sort(key=source_quality_score, reverse=True)
+        selected.extend(leftovers[: max_events - len(selected)])
+
+    selected.sort(key=source_quality_score, reverse=True)
+    selected = selected[:max_events]
+    report = {
+        "source_aware": True,
+        "cap_per_source_uid": int(cap_per_source_uid),
+        "category_cap_factor": float(category_cap_factor),
+        "repeat_cap_factor": float(repeat_cap_factor),
+        "dancer_cap_factor": float(dancer_cap_factor),
+        "before": source_distribution(before),
+        "after": source_distribution(selected),
+    }
+    return selected, report
+
+
+def plain_balanced_top(items: List[Dict[str, Any]], max_events: int) -> List[Dict[str, Any]]:
     if len(items) <= max_events:
         return items
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for item in items:
         groups[str(item.get("event_type", "neutral_flow"))].append(item)
-    weights = {
-        "neutral_flow": 0.25,
-        "calm_flow": 0.16,
-        "support_shift": 0.16,
-        "build_up": 0.12,
-        "high_tension": 0.12,
-        "arm_flourish": 0.08,
-        "release": 0.07,
-        "pose_hold": 0.04,
-    }
     selected: List[Dict[str, Any]] = []
     leftovers: List[Dict[str, Any]] = []
     for event_type, group in groups.items():
-        group.sort(
-            key=lambda x: (
-                float(x["_v21_style"]),
-                float(x["_v21_quality"]),
-                float(x["_v21_safety"]),
-            ),
-            reverse=True,
-        )
-        quota = max(1, int(round(max_events * weights.get(event_type, 0.05))))
+        group.sort(key=source_quality_score, reverse=True)
+        quota = max(1, int(round(max_events * EVENT_TYPE_WEIGHTS.get(event_type, 0.05))))
         selected.extend(group[:quota])
         leftovers.extend(group[quota:])
     if len(selected) < max_events:
-        leftovers.sort(
-            key=lambda x: (
-                float(x["_v21_style"]),
-                float(x["_v21_quality"]),
-                float(x["_v21_safety"]),
-            ),
-            reverse=True,
-        )
+        leftovers.sort(key=source_quality_score, reverse=True)
         selected.extend(leftovers[: max_events - len(selected)])
-    selected.sort(
-        key=lambda x: (
-            float(x["_v21_style"]),
-            float(x["_v21_quality"]),
-            float(x["_v21_safety"]),
-        ),
-        reverse=True,
-    )
+    selected.sort(key=source_quality_score, reverse=True)
     return selected[:max_events]
 
 
@@ -123,11 +190,11 @@ def main() -> None:
     ap.add_argument("--min_safety", type=float, default=0.0)
     ap.add_argument("--family_span", type=int, default=600)
     ap.add_argument("--mmr_dim", type=int, default=64)
-    ap.add_argument("--source_aware_balance", type=int, default=0)
-    ap.add_argument("--cap_per_source_uid", type=int, default=64)
+    ap.add_argument("--source_aware", type=int, default=1)
+    ap.add_argument("--cap_per_source_uid", type=int, default=72)
     ap.add_argument("--category_cap_factor", type=float, default=1.35)
-    ap.add_argument("--repeat_cap_factor", type=float, default=1.60)
-    ap.add_argument("--dancer_cap_factor", type=float, default=1.50)
+    ap.add_argument("--repeat_cap_factor", type=float, default=1.55)
+    ap.add_argument("--dancer_cap_factor", type=float, default=1.45)
     args = ap.parse_args()
 
     source_meta, source_items = load_json_items(args.input_db)
@@ -140,7 +207,7 @@ def main() -> None:
         if not pkl.is_file():
             continue
         style = choose_style_score(item)
-        quality = get_value(item, "original_quality_score", get_value(item, "quality_score", 0.0))
+        quality = get_value(item, "original_quality_score", get_value(item, "segment_quality", get_value(item, "quality_score", 0.0)))
         safety = get_value(item, "safety_score", quality)
         if style < style_threshold or quality < args.min_quality or safety < args.min_safety:
             continue
@@ -151,18 +218,19 @@ def main() -> None:
         record["family_id"] = str(item.get("motion_family_id", family_id(item, args.family_span)))
         prepared.append(record)
 
-    source_aware_report = None
-    if bool(args.source_aware_balance):
-        prepared, source_aware_report = source_aware_select(
+    if int(args.source_aware):
+        prepared, source_report = source_balanced_top(
             prepared,
-            cap_per_source_uid=max(1, int(args.cap_per_source_uid)),
+            max(1, args.max_events),
+            cap_per_source_uid=int(args.cap_per_source_uid),
             category_cap_factor=float(args.category_cap_factor),
             repeat_cap_factor=float(args.repeat_cap_factor),
             dancer_cap_factor=float(args.dancer_cap_factor),
-            max_events=max(1, int(args.max_events)),
         )
     else:
-        prepared = balanced_top(prepared, max(1, args.max_events))
+        prepared = plain_balanced_top(prepared, max(1, args.max_events))
+        source_report = {"source_aware": False, "distribution": source_distribution(prepared)}
+
     if not prepared:
         raise RuntimeError("No events survived the shared-index gate")
 
@@ -178,7 +246,7 @@ def main() -> None:
     quality_scores: List[float] = []
     safety_scores: List[float] = []
 
-    for idx, item in enumerate(prepared):
+    for item in prepared:
         pkl = Path(str(item.get("pkl", item.get("path", ""))))
         try:
             motion = load_motion(pkl)
@@ -213,9 +281,10 @@ def main() -> None:
 
     raw = np.stack(desc_raw).astype(np.float32)
     desc, desc_lo, desc_hi = robust_scale(raw)
-    # Duration dimension should represent the actual dynamic-unit length on a stable 0..1 scale.
-    desc[:, 11] = np.clip((raw[:, 11] - 24.0) / (72.0 - 24.0), 0.0, 1.0)
+    if desc.shape[1] > 11:
+        desc[:, 11] = np.clip((raw[:, 11] - 24.0) / (72.0 - 24.0), 0.0, 1.0)
 
+    identities = identity_lists(kept_meta)
     prefix = Path(args.output_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     json_path = prefix.with_suffix(".json")
@@ -236,10 +305,16 @@ def main() -> None:
         style_score=np.asarray(style_scores, dtype=np.float32),
         quality_score=np.asarray(quality_scores, dtype=np.float32),
         safety_score=np.asarray(safety_scores, dtype=np.float32),
+        dancer_id=np.asarray(identities["dancer_id"], dtype="U32"),
+        repeat_id=np.asarray(identities["repeat_id"], dtype="U32"),
+        category_id=np.asarray(identities["category_id"], dtype="U32"),
+        source_uid=np.asarray(identities["source_uid"], dtype="U96"),
+        dancer_category_group=np.asarray(identities["dancer_category_group"], dtype="U96"),
+        category_repeat_group=np.asarray(identities["category_repeat_group"], dtype="U96"),
     )
 
     report = {
-        "version": "v21_shared_style_event_index",
+        "version": "v21_shared_source_aware_event_index",
         "input_db": str(args.input_db),
         "arrays": str(npz_path),
         "num_input": len(source_items),
@@ -247,12 +322,9 @@ def main() -> None:
         "num_indexed": len(kept_meta),
         "style_threshold": style_threshold,
         "family_span": int(args.family_span),
-        "source_aware_balancing": source_aware_report,
+        "source_aware_report": source_report,
+        "source_distribution_indexed": source_distribution(kept_meta),
         "event_type_counts": dict(Counter(x["event_type"] for x in kept_meta)),
-        "source_uid_counts": dict(Counter(str(x.get("source_uid", "unknown")) for x in kept_meta)),
-        "category_counts": dict(Counter(str(x.get("category_id", "unknown")) for x in kept_meta)),
-        "repeat_counts": dict(Counter(str(x.get("repeat_id", "unknown")) for x in kept_meta)),
-        "dancer_counts": dict(Counter(str(x.get("dancer_id", "unknown")) for x in kept_meta)),
         "descriptor_dims": [
             "energy", "upper", "torso", "lower", "tension", "calmness",
             "support", "build_up", "release", "accent", "phrase_change", "duration",
@@ -267,6 +339,7 @@ def main() -> None:
     print("indexed:", len(kept_meta))
     print("event_types:", report["event_type_counts"])
     print("style_threshold:", style_threshold)
+    print("source_distribution:", report["source_distribution_indexed"])
 
 
 if __name__ == "__main__":
