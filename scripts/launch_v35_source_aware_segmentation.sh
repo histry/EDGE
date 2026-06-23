@@ -34,11 +34,13 @@ mkdir -p "$RUN_ROOT"
 echo "$RUN_ROOT" > output/LATEST_V35_SOURCE_AWARE_SEGMENTATION.txt
 
 if [[ -z "${V35_MOTION_INPUT_DIR:-}" ]]; then
-  for candidate in \
-    "data/dunhuang_dynamic_event_rag_physical" \
-    "data/dunhuang_151d" \
-    "data/dunhuang_motion_151d" \
-    "data/motions"; do
+  candidate_dirs=(
+    "data/dunhuang_dynamic_event_rag_physical"
+    "data/dunhuang_151d"
+    "data/dunhuang_motion_151d"
+    "data/motions"
+  )
+  for candidate in "${candidate_dirs[@]}"; do
     if [[ -d "$candidate" ]]; then
       export V35_MOTION_INPUT_DIR="$candidate"
       break
@@ -86,12 +88,24 @@ if [[ "${V35_REBUILD_EVENT_DB:-1}" == "1" || ! -f "$V35_EVENT_INDEX_JSON" ]]; th
     --min_len "${V35_SEG_MIN_LEN:-24}" \
     --ideal_len "${V35_SEG_IDEAL_LEN:-48}" \
     --max_len "${V35_SEG_MAX_LEN:-72}" \
+    --complex_max_len "${V35_SEG_COMPLEX_MAX_LEN:-96}" \
     --boundary_min_gap "${V35_SEG_BOUNDARY_MIN_GAP:-18}" \
     --energy_smooth "${V35_SEG_ENERGY_SMOOTH:-7}" \
+    --enable_context_window "${V35_ENABLE_CONTEXT_WINDOW:-1}" \
+    --macro_energy_window "${V35_MACRO_ENERGY_WINDOW:-90}" \
+    --macro_high_percentile "${V35_MACRO_HIGH_PERCENTILE:-72}" \
     --save_canonical_len "${V35_SEG_CANONICAL_LEN:-48}" \
     --fps "${V35_FPS:-30}" \
     --min_motion_density "${V35_MIN_MOTION_DENSITY:-0.0045}" \
     --near_duplicate_iou "${V35_NEAR_DUP_IOU:-0.72}" \
+    --enable_motion_nms "${V35_ENABLE_MOTION_NMS:-1}" \
+    --motion_nms_similarity "${V35_MOTION_NMS_SIMILARITY:-0.94}" \
+    --motion_nms_recent_window "${V35_MOTION_NMS_RECENT_WINDOW:-6}" \
+    --enable_density_resample "${V35_ENABLE_DENSITY_RESAMPLE:-1}" \
+    --max_pose_hold_ratio "${V35_MAX_POSE_HOLD_RATIO:-0.12}" \
+    --max_calm_flow_ratio "${V35_MAX_CALM_FLOW_RATIO:-0.22}" \
+    --max_neutral_flow_ratio "${V35_MAX_NEUTRAL_FLOW_RATIO:-0.34}" \
+    --min_keep_per_limited_type "${V35_MIN_KEEP_PER_LIMITED_TYPE:-24}" \
     --max_per_source_before_global_cap "${V35_MAX_PER_SOURCE_BEFORE_CAP:-160}" \
     --cap_per_source_uid "${V35_CAP_PER_SOURCE_UID:-96}" \
     --category_cap_factor "${V35_CATEGORY_CAP_FACTOR:-1.35}" \
