@@ -260,6 +260,12 @@ evaluate_directory() {
         --contact_lock_strength "${V34_CONTACT_LOCK_STRENGTH:-0.85}" \
         --contact_smooth_window "${V34_CONTACT_LOCK_SMOOTH_WINDOW:-11}" \
         --max_root_correction "${V34_CONTACT_LOCK_MAX_ROOT_CORRECTION:-0.18}" \
+        --floor_clearance "${V34_FLOOR_CLEARANCE_POSTPROCESS:-1}" \
+        --floor_margin "${V34_FLOOR_MARGIN:-0.006}" \
+        --floor_strength "${V34_FLOOR_STRENGTH:-0.95}" \
+        --floor_smooth_window "${V34_FLOOR_SMOOTH_WINDOW:-5}" \
+        --floor_max_lift "${V34_FLOOR_MAX_LIFT:-0.12}" \
+        --floor_support_damping "${V34_FLOOR_SUPPORT_DAMPING:-0.18}" \
         --smooth "${V34_OUTPUT_SMOOTH:-0}" \
         --rotation_smooth_window "${V34_OUTPUT_ROT_SMOOTH_WINDOW:-3}" \
         --smooth_strength "${V34_OUTPUT_SMOOTH_STRENGTH:-0.20}"

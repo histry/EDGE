@@ -138,6 +138,103 @@ def _visual_trigger_terms(meta: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _kinetic_adaptive_triggers(
+    *,
+    part: Mapping[str, Any] | None,
+    risk_trigger: float,
+    compat_trigger: float,
+) -> Dict[str, Any]:
+    """Context-aware trigger scaling for visible stitch defects.
+
+    A single dense-risk threshold is brittle: small discontinuities are visible
+    in quiet pose-hold sections, while energetic turns can hide larger residuals.
+    This returns adjusted thresholds without changing the underlying hard
+    boundary checks.
+    """
+    if not _enabled("V34_INPAINT_KINETIC_ADAPTIVE_GATE", "1"):
+        return {
+            "enabled": False,
+            "risk_trigger": float(risk_trigger),
+            "compat_trigger": float(compat_trigger),
+            "scale": 1.0,
+        }
+    part_dict = dict(part or {})
+    rhythm = dict(part_dict.get("rhythm_meta", {}) or {})
+    features = dict(rhythm.get("features", {}) or {})
+    slot_context = dict(rhythm.get("slot_context", {}) or {})
+
+    mean_energy = float(
+        features.get("mean_energy", part_dict.get("rhythm_mean_energy", 0.0))
+    )
+    first_ratio = float(
+        features.get(
+            "first1s_energy_ratio",
+            part_dict.get("rhythm_first1s_energy_ratio", 0.0),
+        )
+    )
+    tail_mean = float(
+        features.get("tail_mean_energy", part_dict.get("rhythm_tail_mean_energy", 0.0))
+    )
+    low_fraction = float(
+        features.get(
+            "low_energy_fraction",
+            part_dict.get("rhythm_low_energy_fraction", 0.0),
+        )
+    )
+    pressure = float(slot_context.get("music_motion_pressure", 0.0))
+    event = str(part_dict.get("motion_event", "neutral_flow"))
+    quiet_events = {
+        x.strip()
+        for x in os.getenv(
+            "V34_INPAINT_QUIET_EVENTS",
+            "pose_hold,calm_flow,neutral_flow",
+        ).split(",")
+        if x.strip()
+    }
+
+    scale = 1.0
+    reasons = []
+    if event in quiet_events or mean_energy <= _env_float("V34_INPAINT_LOW_ENERGY_MEAN", 0.020):
+        scale *= _env_float("V34_INPAINT_QUIET_SCALE", 0.72)
+        reasons.append("quiet_or_low_energy")
+    if (
+        first_ratio >= _env_float("V34_INPAINT_FRONTLOAD_RATIO", 0.74)
+        and tail_mean <= _env_float("V34_INPAINT_LOW_TAIL_ENERGY", 0.020)
+    ):
+        scale *= _env_float("V34_INPAINT_FRONTLOAD_SCALE", 0.78)
+        reasons.append("frontloaded_tail_drop")
+    if low_fraction >= _env_float("V34_INPAINT_LOW_FRACTION", 0.70):
+        scale *= _env_float("V34_INPAINT_LOW_COVERAGE_SCALE", 0.86)
+        reasons.append("low_motion_coverage")
+    if (
+        pressure >= _env_float("V34_INPAINT_HIGH_PRESSURE", 0.72)
+        and mean_energy >= _env_float("V34_INPAINT_HIGH_ENERGY_MEAN", 0.060)
+    ):
+        scale *= _env_float("V34_INPAINT_HIGH_ENERGY_SCALE", 1.15)
+        reasons.append("high_energy_masking")
+
+    scale = float(np.clip(
+        scale,
+        _env_float("V34_INPAINT_TRIGGER_SCALE_MIN", 0.52),
+        _env_float("V34_INPAINT_TRIGGER_SCALE_MAX", 1.25),
+    ))
+    return {
+        "enabled": True,
+        "risk_trigger": float(max(0.05, risk_trigger * scale)),
+        "compat_trigger": float(max(0.05, compat_trigger * scale)),
+        "scale": float(scale),
+        "reasons": reasons,
+        "features": {
+            "motion_event": event,
+            "mean_energy": float(mean_energy),
+            "first1s_energy_ratio": float(first_ratio),
+            "tail_mean_energy": float(tail_mean),
+            "low_energy_fraction": float(low_fraction),
+            "music_motion_pressure": float(pressure),
+        },
+    }
+
+
 def _should_inpaint(
     *,
     risk: Mapping[str, float],
@@ -147,6 +244,13 @@ def _should_inpaint(
     score = _risk_score(risk)
     trigger = _env_float("V34_INPAINT_TRIGGER_RATIO", 0.72)
     compat_trigger = _env_float("V34_INPAINT_COMPAT_SCORE_TRIGGER", 0.45)
+    adaptive = _kinetic_adaptive_triggers(
+        part=part,
+        risk_trigger=trigger,
+        compat_trigger=compat_trigger,
+    )
+    trigger = float(adaptive["risk_trigger"])
+    compat_trigger = float(adaptive["compat_trigger"])
     compat_score = float((part or {}).get("boundary_compat_score", 0.0))
     transition_meta = dict((part or {}).get("transition_meta", {}) or {})
     relaxation_meta = dict(transition_meta.get("constraint_relaxation", {}) or {})
@@ -171,6 +275,7 @@ def _should_inpaint(
         "compat_trigger": bool(compat_score >= compat_trigger),
         "visual_heuristic": bool(visual_terms.get("active", False)),
         "visual_heuristic_terms": visual_terms,
+        "kinetic_adaptive_gate": adaptive,
         "relaxed_constraint": bool(relaxed_constraint),
         "relaxation_reasons": list(relaxation_meta.get("reasons", [])),
         "diffusion_fallback": fallback,
@@ -367,10 +472,28 @@ def maybe_inpaint_boundary(
     })
     if not accept:
         meta["reason"] = "risk_gate_rejected"
+        meta["planner_feedback"] = {
+            "reject": True,
+            "retry_recommended": bool(
+                after_score > before_score
+                or not all(after_checks.values())
+                or bool(trigger_meta.get("relaxed_constraint", False))
+            ),
+            "reason": "inpaint_worsened_or_remained_unsafe",
+            "risk_score_before": float(before_score),
+            "risk_score_after": float(after_score),
+            "risk_ratio_after_over_before": float(after_score / max(before_score, 1e-8)),
+            "absolute_checks_after": after_checks,
+        }
         return previous.copy(), trans.copy(), following.copy(), meta
 
     meta["applied"] = True
     meta["reason"] = "accepted"
+    meta["planner_feedback"] = {
+        "reject": False,
+        "retry_recommended": False,
+        "reason": "inpaint_accepted",
+    }
     return (
         new_previous.astype(np.float32),
         new_transition.astype(np.float32),

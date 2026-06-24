@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -26,6 +27,13 @@ try:
     import torch
 except Exception:  # pragma: no cover - CPU-only environments still get root fixes.
     torch = None
+
+try:
+    from dataset.quaternion import ax_from_6v
+    from vis import SMPLSkeleton
+except Exception:  # pragma: no cover - fallback FK below remains available.
+    ax_from_6v = None
+    SMPLSkeleton = None
 
 
 PARENTS = np.array([
@@ -75,6 +83,17 @@ COLLISION_PAIRS = (
 )
 
 
+def _enabled(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
 def _load_motion(path: Path) -> np.ndarray:
     x = np.load(path, allow_pickle=True)
     if x.ndim == 0 and isinstance(x.item(), dict):
@@ -100,6 +119,35 @@ def _rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
 
 
 def _fk_from_t151_np(motion: np.ndarray) -> np.ndarray:
+    if (
+        _enabled("V34_POSTPROCESS_USE_SMPL_FK", "1")
+        and torch is not None
+        and ax_from_6v is not None
+        and SMPLSkeleton is not None
+    ):
+        try:
+            device_name = os.getenv(
+                "V34_POSTPROCESS_FK_DEVICE",
+                "cuda" if torch.cuda.is_available() else "cpu",
+            )
+            device = torch.device(device_name)
+            root = torch.tensor(
+                motion[:, [4, 5, 6]],
+                dtype=torch.float32,
+                device=device,
+            ).unsqueeze(0)
+            q_6d = torch.tensor(
+                motion[:, 7:151],
+                dtype=torch.float32,
+                device=device,
+            ).reshape(1, motion.shape[0], 24, 6)
+            with torch.no_grad():
+                q_ax = ax_from_6v(q_6d)
+                joints = SMPLSkeleton(device=device).forward(q_ax, root)
+            return joints[0].detach().cpu().numpy().astype(np.float32)
+        except Exception:
+            pass
+
     t = motion.shape[0]
     root = motion[:, [4, 5, 6]].astype(np.float32)
     local_r = _rot6d_to_matrix_np(motion[:, 7:151].reshape(t, 24, 6))
@@ -144,11 +192,55 @@ def _segments(mask: np.ndarray, min_len: int) -> List[Tuple[int, int]]:
     return rows
 
 
-def _contact_mask(motion: np.ndarray, threshold: float) -> np.ndarray:
+def _remove_short_contacts(mask: np.ndarray, min_len: int) -> np.ndarray:
+    clean = np.zeros_like(mask, dtype=bool)
+    for foot in range(mask.shape[1]):
+        for start, end in _segments(mask[:, foot], int(min_len)):
+            clean[start:end, foot] = True
+    return clean
+
+
+def _contact_mask(
+    motion: np.ndarray,
+    threshold: float,
+    *,
+    min_contact_frames: int = 1,
+) -> np.ndarray:
     c = np.asarray(motion[:, 0:4], dtype=np.float32)
     if c.shape[1] != 4:
-        return np.zeros((len(motion), 4), dtype=bool)
-    return c >= float(threshold)
+        label_contact = np.zeros((len(motion), 4), dtype=bool)
+    else:
+        label_contact = c >= float(threshold)
+    if not _enabled("V34_KINEMATIC_CONTACT_INFER", "1") or len(motion) < 2:
+        return _remove_short_contacts(label_contact, max(1, int(min_contact_frames)))
+    try:
+        joints = _fk_from_t151_np(motion)
+        feet = joints[:, FOOT_JOINTS, :]
+        foot_y = feet[:, :, 1]
+        q = float(np.clip(_env_float("V34_FLOOR_QUANTILE", 0.12), 0.01, 0.45))
+        floor_y = float(np.quantile(foot_y.reshape(-1), q))
+        height_gate = foot_y <= floor_y + _env_float("V34_KIN_CONTACT_HEIGHT", 0.045)
+        speed = np.zeros(foot_y.shape, dtype=np.float32)
+        speed[1:] = np.linalg.norm(
+            feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]],
+            axis=-1,
+        )
+        speed_gate = speed <= _env_float("V34_KIN_CONTACT_SPEED", 0.035)
+        vote_threshold = int(
+            np.clip(_env_float("V34_KIN_CONTACT_VOTE_THRESHOLD", 2.0), 1.0, 3.0)
+        )
+        votes = (
+            label_contact.astype(np.int32)
+            + height_gate.astype(np.int32)
+            + speed_gate.astype(np.int32)
+        )
+        inferred = votes >= vote_threshold
+        return _remove_short_contacts(
+            inferred,
+            max(1, int(_env_float("V34_KIN_CONTACT_MIN_FRAMES", min_contact_frames))),
+        )
+    except Exception:
+        return _remove_short_contacts(label_contact, max(1, int(min_contact_frames)))
 
 
 def _mean_contact_speed(joints: np.ndarray, contact: np.ndarray) -> float:
@@ -176,6 +268,86 @@ def _collision_stats(joints: np.ndarray, radius: float) -> Dict[str, float]:
     }
 
 
+def _quality_audit(
+    motion: np.ndarray,
+    *,
+    contact_threshold: float,
+    min_contact_frames: int,
+    floor_margin: float,
+    collision_radius: float,
+) -> Dict[str, float]:
+    joints = _fk_from_t151_np(motion)
+    feet = joints[:, FOOT_JOINTS, :]
+    feet_y = feet[:, :, 1]
+    q = float(np.clip(_env_float("V34_FLOOR_QUANTILE", 0.12), 0.01, 0.45))
+    floor_y = float(
+        _env_float("V34_FLOOR_Y", float(np.quantile(feet_y.reshape(-1), q)))
+    )
+    contact = _contact_mask(
+        motion,
+        contact_threshold,
+        min_contact_frames=int(min_contact_frames),
+    )
+    feet_xz = feet[:, :, [0, 2]]
+    skate_vals: List[np.ndarray] = []
+    for foot in range(4):
+        for start, end in _segments(contact[:, foot], max(2, int(min_contact_frames))):
+            if end - start > 1:
+                skate_vals.append(
+                    np.linalg.norm(
+                        feet_xz[start + 1:end, foot] - feet_xz[start:end - 1, foot],
+                        axis=-1,
+                    )
+                )
+    skate = float(np.mean(np.concatenate(skate_vals))) if skate_vals else 0.0
+
+    root_y = motion[:, 5]
+    root_v = np.diff(root_y, prepend=root_y[:1])
+    root_a = np.diff(root_v, prepend=root_v[:1])
+    vel = np.diff(joints, axis=0, prepend=joints[:1])
+    acc = np.diff(vel, axis=0, prepend=vel[:1])
+    jerk = np.diff(acc, axis=0, prepend=acc[:1])
+    mean_jerk = np.linalg.norm(jerk, axis=-1).mean(axis=-1)
+    collision = _collision_stats(joints, collision_radius)
+
+    penetration = feet_y - (floor_y + float(floor_margin))
+    return {
+        "floor_y": float(floor_y),
+        "contact_ratio": float(np.mean(contact)) if contact.size else 0.0,
+        "foot_skate_mean_mpf": float(skate),
+        "foot_penetration_min_m": float(np.min(penetration)) if penetration.size else 0.0,
+        "root_y_range_m": float(np.max(root_y) - np.min(root_y)) if len(root_y) else 0.0,
+        "root_y_acc_mean": float(np.mean(np.abs(root_a))) if len(root_a) else 0.0,
+        "root_y_acc_p95": float(np.percentile(np.abs(root_a), 95)) if len(root_a) else 0.0,
+        "mean_joint_jerk_max": float(np.max(mean_jerk)) if len(mean_jerk) else 0.0,
+        "mean_joint_jerk_p95": float(np.percentile(mean_jerk, 95)) if len(mean_jerk) else 0.0,
+        "collision_risk": float(collision["risk"]),
+        "collision_min_distance": float(collision["min_distance"]),
+        "collision_bad_frames": float(collision["bad_frames"]),
+    }
+
+
+def _quality_rejection_signal(metrics: Dict[str, float]) -> Dict[str, object]:
+    reasons: List[str] = []
+    if metrics.get("foot_skate_mean_mpf", 0.0) > _env_float("V34_REJECT_MAX_SKATE_MPF", 0.035):
+        reasons.append("foot_sliding")
+    if metrics.get("foot_penetration_min_m", 0.0) < _env_float("V34_REJECT_MIN_FOOT_PENETRATION", -0.015):
+        reasons.append("floor_penetration")
+    if metrics.get("mean_joint_jerk_p95", 0.0) > _env_float("V34_REJECT_MAX_JERK_P95", 1200.0):
+        reasons.append("high_jitter")
+    if metrics.get("collision_risk", 0.0) > _env_float("V34_REJECT_MAX_COLLISION_RISK", 0.20):
+        reasons.append("self_collision_proxy")
+    return {
+        "accepted": not reasons,
+        "reject_reasons": reasons,
+        "planner_action": (
+            "accept"
+            if not reasons
+            else "reroute_local_phrase_or_mask_failed_edges"
+        ),
+    }
+
+
 def contact_lock_root(
     motion: np.ndarray,
     *,
@@ -187,7 +359,11 @@ def contact_lock_root(
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     out = motion.astype(np.float32, copy=True)
     joints = _fk_from_t151_np(out)
-    contact = _contact_mask(out, contact_threshold)
+    contact = _contact_mask(
+        out,
+        contact_threshold,
+        min_contact_frames=int(min_contact_frames),
+    )
     correction = np.zeros((len(out), 2), dtype=np.float32)
     counts = np.zeros((len(out), 1), dtype=np.float32)
     segment_count = 0
@@ -216,7 +392,90 @@ def contact_lock_root(
         "mean_contact_speed_after": _mean_contact_speed(after_joints, contact),
         "max_root_xz_correction": float(np.max(np.linalg.norm(correction, axis=1))) if len(out) else 0.0,
         "contact_threshold": float(contact_threshold),
+        "contact_vote_threshold": float(_env_float("V34_KIN_CONTACT_VOTE_THRESHOLD", 2.0)),
+        "kinematic_contact_min_frames": int(
+            _env_float("V34_KIN_CONTACT_MIN_FRAMES", min_contact_frames)
+        ),
         "strength": float(strength),
+    }
+
+
+def enforce_floor_clearance(
+    motion: np.ndarray,
+    *,
+    enabled: bool,
+    margin: float,
+    strength: float,
+    smooth_window: int,
+    max_lift: float,
+    contact_threshold: float,
+    min_contact_frames: int,
+    support_damping: float,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    joints = _fk_from_t151_np(motion)
+    feet_y = joints[:, FOOT_JOINTS, 1]
+    q = float(np.clip(_env_float("V34_FLOOR_QUANTILE", 0.12), 0.01, 0.45))
+    floor_y = float(
+        _env_float("V34_FLOOR_Y", float(np.quantile(feet_y.reshape(-1), q)))
+    )
+    min_foot_y = np.min(feet_y, axis=1)
+    penetration = np.maximum(0.0, floor_y + float(margin) - min_foot_y)
+    before = {
+        "floor_y": float(floor_y),
+        "min_foot_y": float(np.min(feet_y)) if feet_y.size else 0.0,
+        "penetrating_frames": int(np.sum(penetration > 1e-6)),
+        "max_penetration": float(np.max(penetration)) if len(penetration) else 0.0,
+        "mean_penetration": float(np.mean(penetration)) if len(penetration) else 0.0,
+    }
+    if not enabled or len(motion) == 0:
+        return motion.astype(np.float32, copy=True), {
+            "enabled": bool(enabled),
+            "skipped": True,
+            "before": before,
+        }
+    lift = penetration.astype(np.float32)
+    if max_lift > 0:
+        lift = np.minimum(lift, float(max_lift))
+    lift = _moving_average(lift[:, None], int(smooth_window))[:, 0]
+    out = motion.astype(np.float32, copy=True)
+    out[:, 5] += float(strength) * lift
+    if float(support_damping) > 0.0 and len(out) > 2:
+        contact = _contact_mask(
+            out,
+            contact_threshold,
+            min_contact_frames=int(min_contact_frames),
+        )
+        support = np.any(contact, axis=1)
+        y = out[:, 5].copy()
+        velocity = np.zeros_like(y)
+        velocity[1:] = y[1:] - y[:-1]
+        damped_velocity = velocity.copy()
+        damped_velocity[support] *= max(0.0, 1.0 - float(support_damping))
+        y_damped = y.copy()
+        y_damped[1:] = y[0] + np.cumsum(damped_velocity[1:])
+        out[:, 5] = (0.65 * y + 0.35 * y_damped).astype(np.float32)
+    else:
+        support = np.zeros((len(out),), dtype=bool)
+    after_joints = _fk_from_t151_np(out)
+    after_feet_y = after_joints[:, FOOT_JOINTS, 1]
+    after_pen = np.maximum(0.0, floor_y + float(margin) - np.min(after_feet_y, axis=1))
+    return out, {
+        "enabled": True,
+        "skipped": False,
+        "margin": float(margin),
+        "strength": float(strength),
+        "smooth_window": int(smooth_window),
+        "max_lift": float(max_lift),
+        "support_damping": float(support_damping),
+        "support_frame_ratio": float(np.mean(support)) if len(support) else 0.0,
+        "before": before,
+        "after": {
+            "min_foot_y": float(np.min(after_feet_y)) if after_feet_y.size else 0.0,
+            "penetrating_frames": int(np.sum(after_pen > 1e-6)),
+            "max_penetration": float(np.max(after_pen)) if len(after_pen) else 0.0,
+            "mean_penetration": float(np.mean(after_pen)) if len(after_pen) else 0.0,
+        },
+        "max_root_y_lift": float(np.max(lift)) if len(lift) else 0.0,
     }
 
 
@@ -233,7 +492,11 @@ def enforce_root_y_physics(
     landing_strength: float,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     out = motion.astype(np.float32, copy=True)
-    contact = _contact_mask(out, contact_threshold)
+    contact = _contact_mask(
+        out,
+        contact_threshold,
+        min_contact_frames=max(2, int(_env_float("V34_KIN_CONTACT_MIN_FRAMES", 3))),
+    )
     support = np.any(contact, axis=1)
     flight_segments = _segments(~support, min_flight_frames)
     y = out[:, 5].copy()
@@ -402,6 +665,13 @@ def process_file(args: argparse.Namespace) -> Dict[str, object]:
     out_path = Path(args.out)
     motion = _load_motion(src)
     original = motion.copy()
+    pre_audit = _quality_audit(
+        original,
+        contact_threshold=args.contact_threshold,
+        min_contact_frames=args.min_contact_frames,
+        floor_margin=args.floor_margin,
+        collision_radius=args.collision_radius,
+    )
 
     physics_summary: Dict[str, object] = {"enabled": False}
     if args.root_y_physics:
@@ -441,6 +711,19 @@ def process_file(args: argparse.Namespace) -> Dict[str, object]:
             max_correction=args.max_root_correction,
         )
 
+    floor_summary: Dict[str, object]
+    motion, floor_summary = enforce_floor_clearance(
+        motion,
+        enabled=bool(args.floor_clearance),
+        margin=args.floor_margin,
+        strength=args.floor_strength,
+        smooth_window=args.floor_smooth_window,
+        max_lift=args.floor_max_lift,
+        contact_threshold=args.contact_threshold,
+        min_contact_frames=args.min_contact_frames,
+        support_damping=args.floor_support_damping,
+    )
+
     if args.smooth:
         motion = smooth_rotations_only(
             motion,
@@ -450,15 +733,41 @@ def process_file(args: argparse.Namespace) -> Dict[str, object]:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, motion.astype(np.float32))
+    post_audit = _quality_audit(
+        motion,
+        contact_threshold=args.contact_threshold,
+        min_contact_frames=args.min_contact_frames,
+        floor_margin=args.floor_margin,
+        collision_radius=args.collision_radius,
+    )
+    rejection_signal = _quality_rejection_signal(post_audit)
 
     summary = {
         "version": "v34_physics_plausible_postprocess",
         "input": str(src),
         "output": str(out_path),
         "frames": int(len(motion)),
+        "pre_audit": pre_audit,
+        "post_audit": post_audit,
+        "planner_feedback": rejection_signal,
+        "audit_improvement": {
+            "foot_skate_mean_delta": float(
+                pre_audit["foot_skate_mean_mpf"] - post_audit["foot_skate_mean_mpf"]
+            ),
+            "foot_penetration_min_delta": float(
+                post_audit["foot_penetration_min_m"] - pre_audit["foot_penetration_min_m"]
+            ),
+            "jerk_p95_delta": float(
+                pre_audit["mean_joint_jerk_p95"] - post_audit["mean_joint_jerk_p95"]
+            ),
+            "collision_risk_delta": float(
+                pre_audit["collision_risk"] - post_audit["collision_risk"]
+            ),
+        },
         "root_y_physics": physics_summary,
         "collision_aware_ik": collision_summary,
         "contact_lock": contact_summary,
+        "floor_clearance": floor_summary,
         "rotation_smooth": {
             "enabled": bool(args.smooth),
             "rotation_window": int(args.rotation_smooth_window),
@@ -511,6 +820,12 @@ def main() -> None:
     parser.add_argument("--contact_lock_strength", type=float, default=0.85)
     parser.add_argument("--contact_smooth_window", type=int, default=11)
     parser.add_argument("--max_root_correction", type=float, default=0.18)
+    parser.add_argument("--floor_clearance", type=int, default=1)
+    parser.add_argument("--floor_margin", type=float, default=0.006)
+    parser.add_argument("--floor_strength", type=float, default=0.95)
+    parser.add_argument("--floor_smooth_window", type=int, default=5)
+    parser.add_argument("--floor_max_lift", type=float, default=0.12)
+    parser.add_argument("--floor_support_damping", type=float, default=0.18)
 
     parser.add_argument("--smooth", type=int, default=0)
     parser.add_argument("--rotation_smooth_window", type=int, default=3)

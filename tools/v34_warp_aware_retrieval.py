@@ -9,7 +9,7 @@ beam when its exact locked-slot warp lies outside the allowed interval.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -69,6 +69,18 @@ def _excess_ratio(value: float, limit: float) -> float:
 def _csv_set(name: str, default: str) -> set:
     raw = os.getenv(name, default)
     return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _unique_indices(*groups: Sequence[int]) -> np.ndarray:
+    seen = set()
+    out: List[int] = []
+    for group in groups:
+        for value in group:
+            idx = int(value)
+            if idx not in seen:
+                seen.add(idx)
+                out.append(idx)
+    return np.asarray(out, dtype=np.int64)
 
 
 _FK_PARENTS = np.array([
@@ -418,6 +430,199 @@ def _rhythm_prior_penalty_arrays(
     )
 
 
+def _edge_hub_candidates(
+    *,
+    feasible_indices: np.ndarray,
+    base: np.ndarray,
+    event_types: Sequence[str],
+    natural: np.ndarray,
+    rhythm_features: Dict[str, np.ndarray],
+    source_prior_penalty: np.ndarray,
+    slot_duration_sec: float,
+    fps: int,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Preserve low-node-score connector candidates before beam expansion.
+
+    A bridge snippet can have mediocre music score while being valuable for
+    physical/semantic continuity.  This keeps a small, quality-gated union of
+    neutral transition-like events in the shortlist, preventing Node Top-K from
+    deleting every useful connector before edge costs are evaluated.
+    """
+    if not _enabled("V34_EDGE_HUB_RESCUE", "1") or len(feasible_indices) == 0:
+        return np.zeros((0,), dtype=np.int64), {"enabled": False, "count": 0}
+    top_k = max(0, _env_int("V34_EDGE_HUB_TOP_K", 128))
+    if top_k <= 0:
+        return np.zeros((0,), dtype=np.int64), {"enabled": True, "count": 0}
+
+    hub_tags = _csv_set(
+        "V34_EDGE_HUB_EVENT_TAGS",
+        "neutral_flow,calm_flow,build_up,transition,turn,section_change",
+    )
+    max_seconds = _env_float("V34_EDGE_HUB_MAX_SECONDS", 3.20)
+    min_tail_ratio = _env_float("V34_EDGE_HUB_MIN_TAIL_RATIO", 0.42)
+    max_first_ratio = _env_float("V34_EDGE_HUB_MAX_FIRST1S_RATIO", 0.82)
+    max_collision = _env_float("V34_EDGE_HUB_MAX_COLLISION_RISK", 0.20)
+
+    idx = np.asarray(feasible_indices, dtype=np.int64)
+    event_mask = np.asarray(
+        [str(event_types[int(i)]) in hub_tags for i in idx],
+        dtype=bool,
+    )
+    duration_mask = natural[idx] <= max_seconds * max(float(fps), 1.0)
+    tail_to_mean = rhythm_features.get(
+        "tail_to_mean_energy",
+        np.zeros_like(natural, dtype=np.float32),
+    )
+    first_ratio = rhythm_features.get(
+        "first1s_energy_ratio",
+        np.ones_like(natural, dtype=np.float32),
+    )
+    collision = rhythm_features.get(
+        "self_collision_risk",
+        np.zeros_like(natural, dtype=np.float32),
+    )
+    rhythm_mask = (
+        (tail_to_mean[idx] >= min_tail_ratio)
+        & (first_ratio[idx] <= max_first_ratio)
+        & (collision[idx] <= max_collision)
+    )
+    mask = event_mask & duration_mask & rhythm_mask
+    if not np.any(mask):
+        return np.zeros((0,), dtype=np.int64), {
+            "enabled": True,
+            "count": 0,
+            "reason": "no_hub_candidate_passed_gate",
+            "event_tags": sorted(hub_tags),
+        }
+
+    candidates = idx[mask]
+    source_pen = (
+        source_prior_penalty[candidates]
+        if len(source_prior_penalty) == len(base)
+        else np.zeros_like(candidates, dtype=np.float32)
+    )
+    # Prefer connector candidates with residual tail motion, low front-loading,
+    # low collision risk, and reasonable node score.
+    hub_score = (
+        0.35 * base[candidates]
+        + 0.90 * tail_to_mean[candidates]
+        - 0.70 * first_ratio[candidates]
+        - 1.25 * collision[candidates]
+        - 0.45 * source_pen
+        - 0.05 * np.abs(
+            natural[candidates] / max(slot_duration_sec * max(float(fps), 1.0), 1.0)
+            - 1.0
+        )
+    )
+    order = np.argsort(hub_score)[::-1]
+    selected = candidates[order[: min(top_k, len(order))]]
+    return np.asarray(selected, dtype=np.int64), {
+        "enabled": True,
+        "count": int(len(selected)),
+        "pool_size": int(len(candidates)),
+        "top_k": int(top_k),
+        "event_tags": sorted(hub_tags),
+        "max_seconds": float(max_seconds),
+        "min_tail_ratio": float(min_tail_ratio),
+        "max_first1s_ratio": float(max_first_ratio),
+    }
+
+
+def _source_diverse_rescue_candidates(
+    *,
+    feasible_indices: np.ndarray,
+    base: np.ndarray,
+    source_uids: Sequence[str],
+    rhythm_features: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Keep a tiny set of source-diverse candidates before edge scoring.
+
+    Source-aware balancing in the database reduces prior skew, but Node Top-K can
+    still collapse to one dancer/repetition when the current music slot has a
+    broad semantic match.  This rescue set preserves the best few candidates per
+    source group so edge costs and motif memory can decide, rather than letting
+    scalar music similarity erase diversity before search.
+    """
+    if (
+        not _enabled("V34_SOURCE_DIVERSE_RESCUE", "1")
+        or len(feasible_indices) == 0
+        or len(source_uids) != len(base)
+    ):
+        return np.zeros((0,), dtype=np.int64), {"enabled": False, "count": 0}
+    per_group = max(0, _env_int("V34_SOURCE_DIVERSE_PER_GROUP", 1))
+    max_groups = max(0, _env_int("V34_SOURCE_DIVERSE_MAX_GROUPS", 96))
+    if per_group <= 0 or max_groups <= 0:
+        return np.zeros((0,), dtype=np.int64), {"enabled": True, "count": 0}
+
+    idx = np.asarray(feasible_indices, dtype=np.int64)
+    src = np.asarray(source_uids, dtype=str)
+    first_ratio = rhythm_features.get(
+        "first1s_energy_ratio",
+        np.ones_like(base, dtype=np.float32),
+    )
+    low_fraction = rhythm_features.get(
+        "low_energy_fraction",
+        np.zeros_like(base, dtype=np.float32),
+    )
+    collision = rhythm_features.get(
+        "self_collision_risk",
+        np.zeros_like(base, dtype=np.float32),
+    )
+    score = (
+        base
+        - 0.35 * np.asarray(first_ratio, dtype=np.float32)
+        - 0.30 * np.asarray(low_fraction, dtype=np.float32)
+        - 1.10 * np.asarray(collision, dtype=np.float32)
+    )
+
+    group_best: List[Tuple[float, str, List[int]]] = []
+    for group in sorted(set(src[idx].tolist())):
+        ids = idx[src[idx] == group]
+        if len(ids) == 0:
+            continue
+        local = ids[np.argsort(score[ids])[::-1][:per_group]]
+        group_best.append((float(np.max(score[local])), str(group), [int(x) for x in local]))
+    group_best.sort(key=lambda row: row[0], reverse=True)
+
+    selected: List[int] = []
+    for _, _, ids in group_best[:max_groups]:
+        selected.extend(ids)
+    selected_arr = np.asarray(selected, dtype=np.int64)
+    return selected_arr, {
+        "enabled": True,
+        "count": int(len(selected_arr)),
+        "source_groups_considered": int(len(group_best)),
+        "source_groups_kept": int(min(len(group_best), max_groups)),
+        "per_group": int(per_group),
+        "max_groups": int(max_groups),
+    }
+
+
+def _memory_indices(
+    selected: Sequence[int],
+    selected_parts: Sequence[Mapping[str, Any]] | None,
+) -> List[int]:
+    if (
+        not _enabled("V34_MEMORY_IGNORE_RELAXED", "1")
+        or not selected_parts
+        or len(selected_parts) != len(selected)
+    ):
+        return [int(x) for x in selected]
+    kept: List[int] = []
+    for idx, part in zip(selected, selected_parts):
+        meta = dict(part.get("transition_meta", {}) or {})
+        relaxation = dict(meta.get("constraint_relaxation", {}) or {})
+        relaxed = bool(
+            part.get("constraint_relaxation_used", False)
+            or part.get("constraint_relaxed", False)
+            or relaxation.get("active", False)
+            or relaxation.get("used_due_to_empty_strict", False)
+        )
+        if not relaxed:
+            kept.append(int(idx))
+    return kept
+
+
 def _rhythm_streak_penalty(
     *,
     selected: Sequence[int],
@@ -588,6 +793,7 @@ def _slot_reset_allow(phrase: Any) -> float:
 def _semantic_continuity_penalty(
     *,
     selected: Sequence[int],
+    selected_parts: Sequence[Mapping[str, Any]] | None = None,
     previous: int,
     candidate: int,
     phrase: Any,
@@ -616,7 +822,8 @@ def _semantic_continuity_penalty(
     )))
 
     memory_window = max(1, _env_int("V34_MOTIF_MEMORY_WINDOW", 4))
-    recent = [int(x) for x in selected[-memory_window:]]
+    memory_selected = _memory_indices(selected, selected_parts)
+    recent = [int(x) for x in memory_selected[-memory_window:]]
     if recent:
         memory_activity = abs(float(activity01[int(candidate)]) - float(np.mean(activity01[recent])))
         memory_body = min(abs(float(body_code[int(candidate)]) - float(body_code[int(x)])) / 5.0 for x in recent)
@@ -697,6 +904,8 @@ def _semantic_continuity_penalty(
             "reset_allow": float(reset_allow),
             "previous_event": prev_event,
             "candidate_event": next_event,
+            "memory_ignore_relaxed": bool(_enabled("V34_MEMORY_IGNORE_RELAXED", "1")),
+            "memory_effective_count": int(len(memory_selected)),
         },
     }
 
@@ -1170,7 +1379,30 @@ def choose_events_v34(
         ranked_feasible = feasible_indices[
             np.argsort(base[feasible_indices])[::-1]
         ]
-        shortlist = ranked_feasible[: min(node_top_k, len(ranked_feasible))]
+        node_shortlist = ranked_feasible[: min(node_top_k, len(ranked_feasible))]
+        edge_hub_shortlist, edge_hub_meta = _edge_hub_candidates(
+            feasible_indices=feasible_indices,
+            base=base,
+            event_types=event_types,
+            natural=natural,
+            rhythm_features=rhythm_features,
+            source_prior_penalty=source_prior_penalty,
+            slot_duration_sec=slot_duration_sec,
+            fps=int(getattr(args, "fps", 30)),
+        )
+        source_diverse_shortlist, source_diverse_meta = (
+            _source_diverse_rescue_candidates(
+                feasible_indices=feasible_indices,
+                base=base,
+                source_uids=source_uids,
+                rhythm_features=rhythm_features,
+            )
+        )
+        shortlist = _unique_indices(
+            node_shortlist,
+            edge_hub_shortlist,
+            source_diverse_shortlist,
+        )
         strict_expanded: List[Any] = []
         relaxed_expanded: List[Any] = []
         expanded: List[Any] = []
@@ -1373,6 +1605,7 @@ def choose_events_v34(
                         )
                     semantic_edge_meta = _semantic_continuity_penalty(
                         selected=state.selected,
+                        selected_parts=state.parts,
                         previous=int(previous),
                         candidate=int(idx),
                         phrase=phrase,
@@ -1717,6 +1950,14 @@ def choose_events_v34(
                     "source_aware_prior_meta": source_prior_meta,
                     "candidate_top_k": int(args.candidate_top_k),
                     "graph_node_top_k": int(node_top_k),
+                    "node_shortlist_size": int(len(node_shortlist)),
+                    "edge_hub_shortlist_size": int(len(edge_hub_shortlist)),
+                    "edge_hub_rescue_meta": edge_hub_meta,
+                    "source_diverse_shortlist_size": int(
+                        len(source_diverse_shortlist)
+                    ),
+                    "source_diverse_rescue_meta": source_diverse_meta,
+                    "effective_shortlist_size": int(len(shortlist)),
                     "hierarchy_enabled": bool(args.hierarchical_retrieval),
                     "hierarchy_query_group": int(
                         hierarchy_query.get("group", -1)
