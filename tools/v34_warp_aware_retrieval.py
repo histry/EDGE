@@ -234,6 +234,83 @@ def _motion_rhythm_features(
     }
 
 
+
+def _native_floor_penalty_arrays(
+    items: Sequence[Mapping[str, Any]],
+    motions: Sequence[np.ndarray],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Penalise native floor-pathological RAG snippets before beam expansion.
+
+    V40 uses this to stop the retrieval layer from repeatedly selecting snippets
+    whose own FK chain already contains deep foot-floor penetration.  If the
+    JSON item has fields produced by tools/v40_native_floor_audit.py they are
+    used directly; otherwise the value is computed on the fly from the loaded
+    motion.  The penalty is deliberately soft, so a snippet can still survive
+    when it is musically essential, but it must pay an explicit physical prior.
+    """
+    n = len(motions)
+    zeros = np.zeros((n,), dtype=np.float32)
+    if not _enabled("V40_NATIVE_FLOOR_PENALTY", "1") or n == 0:
+        return zeros, {"enabled": False}
+    tolerance = _env_float("V40_NATIVE_FLOOR_TOLERANCE_M", 0.04)
+    weight = _env_float("V40_NATIVE_FLOOR_PENALTY_WEIGHT", 8.0)
+    q = float(np.clip(_env_float("V40_NATIVE_FLOOR_QUANTILE", 0.05), 0.005, 0.45))
+    margin = _env_float("V40_NATIVE_FLOOR_MARGIN", 0.006)
+    native_pen = np.zeros((n,), dtype=np.float32)
+    min_foot_y = np.zeros((n,), dtype=np.float32)
+    floor_y = np.zeros((n,), dtype=np.float32)
+    source = []
+    for i in range(n):
+        item = items[i] if i < len(items) else {}
+        if isinstance(item, Mapping) and "native_floor_penetration_m" in item:
+            pen = float(item.get("native_floor_penetration_m", 0.0) or 0.0)
+            native_pen[i] = max(0.0, pen)
+            min_foot_y[i] = float(item.get("native_min_foot_y", 0.0) or 0.0)
+            floor_y[i] = float(item.get("native_floor_y", 0.0) or 0.0)
+            source.append("json")
+            continue
+        try:
+            x = np.asarray(motions[i], dtype=np.float32)
+            if x.ndim == 3:
+                x = x[0]
+            if x.ndim != 2 or x.shape[1] < 151 or len(x) < 2:
+                source.append("missing")
+                continue
+            t = x.shape[0]
+            root = x[:, [4, 5, 6]]
+            local_r = _rot6d_to_matrix_np(x[:, 7:151].reshape(t, 24, 6))
+            joints = np.zeros((t, 24, 3), dtype=np.float32)
+            global_r = np.zeros((t, 24, 3, 3), dtype=np.float32)
+            joints[:, 0] = root
+            global_r[:, 0] = local_r[:, 0]
+            for j in range(1, 24):
+                p = int(_FK_PARENTS[j])
+                global_r[:, j] = np.matmul(global_r[:, p], local_r[:, j])
+                joints[:, j] = joints[:, p] + np.matmul(global_r[:, p], _FK_OFFSETS[j][None, :, None])[..., 0]
+            foot_y = joints[:, [7, 8, 10, 11], 1]
+            fy = float(np.quantile(foot_y.reshape(-1), q))
+            mf = float(np.min(foot_y))
+            floor_y[i] = fy
+            min_foot_y[i] = mf
+            native_pen[i] = max(0.0, fy + margin - mf)
+            source.append("computed")
+        except Exception:
+            source.append("failed")
+            native_pen[i] = 0.0
+    excess = np.maximum(0.0, native_pen - float(tolerance))
+    penalty = weight * np.square(excess).astype(np.float32)
+    return penalty.astype(np.float32), {
+        "enabled": True,
+        "weight": float(weight),
+        "tolerance_m": float(tolerance),
+        "quantile": float(q),
+        "margin": float(margin),
+        "max_native_penetration_m": float(np.max(native_pen)) if len(native_pen) else 0.0,
+        "mean_native_penetration_m": float(np.mean(native_pen)) if len(native_pen) else 0.0,
+        "num_over_tolerance": int(np.sum(native_pen > float(tolerance))),
+        "source_counts": {str(k): int(source.count(k)) for k in sorted(set(source))},
+    }
+
 def _build_rhythm_feature_arrays(
     motions: Sequence[np.ndarray],
     *,
@@ -525,76 +602,6 @@ def _edge_hub_candidates(
         "max_seconds": float(max_seconds),
         "min_tail_ratio": float(min_tail_ratio),
         "max_first1s_ratio": float(max_first_ratio),
-    }
-
-
-def _source_diverse_rescue_candidates(
-    *,
-    feasible_indices: np.ndarray,
-    base: np.ndarray,
-    source_uids: Sequence[str],
-    rhythm_features: Dict[str, np.ndarray],
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Keep a tiny set of source-diverse candidates before edge scoring.
-
-    Source-aware balancing in the database reduces prior skew, but Node Top-K can
-    still collapse to one dancer/repetition when the current music slot has a
-    broad semantic match.  This rescue set preserves the best few candidates per
-    source group so edge costs and motif memory can decide, rather than letting
-    scalar music similarity erase diversity before search.
-    """
-    if (
-        not _enabled("V34_SOURCE_DIVERSE_RESCUE", "1")
-        or len(feasible_indices) == 0
-        or len(source_uids) != len(base)
-    ):
-        return np.zeros((0,), dtype=np.int64), {"enabled": False, "count": 0}
-    per_group = max(0, _env_int("V34_SOURCE_DIVERSE_PER_GROUP", 1))
-    max_groups = max(0, _env_int("V34_SOURCE_DIVERSE_MAX_GROUPS", 96))
-    if per_group <= 0 or max_groups <= 0:
-        return np.zeros((0,), dtype=np.int64), {"enabled": True, "count": 0}
-
-    idx = np.asarray(feasible_indices, dtype=np.int64)
-    src = np.asarray(source_uids, dtype=str)
-    first_ratio = rhythm_features.get(
-        "first1s_energy_ratio",
-        np.ones_like(base, dtype=np.float32),
-    )
-    low_fraction = rhythm_features.get(
-        "low_energy_fraction",
-        np.zeros_like(base, dtype=np.float32),
-    )
-    collision = rhythm_features.get(
-        "self_collision_risk",
-        np.zeros_like(base, dtype=np.float32),
-    )
-    score = (
-        base
-        - 0.35 * np.asarray(first_ratio, dtype=np.float32)
-        - 0.30 * np.asarray(low_fraction, dtype=np.float32)
-        - 1.10 * np.asarray(collision, dtype=np.float32)
-    )
-
-    group_best: List[Tuple[float, str, List[int]]] = []
-    for group in sorted(set(src[idx].tolist())):
-        ids = idx[src[idx] == group]
-        if len(ids) == 0:
-            continue
-        local = ids[np.argsort(score[ids])[::-1][:per_group]]
-        group_best.append((float(np.max(score[local])), str(group), [int(x) for x in local]))
-    group_best.sort(key=lambda row: row[0], reverse=True)
-
-    selected: List[int] = []
-    for _, _, ids in group_best[:max_groups]:
-        selected.extend(ids)
-    selected_arr = np.asarray(selected, dtype=np.int64)
-    return selected_arr, {
-        "enabled": True,
-        "count": int(len(selected_arr)),
-        "source_groups_considered": int(len(group_best)),
-        "source_groups_kept": int(min(len(group_best), max_groups)),
-        "per_group": int(per_group),
-        "max_groups": int(max_groups),
     }
 
 
@@ -1123,6 +1130,7 @@ def choose_events_v34(
         repeat_ids=repeat_ids,
         category_ids=category_ids,
     )
+    native_floor_penalty, native_floor_meta = _native_floor_penalty_arrays(items, motions)
     queries = [np.asarray(phrase.query, np.float32) for phrase in phrases]
     similarities = scheduler.precompute_music_similarity(
         router, queries, motion_desc, device
@@ -1315,6 +1323,8 @@ def choose_events_v34(
         base = base - rhythm_prior_penalty
         if len(source_prior_penalty) == len(base):
             base = base - source_prior_penalty
+        if len(native_floor_penalty) == len(base):
+            base = base - native_floor_penalty
 
         node_top_k = min(
             int(args.candidate_top_k),
@@ -1390,19 +1400,7 @@ def choose_events_v34(
             slot_duration_sec=slot_duration_sec,
             fps=int(getattr(args, "fps", 30)),
         )
-        source_diverse_shortlist, source_diverse_meta = (
-            _source_diverse_rescue_candidates(
-                feasible_indices=feasible_indices,
-                base=base,
-                source_uids=source_uids,
-                rhythm_features=rhythm_features,
-            )
-        )
-        shortlist = _unique_indices(
-            node_shortlist,
-            edge_hub_shortlist,
-            source_diverse_shortlist,
-        )
+        shortlist = _unique_indices(node_shortlist, edge_hub_shortlist)
         strict_expanded: List[Any] = []
         relaxed_expanded: List[Any] = []
         expanded: List[Any] = []
@@ -1948,15 +1946,13 @@ def choose_events_v34(
                     ),
                     "source_aware_meta": source_aware_meta,
                     "source_aware_prior_meta": source_prior_meta,
+                    "v40_native_floor_prior_meta": native_floor_meta,
+                    "v40_native_floor_penalty": float(native_floor_penalty[idx]) if len(native_floor_penalty) == len(base) else 0.0,
                     "candidate_top_k": int(args.candidate_top_k),
                     "graph_node_top_k": int(node_top_k),
                     "node_shortlist_size": int(len(node_shortlist)),
                     "edge_hub_shortlist_size": int(len(edge_hub_shortlist)),
                     "edge_hub_rescue_meta": edge_hub_meta,
-                    "source_diverse_shortlist_size": int(
-                        len(source_diverse_shortlist)
-                    ),
-                    "source_diverse_rescue_meta": source_diverse_meta,
                     "effective_shortlist_size": int(len(shortlist)),
                     "hierarchy_enabled": bool(args.hierarchical_retrieval),
                     "hierarchy_query_group": int(

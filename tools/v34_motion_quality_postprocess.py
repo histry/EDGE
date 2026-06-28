@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V39 contact-stability postprocess for EDGE / Dunhuang whole-song generation.
+"""V39C local floor-penetration IK postprocess for EDGE / Dunhuang whole-song generation.
 
 Drop-in replacement for tools/v34_motion_quality_postprocess.py.
 
-Compared with V38, this version keeps the three proven fixes
+Compared with V38/V39B, this version keeps the proven fixes
 (contact denoise, SmoothStep contact ramp, targeted low-pass), and adds:
 
 1) confidence + hysteresis contact inference:
@@ -17,6 +17,10 @@ Compared with V38, this version keeps the three proven fixes
 3) residual-only Butterworth filtering:
    low-pass only the IK/postprocess residual on selected joints, preserving the
    original low-frequency dance phrase while removing high-frequency IK jitter.
+4) local lower-body floor IK:
+   after root-y floor clearance, solve a constrained lower-body/root-y residual
+   only on penetrating frames, avoiding global pelvis lifting while removing
+   residual 10--20cm foot penetration.
 
 The file is intentionally self-contained so it can be copied directly into an
 existing EDGE checkout.  All new behavior is controlled by V39_* environment
@@ -813,6 +817,236 @@ def enforce_floor_clearance(
     }
 
 
+
+def _dilate_bool(mask: np.ndarray, radius: int) -> np.ndarray:
+    mask = mask.astype(bool)
+    radius = max(0, int(radius))
+    if radius <= 0 or len(mask) == 0:
+        return mask
+    out = mask.copy()
+    idx = np.flatnonzero(mask)
+    for i in idx:
+        s = max(0, i - radius)
+        e = min(len(mask), i + radius + 1)
+        out[s:e] = True
+    return out
+
+
+def local_floor_penetration_ik(
+    motion: np.ndarray,
+    enabled: bool,
+    margin: float,
+    collision_radius: float,
+    steps: int,
+    lr: float,
+    floor_weight: float,
+    root_weight: float,
+    rot_weight: float,
+    temporal_weight: float,
+    anatomy_weight: float,
+    max_root_delta: float,
+    context_frames: int,
+    device: str,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Constrained lower-body IK for residual foot-floor penetration.
+
+    The previous floor clearance stage moves root_y globally.  If large residual
+    penetration remains, further global lifting makes the whole dance float.  This
+    solver only opens a local optimisation window around penetrating frames and
+    adjusts lower-body 6D rotations plus a bounded root-y residual.  It preserves
+    the original motion with strong regularisation and temporal smoothness.
+    """
+    before_joints = _fk_from_t151_np(motion)
+    feet_y = before_joints[:, FOOT_JOINTS, 1]
+    q = float(np.clip(_ef("V34_FLOOR_QUANTILE", 0.03), 0.01, 0.45))
+    floor = float(_ef("V34_FLOOR_Y", float(np.quantile(feet_y.reshape(-1), q))))
+    target = floor + float(margin)
+    pen = np.maximum(0.0, target - feet_y)
+    frame_pen = np.max(pen, axis=1)
+    active = _dilate_bool(frame_pen > _ef("V39C_LOCAL_IK_TRIGGER_M", 0.015), context_frames)
+    before = {
+        "floor_y": floor,
+        "target_y": target,
+        "penetrating_frames": int(np.sum(frame_pen > 1e-6)),
+        "active_frames": int(np.sum(active)),
+        "max_penetration": float(np.max(frame_pen)) if len(frame_pen) else 0.0,
+        "mean_penetration": float(np.mean(frame_pen)) if len(frame_pen) else 0.0,
+    }
+    if (not enabled) or torch is None or before["active_frames"] == 0 or before["max_penetration"] <= _ef("V39C_LOCAL_IK_TRIGGER_M", 0.015) or steps <= 0:
+        return motion.astype(np.float32, copy=True), {"enabled": bool(enabled and torch is not None), "skipped": True, "before": before}
+
+    dev = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+    base = torch.as_tensor(motion.astype(np.float32), device=dev)
+    active_t = torch.as_tensor(active.astype(np.float32), device=dev).view(-1, 1)
+    lower_ids_np = _parse_joints(os.getenv("V40_FLOOR_IK_LOWER_JOINTS", "lhip,rhip,lknee,rknee,lankle,rankle"))
+    lower_ids = torch.as_tensor(lower_ids_np, dtype=torch.long, device=dev)
+    knee_ids = torch.as_tensor([i for i, jid in enumerate(lower_ids_np.tolist()) if int(jid) in (4, 5)], dtype=torch.long, device=dev)
+    orig_rot = base[:, 7:151].reshape(-1, 24, 6)[:, lower_ids].detach()
+    var_rot = orig_rot.clone().detach().requires_grad_(True)
+    root_delta = torch.zeros((base.shape[0], 1), dtype=base.dtype, device=dev, requires_grad=True)
+    opt = torch.optim.Adam([var_rot, root_delta], lr=float(lr))
+    target_t = torch.tensor(float(target), dtype=base.dtype, device=dev)
+    max_delta = float(max_root_delta)
+    last_loss = 0.0
+    for _ in range(int(steps)):
+        opt.zero_grad(set_to_none=True)
+        full = base[:, 7:151].reshape(-1, 24, 6).clone()
+        full[:, lower_ids] = var_rot
+        cand = base.clone()
+        rd = torch.clamp(root_delta, -0.02, max_delta)
+        cand[:, 5:6] = cand[:, 5:6] + rd * active_t
+        cand[:, 7:151] = full.reshape(-1, 144)
+        joints = _fk_torch(cand)
+        foot_y = joints[:, FOOT_JOINTS, 1]
+        penetration = torch.relu(target_t - foot_y)
+        w = 0.20 + 0.80 * active_t
+        loss_pen = torch.mean(w * penetration ** 2)
+        loss_root = torch.mean((rd * active_t) ** 2)
+        loss_rot = torch.mean((var_rot - orig_rot) ** 2)
+        loss_temp = torch.zeros((), dtype=base.dtype, device=dev)
+        if base.shape[0] > 2:
+            loss_temp = loss_temp + torch.mean((var_rot[1:] - var_rot[:-1]) ** 2)
+            loss_temp = loss_temp + torch.mean((rd[1:] - rd[:-1]) ** 2)
+        loss_ana = torch.zeros((), dtype=base.dtype, device=dev)
+        if _enabled("V40_ANATOMY_KNEE_GUARD", "1") and knee_ids.numel() > 0:
+            knee_m = _rot6d_to_matrix_torch(var_rot[:, knee_ids])
+            # Conservative Euler-Y pitch proxy.  In this EDGE/SMPL layout, positive
+            # pitch is treated as the unsafe knee-fold direction by default.
+            pitch = torch.atan2(-knee_m[..., 2, 0], torch.sqrt(knee_m[..., 0, 0] ** 2 + knee_m[..., 1, 0] ** 2 + 1e-8))
+            max_pitch = float(_ef("V40_KNEE_MAX_POSITIVE_PITCH_RAD", 0.0))
+            if os.getenv("V40_KNEE_BAD_PITCH_SIGN", "positive").lower() == "negative":
+                loss_ana = torch.mean((active_t.view(-1, 1) * torch.relu(-pitch - max_pitch)) ** 2)
+            else:
+                loss_ana = torch.mean((active_t.view(-1, 1) * torch.relu(pitch - max_pitch)) ** 2)
+        loss = (
+            float(floor_weight) * loss_pen
+            + float(root_weight) * loss_root
+            + float(rot_weight) * loss_rot
+            + float(temporal_weight) * loss_temp
+            + float(anatomy_weight) * loss_ana
+        )
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            root_delta.clamp_(-0.02, max_delta)
+            var_rot.copy_(_normalize_6d_torch(var_rot))
+        last_loss = float(loss.detach().cpu())
+
+    with torch.no_grad():
+        out = motion.astype(np.float32, copy=True)
+        rot = out[:, 7:151].reshape(-1, 24, 6)
+        rot[:, lower_ids_np] = var_rot.detach().cpu().numpy()
+        out[:, 7:151] = _normalize_6d(rot).reshape(-1, 144)
+        rd_np = torch.clamp(root_delta, -0.02, max_delta).detach().cpu().numpy()[:, 0] * active.astype(np.float32)
+        rd_np = _moving_average(rd_np[:, None], _ei("V39C_LOCAL_IK_ROOT_SMOOTH", 5))[:, 0]
+        out[:, 5] += rd_np.astype(np.float32)
+    after_joints = _fk_from_t151_np(out)
+    after_pen = np.maximum(0.0, target - after_joints[:, FOOT_JOINTS, 1])
+    after_frame = np.max(after_pen, axis=1)
+    return out, {
+        "enabled": True,
+        "version": "v39c_local_lower_body_floor_ik",
+        "device": str(dev),
+        "steps": int(steps),
+        "lr": float(lr),
+        "before": before,
+        "after": {
+            "penetrating_frames": int(np.sum(after_frame > 1e-6)),
+            "max_penetration": float(np.max(after_frame)) if len(after_frame) else 0.0,
+            "mean_penetration": float(np.mean(after_frame)) if len(after_frame) else 0.0,
+        },
+        "root_delta_mean": float(np.mean(np.abs(rd_np))) if len(out) else 0.0,
+        "root_delta_max": float(np.max(np.abs(rd_np))) if len(out) else 0.0,
+        "lower_joint_ids": [int(x) for x in lower_ids_np.tolist()],
+        "last_loss": float(last_loss),
+        "weights": {"floor": float(floor_weight), "root": float(root_weight), "rotation": float(rot_weight), "temporal": float(temporal_weight), "anatomy": float(anatomy_weight)},
+        "anatomy_guard": {"enabled": _enabled("V40_ANATOMY_KNEE_GUARD", "1"), "bad_pitch_sign": os.getenv("V40_KNEE_BAD_PITCH_SIGN", "positive")},
+    }
+
+
+def ankle_pitch_clamp_swing_toes(
+    motion: np.ndarray,
+    enabled: bool,
+    margin: float,
+    max_angle_deg: float,
+    foot_length: float,
+    contact_threshold: float,
+    contact_max: float,
+    angle_smooth_window: int,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Swing-foot toe unclamping for non-contact toe penetration.
+
+    This is deliberately conservative: it only touches ankle rotations when toe
+    penetration occurs while both ankle/toe contact confidence is low.  For each
+    side it tries both pitch signs and keeps the sign only if FK penetration
+    improves, preventing coordinate-convention mistakes from hurting outputs.
+    """
+    before_joints = _fk_from_t151_np(motion)
+    feet_y = before_joints[:, FOOT_JOINTS, 1]
+    q = float(np.clip(_ef("V34_FLOOR_QUANTILE", 0.03), 0.01, 0.45))
+    floor = float(_ef("V34_FLOOR_Y", float(np.quantile(feet_y.reshape(-1), q))))
+    target = floor + float(margin)
+    before_pen = np.maximum(0.0, target - feet_y)
+    before_frame = np.max(before_pen, axis=1)
+    if not enabled or len(motion) < 3:
+        return motion.astype(np.float32, copy=True), {"enabled": bool(enabled), "skipped": True, "before_max_penetration": float(np.max(before_frame)) if len(before_frame) else 0.0}
+    _, conf, _ = _contact_confidence(
+        motion, contact_threshold, 1,
+        _ei("V38_CONTACT_MEDIAN_SIZE", 5),
+        _ei("V38_CONTACT_CLOSE_HOLES", 7),
+        _ei("V38_CONTACT_OPEN_SPIKES", 4),
+        True, _ef("V39_CONTACT_ON_THRESHOLD", 0.58), _ef("V39_CONTACT_OFF_THRESHOLD", 0.42),
+    )
+    base = motion.astype(np.float32, copy=True)
+    best = base.copy()
+    best_pen = before_frame.copy()
+    changed = np.zeros((len(base), 2), dtype=bool)
+    angles_used = np.zeros((len(base), 2), dtype=np.float32)
+    side_specs = [(0, 7, 10, [0, 2]), (1, 8, 11, [1, 3])]
+    max_rad = np.deg2rad(float(max_angle_deg))
+    for side, ankle_j, toe_j, contact_cols in side_specs:
+        toe_col = 2 if side == 0 else 3
+        deficit = np.maximum(0.0, target - before_joints[:, toe_j, 1])
+        low_contact = np.max(conf[:, contact_cols], axis=1) <= float(contact_max)
+        mask = (deficit > _ef("V40_ANKLE_CLAMP_TRIGGER_M", 0.012)) & low_contact
+        if not np.any(mask):
+            continue
+        raw_angle = np.minimum(max_rad, np.arcsin(np.clip(deficit / max(float(foot_length), 1e-6), 0.0, 0.98))).astype(np.float32)
+        raw_angle[~mask] = 0.0
+        raw_angle = _moving_average(raw_angle[:, None], angle_smooth_window)[:, 0]
+        for sign in (1.0, -1.0):
+            cand = best.copy()
+            rot = cand[:, 7:151].reshape(len(cand), 24, 6)
+            mat = _rot6d_to_matrix_np(rot[:, ankle_j])
+            rx = _rot_x_np(sign * raw_angle)
+            mat2 = np.matmul(mat, rx)
+            rot[:, ankle_j] = _matrix_to_6d_np(mat2)
+            cand[:, 7:151] = _normalize_6d(rot).reshape(len(cand), 144)
+            joints = _fk_from_t151_np(cand)
+            pen = np.max(np.maximum(0.0, target - joints[:, FOOT_JOINTS, 1]), axis=1)
+            improve = mask & (pen + 1e-7 < best_pen)
+            if np.any(improve):
+                best[improve] = cand[improve]
+                best_pen[improve] = pen[improve]
+                changed[improve, side] = True
+                angles_used[improve, side] = sign * raw_angle[improve]
+    after_pen = best_pen
+    return best.astype(np.float32), {
+        "enabled": True,
+        "version": "v40_swing_toe_ankle_pitch_clamp",
+        "floor_y": float(floor),
+        "target_y": float(target),
+        "max_angle_deg": float(max_angle_deg),
+        "foot_length": float(foot_length),
+        "contact_max": float(contact_max),
+        "changed_frames": int(np.sum(np.any(changed, axis=1))),
+        "changed_left": int(np.sum(changed[:, 0])),
+        "changed_right": int(np.sum(changed[:, 1])),
+        "mean_abs_angle_deg": float(np.rad2deg(np.mean(np.abs(angles_used[changed])))) if np.any(changed) else 0.0,
+        "before": {"max_penetration": float(np.max(before_frame)) if len(before_frame) else 0.0, "penetrating_frames": int(np.sum(before_frame > 1e-6))},
+        "after": {"max_penetration": float(np.max(after_pen)) if len(after_pen) else 0.0, "penetrating_frames": int(np.sum(after_pen > 1e-6))},
+    }
+
 def smooth_rotations_only(motion: np.ndarray, rotation_window: int, strength: float) -> np.ndarray:
     out = motion.astype(np.float32, copy=True)
     strength = float(np.clip(strength, 0, 1))
@@ -832,6 +1066,27 @@ def _rot6d_to_matrix_torch(x):
     b2 = b2 / torch.clamp(torch.linalg.norm(b2, dim=-1, keepdim=True), min=1e-8)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack([b1, b2, b3], dim=-1)
+
+
+def _normalize_6d_torch(x):
+    m = _rot6d_to_matrix_torch(x)
+    return torch.cat([m[..., 0], m[..., 1]], dim=-1)
+
+
+def _matrix_to_6d_np(m):
+    return np.concatenate([m[..., 0], m[..., 1]], axis=-1).astype(np.float32)
+
+
+def _rot_x_np(angle: np.ndarray) -> np.ndarray:
+    angle = np.asarray(angle, dtype=np.float32)
+    c = np.cos(angle); s = np.sin(angle)
+    m = np.zeros(angle.shape + (3, 3), dtype=np.float32)
+    m[..., 0, 0] = 1.0
+    m[..., 1, 1] = c
+    m[..., 1, 2] = -s
+    m[..., 2, 1] = s
+    m[..., 2, 2] = c
+    return m
 
 
 def _fk_torch(motion):
@@ -1049,6 +1304,28 @@ def process_file(args: argparse.Namespace) -> Dict[str, Any]:
         args.contact_close_holes,
         args.contact_open_spikes,
     )
+    motion, local_floor_ik = local_floor_penetration_ik(
+        motion,
+        bool(args.local_floor_ik),
+        args.floor_margin,
+        args.collision_radius,
+        args.local_floor_ik_steps,
+        args.local_floor_ik_lr,
+        args.local_floor_ik_floor_weight,
+        args.local_floor_ik_root_weight,
+        args.local_floor_ik_rot_weight,
+        args.local_floor_ik_temporal_weight,
+        args.local_floor_ik_anatomy_weight,
+        args.local_floor_ik_max_root_delta,
+        args.local_floor_ik_context_frames,
+        args.device,
+    )
+    motion, ankle_clamp = ankle_pitch_clamp_swing_toes(
+        motion, bool(args.ankle_pitch_clamp), args.floor_margin,
+        args.ankle_pitch_clamp_max_deg, args.ankle_pitch_clamp_foot_len,
+        args.contact_threshold, args.ankle_pitch_clamp_contact_max,
+        args.ankle_pitch_clamp_smooth_window,
+    )
     before_butter = motion.copy()
     before_butter_audit = _quality_audit(before_butter, **qargs)
     motion, butter_sum = butterworth_lowpass_rotations(
@@ -1085,7 +1362,7 @@ def process_file(args: argparse.Namespace) -> Dict[str, Any]:
     post = _quality_audit(motion, **qargs)
     reject = _quality_rejection_signal(post)
     summary = {
-        "version": "v39b_footplant_gated_contact_stability",
+        "version": "v40_floor_aware_leg_ik_native_floor_clean",
         "input": str(src),
         "output": str(out_path),
         "frames": int(len(motion)),
@@ -1104,6 +1381,8 @@ def process_file(args: argparse.Namespace) -> Dict[str, Any]:
         "collision_aware_ik": collision,
         "contact_lock": contact,
         "floor_clearance": floor,
+        "local_floor_ik": local_floor_ik,
+        "ankle_pitch_clamp": ankle_clamp,
         "butterworth_filter": butter_sum,
         "rotation_smooth": {"enabled": bool(args.smooth), "note": "global smooth kept optional; V39 prefers residual low-pass"},
         "root_xz_delta_mean": float(np.mean(np.linalg.norm(motion[:, [4, 6]] - original[:, [4, 6]], axis=1))) if len(motion) else 0.0,
@@ -1152,6 +1431,21 @@ def main() -> None:
     p.add_argument("--floor_smooth_window", type=int, default=_ei("V34_FLOOR_SMOOTH_WINDOW", 7))
     p.add_argument("--floor_max_lift", type=float, default=_ef("V34_FLOOR_MAX_LIFT", 0.18))
     p.add_argument("--floor_support_damping", type=float, default=_ef("V34_FLOOR_SUPPORT_DAMPING", 0.25))
+    p.add_argument("--local_floor_ik", type=int, default=_ei("V40_FLOOR_AWARE_LEG_IK", _ei("V39C_LOCAL_FLOOR_IK", 1)))
+    p.add_argument("--local_floor_ik_steps", type=int, default=_ei("V40_FLOOR_IK_STEPS", _ei("V39C_LOCAL_IK_STEPS", 15)))
+    p.add_argument("--local_floor_ik_lr", type=float, default=_ef("V40_FLOOR_IK_LR", _ef("V39C_LOCAL_IK_LR", 0.015)))
+    p.add_argument("--local_floor_ik_floor_weight", type=float, default=_ef("V40_FLOOR_IK_FLOOR_WEIGHT", 12.0))
+    p.add_argument("--local_floor_ik_root_weight", type=float, default=_ef("V40_FLOOR_IK_ROOT_WEIGHT", _ef("V39C_LOCAL_IK_ROOT_WEIGHT", 0.08)))
+    p.add_argument("--local_floor_ik_rot_weight", type=float, default=_ef("V40_FLOOR_IK_ROT_WEIGHT", _ef("V39C_LOCAL_IK_ROT_WEIGHT", 0.80)))
+    p.add_argument("--local_floor_ik_temporal_weight", type=float, default=_ef("V40_FLOOR_IK_TEMPORAL_WEIGHT", _ef("V39C_LOCAL_IK_TEMPORAL_WEIGHT", 0.05)))
+    p.add_argument("--local_floor_ik_anatomy_weight", type=float, default=_ef("V40_FLOOR_IK_ANATOMY_WEIGHT", 20.0))
+    p.add_argument("--local_floor_ik_max_root_delta", type=float, default=_ef("V40_FLOOR_IK_MAX_ROOT_DELTA", _ef("V39C_LOCAL_IK_MAX_ROOT_DELTA", 0.10)))
+    p.add_argument("--local_floor_ik_context_frames", type=int, default=_ei("V40_FLOOR_IK_CONTEXT_FRAMES", _ei("V39C_LOCAL_IK_CONTEXT_FRAMES", 4)))
+    p.add_argument("--ankle_pitch_clamp", type=int, default=_ei("V40_ANKLE_PITCH_CLAMP", 1))
+    p.add_argument("--ankle_pitch_clamp_max_deg", type=float, default=_ef("V40_ANKLE_CLAMP_MAX_DEG", 22.0))
+    p.add_argument("--ankle_pitch_clamp_foot_len", type=float, default=_ef("V40_ANKLE_CLAMP_FOOT_LENGTH", 0.16))
+    p.add_argument("--ankle_pitch_clamp_contact_max", type=float, default=_ef("V40_ANKLE_CLAMP_CONTACT_MAX", 0.25))
+    p.add_argument("--ankle_pitch_clamp_smooth_window", type=int, default=_ei("V40_ANKLE_CLAMP_SMOOTH_WINDOW", 5))
     p.add_argument("--smooth", type=int, default=_ei("V34_OUTPUT_SMOOTH", 0))
     p.add_argument("--rotation_smooth_window", type=int, default=3)
     p.add_argument("--smooth_strength", type=float, default=0.20)
