@@ -69,5 +69,8 @@ export V40_NATIVE_FLOOR_REMOVE_THRESHOLD=${V40_NATIVE_FLOOR_REMOVE_THRESHOLD:-0.
 
 echo "[V40] floor-aware leg IK + native-floor RAG env loaded"
 
-# Ensure project modules are importable when tools/*.py are executed directly
-export PYTHONPATH="${EDGE_ROOT:-/home/disk/lsm/storage/EDGE}${PYTHONPATH:+:$PYTHONPATH}"
+
+# Ensure EDGE project modules are importable
+export EDGE_ROOT="${EDGE_ROOT:-/home/disk/lsm/storage/EDGE}"
+export PYTHONPATH="${EDGE_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+
