@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export V46_ENABLE_TRUE_IK=1
+export V46_DEVICE="${V46_DEVICE:-cuda}"
+export V46_ENABLE_ROOT_Y_PHYSICS="${V46_ENABLE_ROOT_Y_PHYSICS:-1}"
+export V46_IK_SLIDE_RELEASE_M="${V46_IK_SLIDE_RELEASE_M:-0.12}"
+CFG="configs/v46_motionrag_diff_config.json"
+INPUT="${1:?usage: bash scripts/run_v43_true_ik_on_existing_motion.sh input.npy [output.npy]}"
+OUTPUT="${2:-${INPUT%.npy}_v43_TRUE_LB_IK.npy}"
+JSON="${OUTPUT%.npy}.v43_true_ik.json"
+python tools/v46_motionrag_diff.py --config "$CFG" ik --input "$INPUT" --output "$OUTPUT" --json "$JSON"
+echo "[V43 TRUE IK] $OUTPUT"
+echo "[REPORT]      $JSON"
