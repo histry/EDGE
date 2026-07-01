@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.9 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
+V46.11 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
 ==================================================================
 
 This file is designed as a drop-in research patch for an EDGE-style repository.
@@ -15,7 +15,7 @@ Core versions included:
 - V44: music-motion contrastive learning for retrieval alignment.
 - V45: residual temporal Motion Refiner to escape pure stitching.
 - V46: retrieval-augmented conditional residual diffusion with IK finalization.
-- V46.9 safety and project-alignment fixes: direct Chang-E BVH loading, 210fps-to-30fps resampling, filename-aware source semantics, optional manifest-aware metadata, unpaired slot-to-event semantic grounding, capped C1 landing damping, biological max-flight fuse, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
+- V46.11 canonical Chang-E semantic normalization plus V46.11 strong classification semantics and V46.9 project-alignment fixes: direct Chang-E BVH loading, 210fps-to-30fps resampling, filename-aware source semantics, optional manifest-aware metadata, unpaired slot-to-event semantic grounding, capped C1 landing damping, biological max-flight fuse, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
 
 Expected EDGE 151D convention
 -----------------------------
@@ -44,6 +44,7 @@ import math
 import os
 import pickle
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -599,6 +600,13 @@ class V46Config:
     filename_semantic_weight: float = 0.35
     filename_semantic_retrieval_weight: float = 0.20
     filename_semantic_ot_weight: float = 0.35
+    # V46.11: stronger multi-label RAG action semantics and music alignment labels.
+    classification_semantic_enable: bool = True
+    classification_semantic_ratio: float = 0.70
+    classification_retrieval_weight: float = 0.34
+    classification_ot_weight: float = 0.45
+    classification_retrieval_bonus: float = 0.28
+    classification_report_topk: int = 8
 
     embed_dim: int = 128
     top_k: int = 32
@@ -738,6 +746,12 @@ class V46Config:
             "V46_FILENAME_SEMANTIC_WEIGHT": ("filename_semantic_weight", float),
             "V46_FILENAME_SEMANTIC_RETRIEVAL_WEIGHT": ("filename_semantic_retrieval_weight", float),
             "V46_FILENAME_SEMANTIC_OT_WEIGHT": ("filename_semantic_ot_weight", float),
+            "V46_CLASSIFICATION_SEMANTIC_ENABLE": ("classification_semantic_enable", lambda x: bool(int(x))),
+            "V46_CLASSIFICATION_SEMANTIC_RATIO": ("classification_semantic_ratio", float),
+            "V46_CLASSIFICATION_RETRIEVAL_WEIGHT": ("classification_retrieval_weight", float),
+            "V46_CLASSIFICATION_OT_WEIGHT": ("classification_ot_weight", float),
+            "V46_CLASSIFICATION_RETRIEVAL_BONUS": ("classification_retrieval_bonus", float),
+            "V46_CLASSIFICATION_REPORT_TOPK": ("classification_report_topk", int),
             "V46_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
             "V46_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
         }
@@ -842,7 +856,7 @@ CHANG_E_CATEGORY_PROFILES: Dict[str, Dict[str, object]] = {
         "turn": 0.12, "travel": 0.45, "calmness": 0.52,
     },
     "revelation_meditation": {
-        "aliases": {"meditation", "revelation", "revelation_meditation"},
+        "aliases": {"meditation", "mediation", "revelation", "revelation_meditation", "revelation_mediation"},
         "display": "Revelation Meditation",
         "semantic_role": "calm_meditative_flow",
         "energy": 0.18, "onset": 0.05, "lower": 0.18, "upper": 0.28,
@@ -870,6 +884,296 @@ CHANG_E_CATEGORY_PROFILES: Dict[str, Dict[str, object]] = {
         "turn": 0.70, "travel": 0.58, "calmness": 0.25,
     },
 }
+
+
+# V46.11: stronger classification semantics for Chang-E motion-only BVH.
+# The taxonomy is deliberately multi-label: a source file name gives the primary
+# dance family, while motion descriptors keep event-level dynamics.  This lets
+# the RAG router use interpretable labels without pretending that filename tags
+# are paired music supervision.
+ENERGY_LABELS = ("calm", "moderate", "high", "percussive")
+RHYTHM_LABELS = ("sustained", "lyrical", "accented", "percussive")
+BODY_FOCUS_LABELS = ("pose", "lower_body", "upper_body", "full_body", "turning_flow")
+SPATIAL_LABELS = ("in_place", "traveling", "turning")
+MUSIC_ALIGNMENT_LABELS = (
+    "calm_meditative", "lyrical_flow", "pose_hold", "instrument_phrase",
+    "percussive_accent", "turning_climax", "footwork_flow",
+)
+
+CATEGORY_CLASS_OVERRIDES: Dict[str, Dict[str, object]] = {
+    "thirty_six_postures": {
+        "energy_label": "moderate",
+        "rhythm_label": "sustained",
+        "body_focus_label": "pose",
+        "spatial_label": "in_place",
+        "music_alignment_label": "pose_hold",
+        "music_alignment_tags": ["pose_hold", "calm_meditative", "lyrical_flow"],
+        "preferred_music_roles": ["intro", "normal", "release", "calm"],
+        "preferred_dance_keys": ["thirty_six_postures", "lotus_steps", "revelation_meditation"],
+    },
+    "lotus_steps": {
+        "energy_label": "moderate",
+        "rhythm_label": "lyrical",
+        "body_focus_label": "lower_body",
+        "spatial_label": "traveling",
+        "music_alignment_label": "footwork_flow",
+        "music_alignment_tags": ["footwork_flow", "lyrical_flow", "calm_meditative"],
+        "preferred_music_roles": ["normal", "release", "calm"],
+        "preferred_dance_keys": ["lotus_steps", "ribbon_flow", "thirty_six_postures"],
+    },
+    "revelation_meditation": {
+        "energy_label": "calm",
+        "rhythm_label": "sustained",
+        "body_focus_label": "full_body",
+        "spatial_label": "in_place",
+        "music_alignment_label": "calm_meditative",
+        "music_alignment_tags": ["calm_meditative", "pose_hold"],
+        "preferred_music_roles": ["intro", "calm", "release"],
+        "preferred_dance_keys": ["revelation_meditation", "thirty_six_postures", "lotus_steps"],
+    },
+    "pipa_behind_back": {
+        "energy_label": "moderate",
+        "rhythm_label": "accented",
+        "body_focus_label": "upper_body",
+        "spatial_label": "in_place",
+        "music_alignment_label": "instrument_phrase",
+        "music_alignment_tags": ["instrument_phrase", "lyrical_flow", "percussive_accent"],
+        "preferred_music_roles": ["normal", "build_up", "climax"],
+        "preferred_dance_keys": ["pipa_behind_back", "ribbon_flow", "lei_gong_drum"],
+    },
+    "lei_gong_drum": {
+        "energy_label": "percussive",
+        "rhythm_label": "percussive",
+        "body_focus_label": "full_body",
+        "spatial_label": "traveling",
+        "music_alignment_label": "percussive_accent",
+        "music_alignment_tags": ["percussive_accent", "turning_climax"],
+        "preferred_music_roles": ["build_up", "climax"],
+        "preferred_dance_keys": ["lei_gong_drum", "pipa_behind_back", "ribbon_flow"],
+    },
+    "ribbon_flow": {
+        "energy_label": "high",
+        "rhythm_label": "lyrical",
+        "body_focus_label": "turning_flow",
+        "spatial_label": "turning",
+        "music_alignment_label": "turning_climax",
+        "music_alignment_tags": ["turning_climax", "lyrical_flow", "footwork_flow"],
+        "preferred_music_roles": ["normal", "build_up", "climax"],
+        "preferred_dance_keys": ["ribbon_flow", "lotus_steps", "pipa_behind_back"],
+    },
+}
+
+
+def canonicalize_chang_e_key(key: object) -> str:
+    """Canonicalize Chang-E category names for semantic RAG.
+
+    The released/local filenames may contain spelling variants such as
+    ``female_mediation.bvh``.  Source fields keep the raw filename for
+    auditability, but all internal action/music labels should use the
+    Chang-E paper terminology: ``revelation_meditation``.
+    """
+    key_s = str(key or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
+    try:
+        key_s = re.sub(r"_take\d+$", "", key_s)
+    except Exception:
+        pass
+    aliases = {
+        "mediation": "revelation_meditation",
+        "female_mediation": "revelation_meditation",
+        "male_mediation": "revelation_meditation",
+        "revelation_mediation": "revelation_meditation",
+        "meditation": "revelation_meditation",
+    }
+    if key_s in aliases:
+        return aliases[key_s]
+    for k, prof in CHANG_E_CATEGORY_PROFILES.items():
+        if key_s == k or key_s in set(prof.get("aliases", set())):
+            return k
+    return key_s
+
+
+def _safe_profile_key(meta: dict) -> str:
+    key = meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or "unknown"
+    return canonicalize_chang_e_key(key)
+
+
+def _label_index(label: str, labels: Sequence[str]) -> int:
+    try:
+        return list(labels).index(str(label))
+    except ValueError:
+        return -1
+
+
+def strong_action_semantics_from_meta(meta: dict, desc: Optional[np.ndarray] = None) -> Dict[str, object]:
+    """Return multi-label semantic metadata for an event.
+
+    Filename category gives a stable cultural prior; descriptor statistics refine
+    it at event level.  The labels are used for reporting and RAG routing, not as
+    ground-truth paired music supervision.
+    """
+    key = _safe_profile_key(meta)
+    prof = dict(CATEGORY_CLASS_OVERRIDES.get(key, {}))
+    base_prof = CHANG_E_CATEGORY_PROFILES.get(key, {})
+    energy = float(base_prof.get("energy", 0.40))
+    onset = float(base_prof.get("onset", 0.20))
+    travel = float(base_prof.get("travel", 0.25))
+    turn = float(base_prof.get("turn", 0.15))
+    lower = float(base_prof.get("lower", energy))
+    upper = float(base_prof.get("upper", energy))
+    calm = float(base_prof.get("calmness", max(0.0, 0.75 - energy)))
+    if desc is not None and len(desc) >= 19:
+        # Normalize rough descriptor channels into semantic refiners.  This is
+        # intentionally weak: filename category remains the cultural prior.
+        travel = max(travel, float(np.clip(desc[1] / 1.5, 0.0, 1.0)))
+        energy = max(energy, float(np.clip(desc[5] / 0.18, 0.0, 1.0)))
+        lower = max(lower, float(np.clip(desc[7] / 0.12, 0.0, 1.0)))
+        upper = max(upper, float(np.clip(desc[8] / 0.12, 0.0, 1.0)))
+        turn = max(turn, float(np.clip(abs(desc[17]) / 0.25, 0.0, 1.0)))
+        calm = max(0.0, min(calm, 1.0 - min(0.9, energy * 0.65))) if energy > 0.65 else calm
+    if "energy_label" not in prof:
+        prof["energy_label"] = "calm" if energy < 0.28 else ("high" if energy > 0.62 else "moderate")
+    if "rhythm_label" not in prof:
+        prof["rhythm_label"] = "percussive" if onset > 0.55 else ("accented" if onset > 0.30 else ("sustained" if calm > 0.65 else "lyrical"))
+    if "body_focus_label" not in prof:
+        if turn > 0.58:
+            prof["body_focus_label"] = "turning_flow"
+        elif upper > lower * 1.35:
+            prof["body_focus_label"] = "upper_body"
+        elif lower > upper * 1.25:
+            prof["body_focus_label"] = "lower_body"
+        else:
+            prof["body_focus_label"] = "full_body"
+    if "spatial_label" not in prof:
+        prof["spatial_label"] = "turning" if turn > 0.55 else ("traveling" if travel > 0.40 else "in_place")
+    if "music_alignment_label" not in prof:
+        if calm > 0.72:
+            prof["music_alignment_label"] = "calm_meditative"
+        elif onset > 0.55:
+            prof["music_alignment_label"] = "percussive_accent"
+        elif turn > 0.58:
+            prof["music_alignment_label"] = "turning_climax"
+        elif str(prof.get("body_focus_label")) == "upper_body":
+            prof["music_alignment_label"] = "instrument_phrase"
+        else:
+            prof["music_alignment_label"] = "lyrical_flow"
+    tags = list(dict.fromkeys([str(prof.get("music_alignment_label"))] + [str(x) for x in prof.get("music_alignment_tags", [])]))
+    prof["music_alignment_tags"] = tags
+    prof.setdefault("preferred_music_roles", ["normal"])
+    prof.setdefault("preferred_dance_keys", [key])
+    prof["classification_text"] = (
+        f"action={key}; energy={prof.get('energy_label')}; rhythm={prof.get('rhythm_label')}; "
+        f"body={prof.get('body_focus_label')}; spatial={prof.get('spatial_label')}; "
+        f"music_align={prof.get('music_alignment_label')}"
+    )
+    return prof
+
+
+def class_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = None) -> np.ndarray:
+    """A 32D classification prior aligned with audio slot feature channels.
+
+    This is stronger than the old name_semantic vector because it encodes
+    multi-label action family, energy/rhythm/body-focus/spatial/music-affinity.
+    It remains 32D to keep V44/V46 checkpoints compatible with the existing MLPs.
+    """
+    key = _safe_profile_key(meta)
+    base = filename_semantic_vector_from_meta(meta, cfg).copy()
+    cls = strong_action_semantics_from_meta(meta)
+    energy_i = _label_index(str(cls.get("energy_label")), ENERGY_LABELS)
+    rhythm_i = _label_index(str(cls.get("rhythm_label")), RHYTHM_LABELS)
+    body_i = _label_index(str(cls.get("body_focus_label")), BODY_FOCUS_LABELS)
+    spatial_i = _label_index(str(cls.get("spatial_label")), SPATIAL_LABELS)
+    align_i = _label_index(str(cls.get("music_alignment_label")), MUSIC_ALIGNMENT_LABELS)
+    # High-level one-hot / ordinal labels in high channels; low channels still
+    # preserve slot-compatible continuous semantics.
+    base[22] = 0.0 if energy_i < 0 else energy_i / max(1, len(ENERGY_LABELS) - 1)
+    base[23] = 0.0 if rhythm_i < 0 else rhythm_i / max(1, len(RHYTHM_LABELS) - 1)
+    base[24] = 0.0 if body_i < 0 else body_i / max(1, len(BODY_FOCUS_LABELS) - 1)
+    base[25] = 0.0 if spatial_i < 0 else spatial_i / max(1, len(SPATIAL_LABELS) - 1)
+    base[26] = 0.0 if align_i < 0 else align_i / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
+    # Category-specific compact code; stable across rebuilds.
+    known = list(CHANG_E_CATEGORY_PROFILES.keys())
+    ci = known.index(key) if key in known else -1
+    base[27] = 0.0 if ci < 0 else ci / max(1, len(known) - 1)
+    # Explicit affinity bits used by retrieval fallback.
+    tags = set(str(x) for x in cls.get("music_alignment_tags", []))
+    base[28] = 1.0 if "calm_meditative" in tags or str(cls.get("energy_label")) == "calm" else 0.0
+    base[29] = 1.0 if "percussive_accent" in tags or str(cls.get("rhythm_label")) == "percussive" else 0.0
+    base[30] = 1.0 if "turning_climax" in tags or str(cls.get("spatial_label")) == "turning" else 0.0
+    base[31] = 1.0
+    return base.astype(np.float32)
+
+
+def audio_slot_classification_from_pseudo(pseudo: np.ndarray, duration: float, energy: float, onset: float, dyn: float) -> Dict[str, object]:
+    """Infer slot-level music labels for unpaired alignment and schedule reports."""
+    if energy < 0.035 and onset < 0.015:
+        label = "calm_meditative"
+        role = "calm"
+        preferred = ["revelation_meditation", "thirty_six_postures", "lotus_steps"]
+    elif onset > 0.10 or (energy > 0.08 and dyn > 0.04):
+        label = "percussive_accent"
+        role = "climax" if energy > 0.08 else "build_up"
+        preferred = ["lei_gong_drum", "pipa_behind_back", "ribbon_flow"]
+    elif energy > 0.065:
+        label = "turning_climax"
+        role = "build_up"
+        preferred = ["ribbon_flow", "pipa_behind_back", "lei_gong_drum"]
+    elif duration > 5.0 and energy < 0.055:
+        label = "pose_hold"
+        role = "release"
+        preferred = ["thirty_six_postures", "revelation_meditation", "lotus_steps"]
+    else:
+        label = "lyrical_flow"
+        role = "normal"
+        preferred = ["lotus_steps", "thirty_six_postures", "ribbon_flow", "pipa_behind_back"]
+    if label == "percussive_accent":
+        energy_label, rhythm_label = "high", "percussive"
+    elif label == "calm_meditative":
+        energy_label, rhythm_label = "calm", "sustained"
+    elif label == "pose_hold":
+        energy_label, rhythm_label = "calm", "sustained"
+    else:
+        energy_label, rhythm_label = "moderate", "lyrical"
+    return {
+        "role": role,
+        "music_alignment_label": label,
+        "energy_label": energy_label,
+        "rhythm_label": rhythm_label,
+        "preferred_dance_keys": preferred,
+        "preferred_semantic_roles": [CHANG_E_CATEGORY_PROFILES.get(k, {}).get("semantic_role", CATEGORY_CLASS_OVERRIDES.get(k, {}).get("semantic_role", "")) for k in preferred],
+    }
+
+
+def semantic_label_match_bonus(slot: dict, db: dict, cfg: V46Config) -> np.ndarray:
+    """Compute interpretable class-prior bonus for slot-to-event retrieval."""
+    n = len(db.get("paths", []))
+    bonus = np.zeros(n, dtype=np.float32)
+    if not bool(getattr(cfg, "classification_semantic_enable", True)) or n == 0:
+        return bonus
+    dance_keys = np.asarray(db.get("dance_keys", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    roles = np.asarray(db.get("semantic_roles", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    energy = np.asarray(db.get("energy_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    rhythm = np.asarray(db.get("rhythm_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    align = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    preferred = [str(x) for x in slot.get("preferred_dance_keys", [])]
+    preferred_roles = [str(x) for x in slot.get("preferred_semantic_roles", [])]
+    slot_align = str(slot.get("music_alignment_label", ""))
+    slot_energy = str(slot.get("energy_label", ""))
+    slot_rhythm = str(slot.get("rhythm_label", ""))
+    for k in preferred:
+        bonus += (dance_keys == k).astype(np.float32) * 1.00
+    for r in preferred_roles:
+        if r:
+            bonus += (roles == r).astype(np.float32) * 0.45
+    if slot_align:
+        bonus += (align == slot_align).astype(np.float32) * 0.70
+    if slot_energy:
+        bonus += (energy == slot_energy).astype(np.float32) * 0.25
+    if slot_rhythm:
+        bonus += (rhythm == slot_rhythm).astype(np.float32) * 0.20
+    # Normalize so the configured weight is comparable across slots.
+    if bonus.max() > 1e-6:
+        bonus = bonus / float(bonus.max())
+    return bonus.astype(np.float32)
 
 
 def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
@@ -905,7 +1209,9 @@ def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
             category_key = key
             break
     if category_key == "unknown":
-        category_key = base or "unknown"
+        category_key = canonicalize_chang_e_key(base or "unknown")
+    else:
+        category_key = canonicalize_chang_e_key(category_key)
 
     prof = CHANG_E_CATEGORY_PROFILES.get(category_key, {})
     display = str(prof.get("display", category_key.replace("_", " ").title()))
@@ -954,9 +1260,7 @@ def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = No
     that e.g. drum should prefer onset-rich slots and meditation should prefer
     calm slots.
     """
-    key = str(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or "unknown")
-    # Strip take suffix if needed.
-    key = re.sub(r"_take\d+$", "", key)
+    key = canonicalize_chang_e_key(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or "unknown")
     prof = CHANG_E_CATEGORY_PROFILES.get(key, {})
     duration = float(meta.get("duration", 0.0) or 0.0)
     energy = float(prof.get("energy", 0.40))
@@ -1008,17 +1312,32 @@ def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = No
 
 
 def motion_feature_z_for_alignment(db: dict, cfg: V46Config, weight: Optional[float] = None) -> np.ndarray:
-    """Return descriptor z with optional filename-semantic prior mixed in."""
+    """Return descriptor z mixed with filename and strong classification priors."""
     desc_z = np.asarray(db["desc_z"], dtype=np.float32)
-    if (not bool(getattr(cfg, "filename_semantic_enable", True))) or "name_semantic" not in db:
+    if not bool(getattr(cfg, "filename_semantic_enable", True)):
         return desc_z
     mean = np.asarray(db["desc_mean"], dtype=np.float32)
     std = np.asarray(db["desc_std"], dtype=np.float32)
-    sem = np.asarray(db["name_semantic"], dtype=np.float32)
-    sem_z = (sem - mean) / np.maximum(std, 1e-6)
+    parts = []
+    if "name_semantic" in db:
+        name = np.asarray(db["name_semantic"], dtype=np.float32)
+        parts.append((name - mean) / np.maximum(std, 1e-6))
+    if bool(getattr(cfg, "classification_semantic_enable", True)) and "class_semantic" in db:
+        cls = np.asarray(db["class_semantic"], dtype=np.float32)
+        cls_z = (cls - mean) / np.maximum(std, 1e-6)
+        if parts:
+            ratio = float(getattr(cfg, "classification_semantic_ratio", 0.70))
+            ratio = max(0.0, min(1.0, ratio))
+            sem_z = (1.0 - ratio) * parts[0] + ratio * cls_z
+        else:
+            sem_z = cls_z
+    elif parts:
+        sem_z = parts[0]
+    else:
+        return desc_z
     sem_z = np.clip(sem_z, -8.0, 8.0).astype(np.float32)
     w = float(getattr(cfg, "filename_semantic_weight", 0.35) if weight is None else weight)
-    w = max(0.0, min(1.0, w))
+    w = max(0.0, min(0.85, w))
     return ((1.0 - w) * desc_z + w * sem_z).astype(np.float32)
 
 
@@ -1214,7 +1533,7 @@ def add_event_to_db_lists(
             music_feat = audio_feature_for_motion_clip(matched_audio, st, clip.shape[0], cfg)
             music_mask = 1.0
         except Exception as exc:
-            print(f"[V46.9 WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
+            print(f"[V46.11 WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
             music_feat = np.zeros(32, dtype=np.float32)
             music_mask = 0.0
     else:
@@ -1248,11 +1567,16 @@ def add_event_to_db_lists(
         "input_mode": base_meta.get("input_mode", "direct_files"),
     }
     sem = parse_change_bvh_semantics(base_meta.get("source_file", base_meta.get("source_bvh", out_path)))
+    item.update(strong_action_semantics_from_meta({**sem, **item}, desc))
     # Keep source_uid/source_group from filename unless a manifest-specific source
     # explicitly supplied them.  Keep manifest label if present; otherwise use
     # filename category/take label.
     for k in ["source_uid", "gender", "dance_key", "dance_category", "semantic_role", "semantic_text", "take_id", "source_take", "raw_stem"]:
         item[k] = base_meta.get(k, sem.get(k))
+    strong_sem = strong_action_semantics_from_meta(item, desc)
+    item.update(strong_sem)
+    if item.get("semantic_text"):
+        item["semantic_text"] = str(item["semantic_text"]) + "; " + str(strong_sem.get("classification_text", ""))
     if not item.get("label") or item.get("label") == "unknown":
         item["label"] = str(sem.get("label", "unknown"))
     if not item.get("parent_label") or item.get("parent_label") == "unknown":
@@ -1354,6 +1678,7 @@ def build_db(args: argparse.Namespace) -> int:
     std = desc.std(axis=0, keepdims=True) + 1e-6
     desc_z = (desc - mean) / std
     name_semantic = np.stack([filename_semantic_vector_from_meta(m, cfg) for m in meta]).astype(np.float32)
+    class_semantic = np.stack([class_semantic_vector_from_meta(m, cfg) for m in meta]).astype(np.float32)
     db_path = out_dir / "events.npz"
     np.savez_compressed(
         db_path,
@@ -1376,8 +1701,15 @@ def build_db(args: argparse.Namespace) -> int:
         dance_categories=np.array([m.get("dance_category", "unknown") for m in meta], dtype=object),
         semantic_roles=np.array([m.get("semantic_role", "unknown") for m in meta], dtype=object),
         semantic_texts=np.array([m.get("semantic_text", "") for m in meta], dtype=object),
+        energy_labels=np.array([m.get("energy_label", "unknown") for m in meta], dtype=object),
+        rhythm_labels=np.array([m.get("rhythm_label", "unknown") for m in meta], dtype=object),
+        body_focus_labels=np.array([m.get("body_focus_label", "unknown") for m in meta], dtype=object),
+        spatial_labels=np.array([m.get("spatial_label", "unknown") for m in meta], dtype=object),
+        music_alignment_labels=np.array([m.get("music_alignment_label", "unknown") for m in meta], dtype=object),
+        classification_texts=np.array([m.get("classification_text", "") for m in meta], dtype=object),
         take_ids=np.array([int(m.get("take_id", -1) if m.get("take_id", -1) is not None else -1) for m in meta], dtype=np.int32),
         name_semantic=name_semantic.astype(np.float32),
+        class_semantic=class_semantic.astype(np.float32),
         durations=np.array([m["duration"] for m in meta], dtype=np.float32),
         frames=np.array([m["frames"] for m in meta], dtype=np.int32),
         music=np.stack(music_feats).astype(np.float32),
@@ -1392,11 +1724,15 @@ def build_db(args: argparse.Namespace) -> int:
         "num_source_uids_total": int(len(set(str(m.get("source_uid", m.get("source_group"))) for m in meta))),
         "category_counts": {str(k): int(sum(str(m.get("dance_key")) == str(k) for m in meta)) for k in sorted(set(str(m.get("dance_key")) for m in meta))},
         "gender_counts": {str(k): int(sum(str(m.get("gender")) == str(k) for m in meta)) for k in sorted(set(str(m.get("gender")) for m in meta))},
-        "source_group_semantics": "full_filename_stem; category/gender/take are separate semantic metadata",
+        "energy_label_counts": {str(k): int(sum(str(m.get("energy_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("energy_label")) for m in meta))},
+        "rhythm_label_counts": {str(k): int(sum(str(m.get("rhythm_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("rhythm_label")) for m in meta))},
+        "body_focus_counts": {str(k): int(sum(str(m.get("body_focus_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("body_focus_label")) for m in meta))},
+        "music_alignment_label_counts": {str(k): int(sum(str(m.get("music_alignment_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("music_alignment_label")) for m in meta))},
+        "source_group_semantics": "full_filename_stem; category/gender/take are separate semantic metadata; V46.11 adds multi-label action/music-alignment classes",
         "train_val_group_overlap": 0,  # no random sample split is produced here; downstream split must remain source-disjoint.
     }
     report = {
-        "version": "v46_9_filename_semantic_source_aware_db",
+        "version": "v46_11_canonical_strong_class_semantic_source_aware_db",
         "config": dataclasses.asdict(cfg),
         "events": meta,
         "num_events": len(meta),
@@ -1598,8 +1934,14 @@ def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slo
         pseudo[17] = f[7]
         pseudo[18] = dyn
         pseudo[19:] = f[: 32 - 19]
-        role = "climax" if energy > np.percentile([energy, f[3], f[15]], 75) else ("calm" if energy < 0.03 else "normal")
-        slots.append({"slot_id": i, "start": st / sr, "end": ed / sr, "duration": dur, "energy": energy, "onset": onset, "role": role})
+        slot_sem = audio_slot_classification_from_pseudo(pseudo, dur, energy, onset, dyn)
+        # Encode music alignment labels in the same high channels as class_semantic.
+        pseudo[22] = _label_index(slot_sem["energy_label"], ENERGY_LABELS) / max(1, len(ENERGY_LABELS) - 1)
+        pseudo[23] = _label_index(slot_sem["rhythm_label"], RHYTHM_LABELS) / max(1, len(RHYTHM_LABELS) - 1)
+        pseudo[26] = _label_index(slot_sem["music_alignment_label"], MUSIC_ALIGNMENT_LABELS) / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
+        slot_item = {"slot_id": i, "start": st / sr, "end": ed / sr, "duration": dur, "energy": energy, "onset": onset}
+        slot_item.update(slot_sem)
+        slots.append(slot_item)
         feats.append(pseudo.astype(np.float32))
     return slots, np.stack(feats).astype(np.float32)
 
@@ -1645,7 +1987,7 @@ def make_weak_music_features_from_motion(desc: np.ndarray, noise: float = 0.08) 
 
 def semantic_dims_and_weights() -> Tuple[np.ndarray, np.ndarray]:
     """Feature weights shared by unpaired audio-motion OT and retrieval fallback."""
-    dims = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 16, 17, 18], dtype=np.int64)
+    dims = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 16, 17, 18, 22, 23, 24, 25, 26, 28, 29, 30], dtype=np.int64)
     weights = np.array([
         0.45,  # duration
         0.80, 0.95, 0.75, 0.70,  # root/energy/dynamics
@@ -1653,6 +1995,8 @@ def semantic_dims_and_weights() -> Tuple[np.ndarray, np.ndarray]:
         0.45, 0.35,              # lower/upper ratio + contact calmness
         0.75, 0.75,              # foot speed
         0.90, 0.95, 0.65,        # onset/turn/root-y dynamics
+        0.55, 0.55, 0.42, 0.42, 0.70,  # explicit class channels
+        0.35, 0.42, 0.42,        # calm/percussive/turn affinity bits
     ], dtype=np.float32)
     return dims, weights
 
@@ -1666,7 +2010,7 @@ def load_unpaired_audio_feature_pool(audio_dirs: Optional[Sequence[str]], cfg: V
         try:
             slots, sf = audio_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds))
         except Exception as exc:
-            print(f"[V46.9 WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
+            print(f"[V46.11 WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
             continue
         for slot, feat in zip(slots, sf):
             feats.append(feat.astype(np.float32))
@@ -1692,7 +2036,7 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
     if audio_raw.shape[0] < int(cfg.unpaired_min_audio_slots):
         return None
 
-    motion_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_ot_weight", getattr(cfg, "filename_semantic_weight", 0.35))))
+    motion_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "classification_ot_weight", getattr(cfg, "filename_semantic_ot_weight", 0.35))))
     desc_mean = np.asarray(db["desc_mean"], dtype=np.float32)
     desc_std = np.asarray(db["desc_std"], dtype=np.float32)
     music_z_all = ((audio_raw - desc_mean) / np.maximum(desc_std, 1e-6)).astype(np.float32)
@@ -1840,7 +2184,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
-        "version": "v44_9_unpaired_audio_filename_semantic_grounding",
+        "version": "v44_11_unpaired_audio_canonical_strong_class_semantic_grounding",
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "feat_dim": motion.shape[1],
@@ -2102,7 +2446,7 @@ def transition_cost(exit_state: np.ndarray, entry_state: np.ndarray, cexit: np.n
 
 def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V46Config, contrastive=None) -> Tuple[List[int], List[dict]]:
     desc = np.asarray(db["desc"], dtype=np.float32)
-    desc_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_retrieval_weight", 0.20)))
+    desc_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "classification_retrieval_weight", getattr(cfg, "filename_semantic_retrieval_weight", 0.20))))
     mean = np.asarray(db["desc_mean"], dtype=np.float32)
     std = np.asarray(db["desc_std"], dtype=np.float32)
     if contrastive is not None and hasattr(contrastive, "music_mean") and hasattr(contrastive, "music_std"):
@@ -2126,7 +2470,8 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
     for i, slot in enumerate(slots):
         sim = music_emb[i] @ motion_emb.T
         dur_cost = np.abs(np.log(np.maximum(durations, 1e-4) / max(float(slot["duration"]), 1e-4)))
-        base_score = sim - cfg.retrieval_warp_penalty * dur_cost
+        class_bonus = semantic_label_match_bonus(slot, db, cfg)
+        base_score = sim - cfg.retrieval_warp_penalty * dur_cost + float(getattr(cfg, "classification_retrieval_bonus", 0.28)) * class_bonus
         cand = np.argsort(-base_score)[: max(cfg.top_k, cfg.beam_size)].tolist()
         new_beams: List[Tuple[float, List[int], Dict[str, int]]] = []
         for score, path, src_counts in beams:
@@ -2144,7 +2489,37 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
                 new_beams.append((score + sc, path + [int(idx)], ns))
         new_beams.sort(key=lambda x: x[0], reverse=True)
         beams = new_beams[: cfg.beam_size]
-        reports.append({"slot": i, "start": slot.get("start"), "end": slot.get("end"), "top_candidate": int(cand[0]), "beam_best_score": float(beams[0][0])})
+        preview_n = max(1, min(int(getattr(cfg, "classification_report_topk", 8)), len(cand)))
+        dance_keys = np.asarray(db.get("dance_keys", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+        labels_arr = np.asarray(db.get("labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+        align_arr = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+        sources_arr = np.asarray(db.get("source_groups", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+        reports.append({
+            "slot": i,
+            "start": slot.get("start"),
+            "end": slot.get("end"),
+            "duration": slot.get("duration"),
+            "slot_role": slot.get("role"),
+            "slot_music_alignment_label": slot.get("music_alignment_label"),
+            "slot_preferred_dance_keys": slot.get("preferred_dance_keys", []),
+            "top_candidate": int(cand[0]),
+            "top_candidate_label": str(labels_arr[cand[0]]),
+            "top_candidate_dance_key": str(dance_keys[cand[0]]),
+            "top_candidate_music_alignment_label": str(align_arr[cand[0]]),
+            "beam_best_score": float(beams[0][0]),
+            "candidate_preview": [
+                {
+                    "event_id": int(j),
+                    "score": float(base_score[int(j)]),
+                    "class_bonus": float(class_bonus[int(j)]),
+                    "source": str(sources_arr[int(j)]),
+                    "label": str(labels_arr[int(j)]),
+                    "dance_key": str(dance_keys[int(j)]),
+                    "music_alignment_label": str(align_arr[int(j)]),
+                }
+                for j in cand[:preview_n]
+            ],
+        })
     return beams[0][1], reports
 
 
