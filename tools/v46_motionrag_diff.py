@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.8 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
+V46.9 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
 ==================================================================
 
 This file is designed as a drop-in research patch for an EDGE-style repository.
@@ -15,7 +15,7 @@ Core versions included:
 - V44: music-motion contrastive learning for retrieval alignment.
 - V45: residual temporal Motion Refiner to escape pure stitching.
 - V46: retrieval-augmented conditional residual diffusion with IK finalization.
-- V46.8 safety and project-alignment fixes: direct Chang-E BVH loading, 210fps-to-30fps resampling, optional manifest-aware source metadata, unpaired slot-to-event semantic grounding, capped C1 landing damping, biological max-flight fuse, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
+- V46.9 safety and project-alignment fixes: direct Chang-E BVH loading, 210fps-to-30fps resampling, filename-aware source semantics, optional manifest-aware metadata, unpaired slot-to-event semantic grounding, capped C1 landing damping, biological max-flight fuse, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
 
 Expected EDGE 151D convention
 -----------------------------
@@ -587,6 +587,19 @@ class V46Config:
     bvh_resample_to_config_fps: bool = True
     manifest_enable: bool = True
     manifest_secondary_event_split: bool = True
+
+    # V46.9: Chang-E/change BVH filename semantics are scientifically meaningful.
+    # Each original BVH file is a source_uid/source_group, while the parsed
+    # category/gender/take fields become semantic metadata and weak alignment
+    # priors for unpaired slot-to-event routing.  This fixes the V46.8 issue
+    # where singleton names such as female_lotus/male_ribbon were collapsed
+    # into the same directory-level source group.
+    source_group_mode: str = "filename"  # filename | legacy_prefix
+    filename_semantic_enable: bool = True
+    filename_semantic_weight: float = 0.35
+    filename_semantic_retrieval_weight: float = 0.20
+    filename_semantic_ot_weight: float = 0.35
+
     embed_dim: int = 128
     top_k: int = 32
     beam_size: int = 8
@@ -720,6 +733,11 @@ class V46Config:
             "V46_DIFFUSION_STEPS": ("diffusion_steps", int),
             "V46_DEVICE": ("device", str),
             "V46_BVH_RESAMPLE_TO_CONFIG_FPS": ("bvh_resample_to_config_fps", lambda x: bool(int(x))),
+            "V46_SOURCE_GROUP_MODE": ("source_group_mode", str),
+            "V46_FILENAME_SEMANTIC_ENABLE": ("filename_semantic_enable", lambda x: bool(int(x))),
+            "V46_FILENAME_SEMANTIC_WEIGHT": ("filename_semantic_weight", float),
+            "V46_FILENAME_SEMANTIC_RETRIEVAL_WEIGHT": ("filename_semantic_retrieval_weight", float),
+            "V46_FILENAME_SEMANTIC_OT_WEIGHT": ("filename_semantic_ot_weight", float),
             "V46_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
             "V46_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
         }
@@ -801,16 +819,207 @@ def motion_boundary_state(motion: np.ndarray) -> Tuple[np.ndarray, np.ndarray, n
     return entry.astype(np.float32), exit_.astype(np.float32), contact[0], contact[-1]
 
 
+
+def _clean_stem(path: str | Path) -> str:
+    return Path(str(path)).stem.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+CHANG_E_CATEGORY_PROFILES: Dict[str, Dict[str, object]] = {
+    # The category names follow the Chang-E paper/Table-1 terminology while
+    # staying compatible with the user's actual filenames under EDGE/change.
+    "thirty_six_postures": {
+        "aliases": {"36pose", "36posture", "36postures", "thirtysix", "thirty_six"},
+        "display": "Ji Yue Tian Thirty-Six Postures",
+        "semantic_role": "pose_sequence",
+        "energy": 0.42, "onset": 0.22, "lower": 0.38, "upper": 0.55,
+        "turn": 0.18, "travel": 0.25, "calmness": 0.45,
+    },
+    "lotus_steps": {
+        "aliases": {"lotus", "lotussteps", "lotus_step", "lotus_steps"},
+        "display": "Lotus Steps",
+        "semantic_role": "flowing_footwork",
+        "energy": 0.35, "onset": 0.16, "lower": 0.58, "upper": 0.32,
+        "turn": 0.12, "travel": 0.45, "calmness": 0.52,
+    },
+    "revelation_meditation": {
+        "aliases": {"meditation", "revelation", "revelation_meditation"},
+        "display": "Revelation Meditation",
+        "semantic_role": "calm_meditative_flow",
+        "energy": 0.18, "onset": 0.05, "lower": 0.18, "upper": 0.28,
+        "turn": 0.08, "travel": 0.10, "calmness": 0.86,
+    },
+    "pipa_behind_back": {
+        "aliases": {"pipa", "pipa1", "pipa2", "playing_pipa", "playing_the_pipa"},
+        "display": "Playing the Pipa Behind the Back",
+        "semantic_role": "instrument_upper_body_motif",
+        "energy": 0.48, "onset": 0.22, "lower": 0.30, "upper": 0.78,
+        "turn": 0.25, "travel": 0.26, "calmness": 0.35,
+    },
+    "lei_gong_drum": {
+        "aliases": {"drum", "lei_gong", "leigong", "lei_gong_drum"},
+        "display": "Lei Gong Drum",
+        "semantic_role": "percussive_high_energy",
+        "energy": 0.78, "onset": 0.72, "lower": 0.72, "upper": 0.70,
+        "turn": 0.20, "travel": 0.42, "calmness": 0.15,
+    },
+    "ribbon_flow": {
+        "aliases": {"ribbon", "sash", "silk", "whirl", "sogdian", "sogdian_whirl"},
+        "display": "Ribbon / Sogdian Whirl Flow",
+        "semantic_role": "flowing_turning_motif",
+        "energy": 0.62, "onset": 0.36, "lower": 0.50, "upper": 0.66,
+        "turn": 0.70, "travel": 0.58, "calmness": 0.25,
+    },
+}
+
+
+def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
+    """Parse meaningful Chang-E filename semantics from EDGE/change/*.bvh.
+
+    Examples:
+      female_36pose_1.bvh -> gender=female, category=thirty_six_postures, take=1
+      male_pipa_2.bvh     -> gender=male,   category=pipa_behind_back, take=2
+      female_lotus.bvh    -> gender=female, category=lotus_steps
+
+    The full filename stem is deliberately used as source_uid/source_group for
+    source-aware RAG and leakage prevention.  Category/gender/take are separate
+    semantic attributes used for routing and reporting, not for source grouping.
+    """
+    stem = _clean_stem(path)
+    tokens = [t for t in stem.split("_") if t]
+    gender = "unknown"
+    rest = tokens[:]
+    if rest and rest[0] in {"male", "female"}:
+        gender = rest[0]
+        rest = rest[1:]
+
+    take_id: Optional[int] = None
+    if rest and rest[-1].isdigit():
+        take_id = int(rest[-1])
+        rest = rest[:-1]
+    base = "_".join(rest) if rest else stem
+
+    category_key = "unknown"
+    for key, prof in CHANG_E_CATEGORY_PROFILES.items():
+        aliases = set(prof.get("aliases", set()))
+        if base in aliases or any(tok in aliases for tok in rest):
+            category_key = key
+            break
+    if category_key == "unknown":
+        category_key = base or "unknown"
+
+    prof = CHANG_E_CATEGORY_PROFILES.get(category_key, {})
+    display = str(prof.get("display", category_key.replace("_", " ").title()))
+    semantic_role = str(prof.get("semantic_role", "unknown_motion"))
+    source_uid = stem
+    take_text = f" take {take_id}" if take_id is not None else ""
+    gender_text = "female" if gender == "female" else ("male" if gender == "male" else "unknown-gender")
+    semantic_text = f"{gender_text} {display}{take_text}; role={semantic_role}"
+    event_label = category_key
+    if take_id is not None:
+        event_label = f"{category_key}_take{take_id}"
+    return {
+        "source_uid": source_uid,
+        "source_group": source_uid,
+        "gender": gender,
+        "dance_key": category_key,
+        "dance_category": display,
+        "semantic_role": semantic_role,
+        "semantic_text": semantic_text,
+        "take_id": take_id if take_id is not None else -1,
+        "source_take": take_id if take_id is not None else -1,
+        "label": event_label,
+        "parent_label": category_key,
+        "raw_stem": stem,
+    }
+
+
 def source_group_from_path(path: str | Path) -> str:
-    p = Path(path)
-    parts = p.parts[-4:]
-    stem = p.stem
-    tokens = stem.replace("-", "_").split("_")
-    if len(tokens) >= 3:
-        key = "_".join(tokens[:3])
-    else:
-        key = "/".join(parts[:-1]) if len(parts) > 1 else stem
-    return key
+    # V46.9 default: each meaningful Chang-E BVH stem is a separate source
+    # group. This yields 12 source groups for the user's current change/*.bvh
+    # instead of collapsing singleton files into one directory-level group.
+    return str(parse_change_bvh_semantics(path).get("source_group"))
+
+
+def infer_label_from_filename(path: str | Path) -> str:
+    return str(parse_change_bvh_semantics(path).get("label"))
+
+
+def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = None) -> np.ndarray:
+    """Convert filename/category semantics into a 32D slot-compatible prior.
+
+    The vector uses the same coarse channel layout as audio_slots()/event_descriptor():
+    duration, root/travel, energy, dynamics, joint/lower/upper density, contact
+    calmness, foot speed, turn/onset and root-y dynamics.  It is not a paired
+    label; it is a weak prior that makes unpaired music-to-event matching aware
+    that e.g. drum should prefer onset-rich slots and meditation should prefer
+    calm slots.
+    """
+    key = str(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or "unknown")
+    # Strip take suffix if needed.
+    key = re.sub(r"_take\d+$", "", key)
+    prof = CHANG_E_CATEGORY_PROFILES.get(key, {})
+    duration = float(meta.get("duration", 0.0) or 0.0)
+    energy = float(prof.get("energy", 0.40))
+    onset = float(prof.get("onset", 0.20))
+    lower = float(prof.get("lower", energy))
+    upper = float(prof.get("upper", energy))
+    turn = float(prof.get("turn", 0.15))
+    travel = float(prof.get("travel", 0.25))
+    calm = float(prof.get("calmness", max(0.0, 0.75 - energy)))
+    v = np.zeros(32, dtype=np.float32)
+    v[0] = duration
+    v[1] = travel * 2.0
+    v[2] = energy
+    v[3] = min(1.0, energy + 0.25 * onset)
+    v[4] = energy * 0.45 + onset * 0.55
+    v[5] = energy + onset
+    v[6] = min(1.0, energy + 0.45 * onset)
+    v[7] = lower
+    v[8] = upper
+    v[9] = lower / max(upper, 1e-4)
+    v[10] = calm
+    v[11] = calm * 0.8
+    v[12] = calm * 0.8
+    v[13] = max(0.02, onset)
+    v[14] = max(0.02, onset * 1.25)
+    v[15] = turn
+    v[16] = abs(turn) + 0.25 * onset
+    v[17] = max(abs(turn), onset)
+    v[18] = energy * (0.25 + 0.5 * (1.0 - calm))
+    v[19] = 0.15 + 0.25 * energy
+    # Gender is not a quality score. It is only kept as a small style flag so
+    # the router can report source diversity; it should not dominate retrieval.
+    gender = str(meta.get("gender", "unknown"))
+    v[20] = 0.15 if gender == "female" else (0.35 if gender == "male" else 0.25)
+    take = float(meta.get("take_id", -1) if meta.get("take_id", -1) is not None else -1)
+    v[21] = max(0.0, take) / 4.0 if take >= 0 else 0.0
+    # Duplicate coarse stats to high channels for robust normalized matching.
+    v[22] = energy
+    v[23] = onset
+    v[24] = travel
+    v[25] = calm
+    v[26] = lower
+    v[27] = upper
+    v[28] = turn
+    v[29] = energy + 0.5 * onset
+    v[30] = (lower + upper) * 0.5
+    v[31] = 1.0
+    return v.astype(np.float32)
+
+
+def motion_feature_z_for_alignment(db: dict, cfg: V46Config, weight: Optional[float] = None) -> np.ndarray:
+    """Return descriptor z with optional filename-semantic prior mixed in."""
+    desc_z = np.asarray(db["desc_z"], dtype=np.float32)
+    if (not bool(getattr(cfg, "filename_semantic_enable", True))) or "name_semantic" not in db:
+        return desc_z
+    mean = np.asarray(db["desc_mean"], dtype=np.float32)
+    std = np.asarray(db["desc_std"], dtype=np.float32)
+    sem = np.asarray(db["name_semantic"], dtype=np.float32)
+    sem_z = (sem - mean) / np.maximum(std, 1e-6)
+    sem_z = np.clip(sem_z, -8.0, 8.0).astype(np.float32)
+    w = float(getattr(cfg, "filename_semantic_weight", 0.35) if weight is None else weight)
+    w = max(0.0, min(1.0, w))
+    return ((1.0 - w) * desc_z + w * sem_z).astype(np.float32)
 
 
 def scan_motion_files(motion_dirs: Sequence[str], exts: Sequence[str] = (".npy", ".npz", ".pkl", ".pickle", ".bvh")) -> List[str]:
@@ -944,7 +1153,8 @@ def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[st
             end_frame = _coerce_int(row.get("end_frame"), None)
             label = str(row.get("label") or row.get("motion_event") or row.get("fragment_name") or Path(load_path).stem)
             source_name = str(row.get("source_bvh") or Path(source or load_path).name)
-            rows.append({
+            sem = parse_change_bvh_semantics(source or load_path)
+            item = {
                 "manifest_id": ridx,
                 "manifest_path": str(mp),
                 "load_path": str(load_path),
@@ -959,7 +1169,10 @@ def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[st
                 "duration_sec_manifest": _coerce_float(row.get("duration_sec"), None),
                 "bvh_fps_manifest": _coerce_float(row.get("bvh_fps"), None),
                 "raw_manifest_row": {k: row.get(k) for k in row.keys()},
-            })
+            }
+            item.update({k: v for k, v in sem.items() if k not in {"label", "parent_label"}})
+            # Manifest labels are manual semantic labels and should remain primary.
+            rows.append(item)
     return rows
 
 
@@ -972,14 +1185,13 @@ def iter_source_records(args: argparse.Namespace, cfg: V46Config) -> Tuple[List[
     files = scan_motion_files(motion_dirs)
     if not files:
         raise FileNotFoundError(f"No motion files found in: {motion_dirs}")
-    return [{"load_path": f, "source_file": f, "source_bvh": Path(f).name, "label": infer_label_from_filename(f), "fragment_index": 0} for f in files], {"input_mode": "direct_files", "files": len(files), "motion_dirs": motion_dirs}
-
-
-def infer_label_from_filename(path: str | Path) -> str:
-    stem = Path(path).stem.lower()
-    for token in ["female_", "male_"]:
-        stem = stem.replace(token, "")
-    return stem
+    out_records = []
+    for f in files:
+        sem = parse_change_bvh_semantics(f)
+        rec = {"load_path": f, "source_file": f, "source_bvh": Path(f).name, "fragment_index": 0}
+        rec.update(sem)
+        out_records.append(rec)
+    return out_records, {"input_mode": "direct_files", "files": len(files), "motion_dirs": motion_dirs}
 
 
 def add_event_to_db_lists(
@@ -1002,7 +1214,7 @@ def add_event_to_db_lists(
             music_feat = audio_feature_for_motion_clip(matched_audio, st, clip.shape[0], cfg)
             music_mask = 1.0
         except Exception as exc:
-            print(f"[V46.8 WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
+            print(f"[V46.9 WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
             music_feat = np.zeros(32, dtype=np.float32)
             music_mask = 0.0
     else:
@@ -1035,6 +1247,16 @@ def add_event_to_db_lists(
         "manifest_path": base_meta.get("manifest_path"),
         "input_mode": base_meta.get("input_mode", "direct_files"),
     }
+    sem = parse_change_bvh_semantics(base_meta.get("source_file", base_meta.get("source_bvh", out_path)))
+    # Keep source_uid/source_group from filename unless a manifest-specific source
+    # explicitly supplied them.  Keep manifest label if present; otherwise use
+    # filename category/take label.
+    for k in ["source_uid", "gender", "dance_key", "dance_category", "semantic_role", "semantic_text", "take_id", "source_take", "raw_stem"]:
+        item[k] = base_meta.get(k, sem.get(k))
+    if not item.get("label") or item.get("label") == "unknown":
+        item["label"] = str(sem.get("label", "unknown"))
+    if not item.get("parent_label") or item.get("parent_label") == "unknown":
+        item["parent_label"] = str(sem.get("parent_label", item.get("label", "unknown")))
     if "resample_report" in base_meta:
         item["resample_report"] = base_meta["resample_report"]
     meta.append(item)
@@ -1131,6 +1353,7 @@ def build_db(args: argparse.Namespace) -> int:
     mean = desc.mean(axis=0, keepdims=True)
     std = desc.std(axis=0, keepdims=True) + 1e-6
     desc_z = (desc - mean) / std
+    name_semantic = np.stack([filename_semantic_vector_from_meta(m, cfg) for m in meta]).astype(np.float32)
     db_path = out_dir / "events.npz"
     np.savez_compressed(
         db_path,
@@ -1147,6 +1370,14 @@ def build_db(args: argparse.Namespace) -> int:
         labels=np.array([m.get("label", "unknown") for m in meta], dtype=object),
         parent_labels=np.array([m.get("parent_label", m.get("label", "unknown")) for m in meta], dtype=object),
         source_bvh=np.array([m.get("source_bvh", "") for m in meta], dtype=object),
+        source_uids=np.array([m.get("source_uid", m.get("source_group", "")) for m in meta], dtype=object),
+        genders=np.array([m.get("gender", "unknown") for m in meta], dtype=object),
+        dance_keys=np.array([m.get("dance_key", "unknown") for m in meta], dtype=object),
+        dance_categories=np.array([m.get("dance_category", "unknown") for m in meta], dtype=object),
+        semantic_roles=np.array([m.get("semantic_role", "unknown") for m in meta], dtype=object),
+        semantic_texts=np.array([m.get("semantic_text", "") for m in meta], dtype=object),
+        take_ids=np.array([int(m.get("take_id", -1) if m.get("take_id", -1) is not None else -1) for m in meta], dtype=np.int32),
+        name_semantic=name_semantic.astype(np.float32),
         durations=np.array([m["duration"] for m in meta], dtype=np.float32),
         frames=np.array([m["frames"] for m in meta], dtype=np.int32),
         music=np.stack(music_feats).astype(np.float32),
@@ -1158,10 +1389,14 @@ def build_db(args: argparse.Namespace) -> int:
         "num_labels_total": int(len(set(str(m.get("label")) for m in meta))),
         "events_per_source_min": int(min([sum(str(x.get("source_group")) == s for x in meta) for s in set(str(m.get("source_group")) for m in meta)])),
         "events_per_source_max": int(max([sum(str(x.get("source_group")) == s for x in meta) for s in set(str(m.get("source_group")) for m in meta)])),
+        "num_source_uids_total": int(len(set(str(m.get("source_uid", m.get("source_group"))) for m in meta))),
+        "category_counts": {str(k): int(sum(str(m.get("dance_key")) == str(k) for m in meta)) for k in sorted(set(str(m.get("dance_key")) for m in meta))},
+        "gender_counts": {str(k): int(sum(str(m.get("gender")) == str(k) for m in meta)) for k in sorted(set(str(m.get("gender")) for m in meta))},
+        "source_group_semantics": "full_filename_stem; category/gender/take are separate semantic metadata",
         "train_val_group_overlap": 0,  # no random sample split is produced here; downstream split must remain source-disjoint.
     }
     report = {
-        "version": "v46_8_project_aligned_source_aware_db",
+        "version": "v46_9_filename_semantic_source_aware_db",
         "config": dataclasses.asdict(cfg),
         "events": meta,
         "num_events": len(meta),
@@ -1431,7 +1666,7 @@ def load_unpaired_audio_feature_pool(audio_dirs: Optional[Sequence[str]], cfg: V
         try:
             slots, sf = audio_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds))
         except Exception as exc:
-            print(f"[V46.8 WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
+            print(f"[V46.9 WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
             continue
         for slot, feat in zip(slots, sf):
             feats.append(feat.astype(np.float32))
@@ -1457,7 +1692,7 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
     if audio_raw.shape[0] < int(cfg.unpaired_min_audio_slots):
         return None
 
-    motion_z = np.asarray(db["desc_z"], dtype=np.float32)
+    motion_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_ot_weight", getattr(cfg, "filename_semantic_weight", 0.35))))
     desc_mean = np.asarray(db["desc_mean"], dtype=np.float32)
     desc_std = np.asarray(db["desc_std"], dtype=np.float32)
     music_z_all = ((audio_raw - desc_mean) / np.maximum(desc_std, 1e-6)).astype(np.float32)
@@ -1532,7 +1767,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
-    motion_db = np.asarray(db["desc_z"], dtype=np.float32)
+    motion_db = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_weight", 0.35)))
     supervision_mode = "weak_motion_proxy"
     pair_report: Dict[str, object] = {}
 
@@ -1605,7 +1840,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
-        "version": "v44_7_unpaired_audio_semantic_grounding",
+        "version": "v44_9_unpaired_audio_filename_semantic_grounding",
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "feat_dim": motion.shape[1],
@@ -1867,7 +2102,7 @@ def transition_cost(exit_state: np.ndarray, entry_state: np.ndarray, cexit: np.n
 
 def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V46Config, contrastive=None) -> Tuple[List[int], List[dict]]:
     desc = np.asarray(db["desc"], dtype=np.float32)
-    desc_z = np.asarray(db["desc_z"], dtype=np.float32)
+    desc_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_retrieval_weight", 0.20)))
     mean = np.asarray(db["desc_mean"], dtype=np.float32)
     std = np.asarray(db["desc_std"], dtype=np.float32)
     if contrastive is not None and hasattr(contrastive, "music_mean") and hasattr(contrastive, "music_std"):
