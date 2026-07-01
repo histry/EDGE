@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.1 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
+V46.8 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
 ==================================================================
 
 This file is designed as a drop-in research patch for an EDGE-style repository.
@@ -15,7 +15,7 @@ Core versions included:
 - V44: music-motion contrastive learning for retrieval alignment.
 - V45: residual temporal Motion Refiner to escape pure stitching.
 - V46: retrieval-augmented conditional residual diffusion with IK finalization.
-- V46.1 safety fixes: dynamic landing damping, C1 Hanning flight gate, intentional-slide release guard.
+- V46.8 safety and project-alignment fixes: direct Chang-E BVH loading, 210fps-to-30fps resampling, optional manifest-aware source metadata, unpaired slot-to-event semantic grounding, capped C1 landing damping, biological max-flight fuse, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
 
 Expected EDGE 151D convention
 -----------------------------
@@ -35,6 +35,7 @@ python tools/v46_motionrag_diff.py generate --audio test_music_bank/dunhuangwu2.
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import glob
 import hashlib
@@ -216,6 +217,246 @@ def normalize_motion_shape(arr: np.ndarray) -> List[np.ndarray]:
     return outs
 
 
+
+def _bvh_rotation_matrix(axis: str, angle_deg: float) -> np.ndarray:
+    """Single-axis right-handed rotation matrix used by BVH Euler channels."""
+    a = math.radians(float(angle_deg))
+    c, ss = math.cos(a), math.sin(a)
+    axis = axis.upper()[0]
+    if axis == "X":
+        return np.array([[1.0, 0.0, 0.0], [0.0, c, -ss], [0.0, ss, c]], dtype=np.float32)
+    if axis == "Y":
+        return np.array([[c, 0.0, ss], [0.0, 1.0, 0.0], [-ss, 0.0, c]], dtype=np.float32)
+    return np.array([[c, -ss, 0.0], [ss, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+
+def _bvh_euler_to_matrix(channels: Sequence[str], values: Sequence[float]) -> np.ndarray:
+    """
+    Convert BVH local Euler rotation channels to a rotation matrix.
+
+    BVH stores each joint's channels in an explicit order, commonly
+    Zrotation/Xrotation/Yrotation. We multiply in that listed order, which is
+    the standard practical interpretation for BVH local transforms.
+    """
+    R = np.eye(3, dtype=np.float32)
+    for ch, v in zip(channels, values):
+        if ch.lower().endswith("rotation"):
+            R = R @ _bvh_rotation_matrix(ch[0], float(v))
+    return R.astype(np.float32)
+
+
+def _norm_joint_name(name: str) -> str:
+    return "".join(c for c in name.lower() if c.isalnum())
+
+
+def _pick_bvh_joint(norm_names: List[str], aliases: Sequence[str], used: set[int], allow_used: bool = False) -> int:
+    alias_norm = [_norm_joint_name(a) for a in aliases]
+    # First pass: exact or contains match with unused joints.
+    for a in alias_norm:
+        for i, n in enumerate(norm_names):
+            if (allow_used or i not in used) and (n == a or a in n or n in a):
+                used.add(i)
+                return i
+    # Second pass: allow duplicates for non-critical missing end-effectors.
+    for a in alias_norm:
+        for i, n in enumerate(norm_names):
+            if n == a or a in n or n in a:
+                return i
+    return -1
+
+
+def _bvh_target_joint_indices(joint_names: Sequence[str]) -> List[int]:
+    """
+    Map a generic Chang-E/BVH skeleton to the 24-joint EDGE/SMPL-like order.
+
+    This is a pragmatic name-based adapter. It is intended for event-database
+    building and retrieval/refinement, not for claiming exact SMPL conversion.
+    If a joint is missing, identity rotation is used for that target joint.
+    """
+    norm = [_norm_joint_name(x) for x in joint_names]
+    used: set[int] = set()
+    aliases = [
+        ["hips", "hip", "pelvis", "root", "mixamorigHips"],
+        ["leftupleg", "lefthip", "leftthigh", "lhip", "lthigh"],
+        ["rightupleg", "righthip", "rightthigh", "rhip", "rthigh"],
+        ["spine", "spine1", "lowerspine", "abdomen"],
+        ["leftleg", "leftknee", "leftshin", "lleg", "lknee", "lshin"],
+        ["rightleg", "rightknee", "rightshin", "rleg", "rknee", "rshin"],
+        ["spine1", "spine2", "chest", "midspine"],
+        ["leftfoot", "leftankle", "lfoot", "lankle"],
+        ["rightfoot", "rightankle", "rfoot", "rankle"],
+        ["spine2", "spine3", "upperchest", "chest", "thorax"],
+        ["lefttoe", "lefttoebase", "lefttoeend", "leftball", "ltoe", "leftfoot"],
+        ["righttoe", "righttoebase", "righttoeend", "rightball", "rtoe", "rightfoot"],
+        ["neck", "neck1"],
+        ["leftshoulder", "leftcollar", "leftclavicle", "lshoulder", "lcollar"],
+        ["rightshoulder", "rightcollar", "rightclavicle", "rshoulder", "rcollar"],
+        ["head", "headtop", "headendeffector"],
+        ["leftarm", "leftupperarm", "larm", "lupperarm"],
+        ["rightarm", "rightupperarm", "rarm", "rupperarm"],
+        ["leftforearm", "leftlowerarm", "leftelbow", "lforearm", "lelbow"],
+        ["rightforearm", "rightlowerarm", "rightelbow", "rforearm", "relbow"],
+        ["lefthand", "leftwrist", "lhand", "lwrist"],
+        ["righthand", "rightwrist", "rhand", "rwrist"],
+        ["lefthand", "leftfinger", "leftthumb", "lhand"],
+        ["righthand", "rightfinger", "rightthumb", "rhand"],
+    ]
+    out: List[int] = []
+    for target_id, al in enumerate(aliases):
+        # Allow duplicate hands/toes if the BVH skeleton has no separate finger/toe joints.
+        allow = target_id in {10, 11, 22, 23}
+        out.append(_pick_bvh_joint(norm, al, used, allow_used=allow))
+    # Last-resort fallback for very small/nonstandard skeletons.
+    for i in range(len(out)):
+        if out[i] < 0 and i < len(joint_names):
+            out[i] = i
+    return out
+
+
+def load_bvh_file(path: str | Path) -> List[np.ndarray]:
+    """
+    Load a Chang-E-style `.bvh` file and convert it to an EDGE-like 151D array.
+
+    Output convention:
+      - motion[:, 4:7] = root XYZ translation
+      - motion[:, 7:151] = 24 local joint rotations in 6D form
+
+    BVH files commonly store positions in centimeters. The loader auto-scales
+    to meters when skeleton offsets look centimeter-scale. This direct adapter
+    is sufficient for source-aware event indexing, retrieval, V45/V46 training,
+    and V43 IK; for exact SMPL/EDGE reproduction, a dedicated retargeting stage
+    can still be used before build-db.
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    motion_line = None
+    for i, line in enumerate(text):
+        if line.strip().upper() == "MOTION":
+            motion_line = i
+            break
+    if motion_line is None:
+        raise ValueError(f"BVH MOTION section not found: {p}")
+
+    joints: List[dict] = []
+    stack: List[Optional[int]] = []
+    pending_joint: Optional[int] = None
+    pending_end = False
+    channel_cursor = 0
+
+    for raw in text[:motion_line]:
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        key = parts[0].upper()
+        if key in {"ROOT", "JOINT"} and len(parts) >= 2:
+            parent = stack[-1] if stack else -1
+            if parent is None:
+                parent = -1
+            joints.append({"name": parts[1], "parent": int(parent), "offset": np.zeros(3, dtype=np.float32), "channels": [], "channel_start": channel_cursor})
+            pending_joint = len(joints) - 1
+            pending_end = False
+        elif key == "END":
+            pending_end = True
+            pending_joint = None
+        elif key == "{":
+            if pending_joint is not None:
+                stack.append(pending_joint)
+                pending_joint = None
+            elif pending_end:
+                stack.append(None)
+                pending_end = False
+        elif key == "}":
+            if stack:
+                stack.pop()
+        elif key == "OFFSET" and len(parts) >= 4:
+            if stack and stack[-1] is not None:
+                joints[stack[-1]]["offset"] = np.array([float(parts[1]), float(parts[2]), float(parts[3])], dtype=np.float32)
+        elif key == "CHANNELS" and len(parts) >= 2:
+            if stack and stack[-1] is not None:
+                n = int(parts[1])
+                ch = parts[2:2 + n]
+                joints[stack[-1]]["channels"] = ch
+                joints[stack[-1]]["channel_start"] = channel_cursor
+                channel_cursor += n
+
+    if not joints or channel_cursor <= 0:
+        raise ValueError(f"No BVH joints/channels parsed: {p}")
+
+    frames = None
+    frame_time = 1.0 / 30.0
+    data_start = None
+    for i in range(motion_line + 1, len(text)):
+        line = text[i].strip()
+        low = line.lower()
+        if low.startswith("frames"):
+            frames = int(line.replace(":", " ").split()[-1])
+        elif low.startswith("frame time"):
+            frame_time = float(line.replace(":", " ").split()[-1])
+            data_start = i + 1
+            break
+    if frames is None or data_start is None:
+        raise ValueError(f"BVH frame metadata not found: {p}")
+
+    values: List[List[float]] = []
+    for raw in text[data_start:]:
+        line = raw.strip()
+        if not line:
+            continue
+        row = [float(x) for x in line.split()]
+        if len(row) >= channel_cursor:
+            values.append(row[:channel_cursor])
+    data = np.asarray(values, dtype=np.float32)
+    if data.ndim != 2 or data.shape[0] == 0:
+        raise ValueError(f"BVH motion values empty: {p}")
+    if frames is not None and data.shape[0] != frames:
+        frames = data.shape[0]
+
+    offsets = np.stack([j["offset"] for j in joints]).astype(np.float32)
+    bone_lens = np.linalg.norm(offsets, axis=1)
+    nonzero = bone_lens[bone_lens > 1e-6]
+    # BVH is often centimeters; meters-scale skeletons have bone lengths < 2.
+    auto_scale = 0.01 if (nonzero.size and float(np.percentile(nonzero, 90)) > 2.0) else 1.0
+    # If root trajectory itself is huge, also treat it as centimeters.
+    root_j = 0
+    root_ch = joints[root_j]["channels"]
+    root_st = int(joints[root_j]["channel_start"])
+    pos_cols = {ch.lower(): root_st + k for k, ch in enumerate(root_ch) if ch.lower().endswith("position")}
+    root_xyz = np.zeros((data.shape[0], 3), dtype=np.float32)
+    for axis, out_i in [("xposition", 0), ("yposition", 1), ("zposition", 2)]:
+        if axis in pos_cols:
+            root_xyz[:, out_i] = data[:, pos_cols[axis]]
+    if np.nanpercentile(np.linalg.norm(root_xyz[:, [0, 2]] - root_xyz[:1, [0, 2]], axis=1), 95) > 20.0:
+        auto_scale = 0.01
+    root_xyz *= float(auto_scale)
+
+    local_all = np.tile(np.eye(3, dtype=np.float32), (data.shape[0], len(joints), 1, 1))
+    for j_idx, j in enumerate(joints):
+        ch = list(j["channels"])
+        st = int(j["channel_start"])
+        rot_idx = [k for k, c in enumerate(ch) if c.lower().endswith("rotation")]
+        rot_ch = [ch[k] for k in rot_idx]
+        if not rot_idx:
+            continue
+        for t in range(data.shape[0]):
+            vals = [data[t, st + k] for k in rot_idx]
+            local_all[t, j_idx] = _bvh_euler_to_matrix(rot_ch, vals)
+
+    target_idx = _bvh_target_joint_indices([str(j["name"]) for j in joints])
+    target_local = np.tile(np.eye(3, dtype=np.float32), (data.shape[0], NUM_JOINTS, 1, 1))
+    for tgt, src in enumerate(target_idx):
+        if 0 <= src < len(joints):
+            target_local[:, tgt] = local_all[:, src]
+
+    out = np.zeros((data.shape[0], EDGE_DIM), dtype=np.float32)
+    out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root_xyz
+    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(target_local).reshape(data.shape[0], -1)
+    # Lightweight metadata in unused leading channels for traceability without
+    # touching the EDGE root/rotation convention used downstream.
+    out[:, 0] = float(1.0 / max(frame_time, 1e-8))
+    out[:, 1] = float(auto_scale)
+    return [out.astype(np.float32)]
+
 def load_motion_file(path: str | Path) -> List[np.ndarray]:
     p = Path(path)
     outs: List[np.ndarray] = []
@@ -236,6 +477,8 @@ def load_motion_file(path: str | Path) -> List[np.ndarray]:
                         outs.extend(normalize_motion_shape(np.asarray(obj[k])))
             else:
                 outs.extend(normalize_motion_shape(np.asarray(obj)))
+        elif p.suffix.lower() == ".bvh":
+            outs.extend(load_bvh_file(p))
     except Exception as exc:
         print(f"[V46 WARN] failed loading {p}: {exc}", file=sys.stderr)
     return [x for x in outs if x.ndim == 2 and x.shape[0] >= 8]
@@ -339,6 +582,11 @@ class V46Config:
     min_event_frames: int = 36
     max_event_frames: int = 180
     db_feature_dim: int = 32
+    # V46.8: Chang-E BVH files are often high-FPS (manifest reports about 210fps).
+    # Always resample source motions into the EDGE training FPS before event slicing.
+    bvh_resample_to_config_fps: bool = True
+    manifest_enable: bool = True
+    manifest_secondary_event_split: bool = True
     embed_dim: int = 128
     top_k: int = 32
     beam_size: int = 8
@@ -361,18 +609,61 @@ class V46Config:
     ik_height_margin: float = 0.050
     ik_speed_gate_mpf: float = 0.035
     ik_max_delta_rot: float = 0.65
-    # V46.1: do not lock intentional Dunhuang cloud-step / sliding-step contacts.
-    # If a contacted foot moves smoothly over this XZ span, it is treated as
-    # designed sliding support rather than skating error. 0.12 m is the default
-    # threshold requested for Dunhuang cloud-step safety.
+    # V46.4: cloud-step is not a release / continue any more.  Large XZ travel
+    # in contact is classified by speed and then mapped to a sliding anchor.
+    # This avoids the Footskate Forgiveness Paradox: severe slow AI drifting is
+    # still locked, while true Dunhuang cloud-step gets a smooth moving target.
     ik_slide_release_m: float = 0.12
     ik_slide_release_min_frames: int = 4
+    ik_cloud_step_speed_mps: float = 0.15
+    ik_sliding_anchor_window: int = 10
+    ik_cloud_speed_cv_max: float = 1.75
     # V46.1: root-Y ballistic/damping pass. It is deliberately C1-safe and
     # never breaks a damping cycle mid-contact.
     root_y_physics_enable: bool = True
     root_y_flight_strength: float = 0.18
-    root_y_min_flight_frames: int = 5
+    root_y_min_flight_frames: int = 3
+    # V46.3: biological fuse. If the no-contact interval is longer than this,
+    # treat it as corrupted contact labels / bad upstream generation, not a
+    # real human jump. Do not inject a huge ballistic parabola or landing dip.
+    root_y_max_flight_seconds: float = 1.20
     root_y_damping_max_dip: float = 0.018
+    # V46.8: cap landing damping to an early post-touchdown window.  The window
+    # still starts and ends at zero dip, but it no longer stretches across a
+    # multi-second support island and therefore cannot create delayed squats.
+    root_y_damping_max_seconds: float = 0.28
+
+    # V46.8: root-aware cloud-step guard. A true cloud-step requires foot travel
+    # to be consistent with root/CoM translation; smooth AI dark-drift with no
+    # body support is kept on the static-anchor repair path.
+    ik_cloud_root_min_travel_m: float = 0.045
+    ik_cloud_direction_cos_min: float = 0.35
+    ik_cloud_root_foot_rel_max_m: float = 0.18
+
+    # V46.8: long-sequence IK stitching and rollback safety.
+    ik_chunk_overlap: int = 24
+    rollback_skate_ratio: float = 1.18
+    rollback_jerk_ratio: float = 1.18
+    rollback_penetration_margin_m: float = 0.012
+    rollback_root_delta_max_m: float = 0.18
+
+    # V46.8: require real audio features for V44; false keeps the weak-proxy
+    # fallback for smoke tests, while reports mark it as weak supervision.
+    contrastive_require_real_music: bool = False
+    audio_pair_min_coverage: float = 0.15
+
+    # V46.8: Chang-E BVH is usually motion-only.  When no synchronized
+    # BVH/audio pairs exist, train V44 with real unpaired music clips plus
+    # semantic optimal-transport pseudo pairs instead of motion-descriptor
+    # self-distillation.  This keeps the method honest: the checkpoint records
+    # unpaired_audio_semantic_ot, not paired supervision.
+    unpaired_audio_enable: bool = True
+    unpaired_audio_slot_seconds: float = 4.0
+    unpaired_positive_topk: int = 8
+    unpaired_pairs_per_audio_slot: int = 4
+    unpaired_min_audio_slots: int = 1
+    unpaired_disable_motion_proxy: bool = False
+
     lower_body_only: bool = True
     refiner_enable: bool = True
     diffusion_enable: bool = True
@@ -404,9 +695,33 @@ class V46Config:
             "V46_BEAM_SIZE": ("beam_size", int),
             "V46_IK_ITERS": ("ik_iters", int),
             "V46_IK_SLIDE_RELEASE_M": ("ik_slide_release_m", float),
+            "V46_IK_CLOUD_STEP_SPEED_MPS": ("ik_cloud_step_speed_mps", float),
+            "V46_IK_SLIDING_ANCHOR_WINDOW": ("ik_sliding_anchor_window", int),
+            "V46_IK_CLOUD_SPEED_CV_MAX": ("ik_cloud_speed_cv_max", float),
+            "V46_IK_CLOUD_ROOT_MIN_TRAVEL_M": ("ik_cloud_root_min_travel_m", float),
+            "V46_IK_CLOUD_DIRECTION_COS_MIN": ("ik_cloud_direction_cos_min", float),
+            "V46_IK_CLOUD_ROOT_FOOT_REL_MAX_M": ("ik_cloud_root_foot_rel_max_m", float),
+            "V46_IK_CHUNK_OVERLAP": ("ik_chunk_overlap", int),
+            "V46_ROLLBACK_SKATE_RATIO": ("rollback_skate_ratio", float),
+            "V46_ROLLBACK_JERK_RATIO": ("rollback_jerk_ratio", float),
+            "V46_ROLLBACK_PENETRATION_MARGIN_M": ("rollback_penetration_margin_m", float),
+            "V46_ROLLBACK_ROOT_DELTA_MAX_M": ("rollback_root_delta_max_m", float),
+            "V46_CONTRASTIVE_REQUIRE_REAL_MUSIC": ("contrastive_require_real_music", lambda x: bool(int(x))),
+            "V46_AUDIO_PAIR_MIN_COVERAGE": ("audio_pair_min_coverage", float),
+            "V46_UNPAIRED_AUDIO_ENABLE": ("unpaired_audio_enable", lambda x: bool(int(x))),
+            "V46_UNPAIRED_AUDIO_SLOT_SECONDS": ("unpaired_audio_slot_seconds", float),
+            "V46_UNPAIRED_POSITIVE_TOPK": ("unpaired_positive_topk", int),
+            "V46_UNPAIRED_PAIRS_PER_AUDIO_SLOT": ("unpaired_pairs_per_audio_slot", int),
+            "V46_UNPAIRED_DISABLE_MOTION_PROXY": ("unpaired_disable_motion_proxy", lambda x: bool(int(x))),
+            "V46_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
             "V46_ENABLE_ROOT_Y_PHYSICS": ("root_y_physics_enable", lambda x: bool(int(x))),
+            "V46_ROOT_Y_MIN_FLIGHT_FRAMES": ("root_y_min_flight_frames", int),
+            "V46_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
             "V46_DIFFUSION_STEPS": ("diffusion_steps", int),
             "V46_DEVICE": ("device", str),
+            "V46_BVH_RESAMPLE_TO_CONFIG_FPS": ("bvh_resample_to_config_fps", lambda x: bool(int(x))),
+            "V46_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
+            "V46_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
         }
         for e, (attr, caster) in env_map.items():
             if e in os.environ:
@@ -498,7 +813,7 @@ def source_group_from_path(path: str | Path) -> str:
     return key
 
 
-def scan_motion_files(motion_dirs: Sequence[str], exts: Sequence[str] = (".npy", ".npz", ".pkl", ".pickle")) -> List[str]:
+def scan_motion_files(motion_dirs: Sequence[str], exts: Sequence[str] = (".npy", ".npz", ".pkl", ".pickle", ".bvh")) -> List[str]:
     files: List[str] = []
     for d in motion_dirs:
         if not d:
@@ -515,64 +830,298 @@ def scan_motion_files(motion_dirs: Sequence[str], exts: Sequence[str] = (".npy",
     return sorted(set(files))
 
 
+
+def resolve_path_from_roots(value: object, roots: Sequence[str | Path]) -> Optional[str]:
+    """Resolve manifest paths robustly against manifest dir, repo root, and motion dirs."""
+    if value is None:
+        return None
+    text = str(value).strip().strip('"').strip("'")
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    p = Path(text)
+    candidates: List[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        for r in roots:
+            if not r:
+                continue
+            candidates.append(Path(r) / p)
+            candidates.append(Path(r) / p.name)
+    # Direct hit.
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    # Fallback: recursive name search inside roots for screenshot-style change/*.bvh.
+    name = p.name
+    if name:
+        for r in roots:
+            rr = Path(r)
+            if rr.exists() and rr.is_dir():
+                hits = list(rr.rglob(name))
+                if hits:
+                    return str(hits[0])
+    return None
+
+
+def _coerce_int(value: object, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return default
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def _coerce_float(value: object, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return default
+        return float(text)
+    except Exception:
+        return default
+
+
+def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+    """
+    Resample BVH-derived EDGE-like arrays to cfg.fps before event slicing.
+
+    load_bvh_file stores the native BVH FPS in motion[:,0].  Chang-E/manifest
+    BVH can be about 210fps; slicing 120 native frames as if they were 30fps
+    would silently turn a 4s event into a 0.57s fragment.  This guard is critical
+    for scientific duration priors and for V44/V45/V46 training stability.
+    """
+    x = np.asarray(motion, dtype=np.float32)
+    if x.ndim != 2 or x.shape[0] < 2:
+        return x, {"resampled": False, "reason": "too_short"}
+    native = float(np.nanmedian(x[:, 0])) if np.isfinite(x[:, 0]).any() and float(np.nanmedian(x[:, 0])) > 1.0 else float(cfg.fps)
+    target = float(cfg.fps)
+    if (not bool(getattr(cfg, "bvh_resample_to_config_fps", True))) or abs(native - target) < 1e-3:
+        y = x.copy()
+        y[:, 0] = target
+        return y.astype(np.float32), {"resampled": False, "native_fps": native, "target_fps": target, "frames": int(len(x))}
+    new_len = max(2, int(round(x.shape[0] * target / max(native, 1e-6))))
+    y = resample_motion_np(x, new_len)
+    y[:, 0] = target
+    return y.astype(np.float32), {"resampled": True, "native_fps": native, "target_fps": target, "frames_before": int(len(x)), "frames_after": int(new_len)}
+
+
+def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[str], cfg: V46Config) -> List[dict]:
+    """
+    Read an optional manifest.csv and return normalized source-aware records.
+
+    Supported columns follow the user's prior manifest document:
+      source_bvh, fragment_file, fragment_index, label,
+      start_frame, end_frame, start_time, end_time, duration_sec, bvh_fps.
+    The manifest is an upstream semantic slicing index, not a finished RAG DB;
+    we keep its fields as parent metadata and still compute tensor/contact/boundary
+    descriptors here.
+    """
+    if not manifest_path or not bool(getattr(cfg, "manifest_enable", True)):
+        return []
+    mp = Path(manifest_path)
+    if not mp.exists():
+        return []
+    roots: List[Path] = [mp.parent, Path.cwd()]
+    for d in motion_dirs or []:
+        roots.append(Path(d))
+    rows: List[dict] = []
+    with open(mp, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for ridx, row in enumerate(reader):
+            fragment = resolve_path_from_roots(row.get("fragment_file") or row.get("path") or row.get("file"), roots)
+            source = resolve_path_from_roots(row.get("source_bvh") or row.get("source_file") or row.get("bvh"), roots)
+            load_path = fragment or source
+            if not load_path:
+                continue
+            start_frame = _coerce_int(row.get("start_frame"), None)
+            end_frame = _coerce_int(row.get("end_frame"), None)
+            label = str(row.get("label") or row.get("motion_event") or row.get("fragment_name") or Path(load_path).stem)
+            source_name = str(row.get("source_bvh") or Path(source or load_path).name)
+            rows.append({
+                "manifest_id": ridx,
+                "manifest_path": str(mp),
+                "load_path": str(load_path),
+                "source_file": str(source or load_path),
+                "source_bvh": source_name,
+                "fragment_file": str(fragment) if fragment else None,
+                "fragment_index": _coerce_int(row.get("fragment_index"), ridx),
+                "label": label,
+                "parent_label": label,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "duration_sec_manifest": _coerce_float(row.get("duration_sec"), None),
+                "bvh_fps_manifest": _coerce_float(row.get("bvh_fps"), None),
+                "raw_manifest_row": {k: row.get(k) for k in row.keys()},
+            })
+    return rows
+
+
+def iter_source_records(args: argparse.Namespace, cfg: V46Config) -> Tuple[List[dict], dict]:
+    """Return load records from manifest when available, otherwise from motion_dirs."""
+    motion_dirs = list(getattr(args, "motion_dirs", None) or [])
+    manifest_records = read_manifest_records(getattr(args, "manifest", None), motion_dirs, cfg)
+    if manifest_records:
+        return manifest_records, {"input_mode": "manifest", "manifest_records": len(manifest_records), "motion_dirs": motion_dirs}
+    files = scan_motion_files(motion_dirs)
+    if not files:
+        raise FileNotFoundError(f"No motion files found in: {motion_dirs}")
+    return [{"load_path": f, "source_file": f, "source_bvh": Path(f).name, "label": infer_label_from_filename(f), "fragment_index": 0} for f in files], {"input_mode": "direct_files", "files": len(files), "motion_dirs": motion_dirs}
+
+
+def infer_label_from_filename(path: str | Path) -> str:
+    stem = Path(path).stem.lower()
+    for token in ["female_", "male_"]:
+        stem = stem.replace(token, "")
+    return stem
+
+
+def add_event_to_db_lists(
+    clip: np.ndarray,
+    event_idx: int,
+    out_path: Path,
+    cfg: V46Config,
+    source: str,
+    matched_audio: Optional[str],
+    st: int,
+    base_meta: dict,
+    descs: List[np.ndarray], entries: List[np.ndarray], exits: List[np.ndarray], c0s: List[np.ndarray], c1s: List[np.ndarray],
+    music_feats: List[np.ndarray], music_masks: List[float], meta: List[dict],
+) -> None:
+    np.save(out_path, clip.astype(np.float32))
+    desc = event_descriptor(clip, cfg.fps)
+    entry, exit_, c0, c1 = motion_boundary_state(clip)
+    if matched_audio:
+        try:
+            music_feat = audio_feature_for_motion_clip(matched_audio, st, clip.shape[0], cfg)
+            music_mask = 1.0
+        except Exception as exc:
+            print(f"[V46.8 WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
+            music_feat = np.zeros(32, dtype=np.float32)
+            music_mask = 0.0
+    else:
+        music_feat = np.zeros(32, dtype=np.float32)
+        music_mask = 0.0
+    descs.append(desc)
+    entries.append(entry)
+    exits.append(exit_)
+    c0s.append(c0)
+    c1s.append(c1)
+    music_feats.append(music_feat.astype(np.float32))
+    music_masks.append(float(music_mask))
+    item = {
+        "event_id": event_idx,
+        "path": str(out_path),
+        "source_file": str(base_meta.get("source_file", base_meta.get("load_path", ""))),
+        "source_bvh": str(base_meta.get("source_bvh", Path(str(base_meta.get("source_file", "source"))).name)),
+        "source_group": source,
+        "matched_audio": matched_audio,
+        "has_real_audio_feature": bool(music_mask > 0.5),
+        "seq_id": int(base_meta.get("seq_id", 0)),
+        "start": int(st),
+        "end": int(st + clip.shape[0]),
+        "frames": int(clip.shape[0]),
+        "duration": float(clip.shape[0] / max(float(cfg.fps), 1e-6)),
+        "label": str(base_meta.get("label", infer_label_from_filename(base_meta.get("source_file", out_path)))),
+        "parent_label": str(base_meta.get("parent_label", base_meta.get("label", "unknown"))),
+        "fragment_index": int(base_meta.get("fragment_index", 0) or 0),
+        "manifest_id": base_meta.get("manifest_id"),
+        "manifest_path": base_meta.get("manifest_path"),
+        "input_mode": base_meta.get("input_mode", "direct_files"),
+    }
+    if "resample_report" in base_meta:
+        item["resample_report"] = base_meta["resample_report"]
+    meta.append(item)
+
 def build_db(args: argparse.Namespace) -> int:
     cfg = V46Config.from_json(args.config).apply_env()
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     out_dir = ensure_dir(args.out_db)
-    files = scan_motion_files(args.motion_dirs)
-    if not files:
-        raise FileNotFoundError(f"No motion files found in: {args.motion_dirs}")
-    motions: List[np.ndarray] = []
+    audio_files = collect_audio_files(getattr(args, "audio_dirs", None))
+    records, input_report = iter_source_records(args, cfg)
+    audio_match_cache: Dict[str, Optional[str]] = {}
+
     meta: List[dict] = []
     descs: List[np.ndarray] = []
     entries: List[np.ndarray] = []
     exits: List[np.ndarray] = []
     c0s: List[np.ndarray] = []
     c1s: List[np.ndarray] = []
+    music_feats: List[np.ndarray] = []
+    music_masks: List[float] = []
+    resample_reports: List[dict] = []
 
     npy_dir = ensure_dir(out_dir / "events")
     event_idx = 0
-    for f in files:
+    for rec in records:
+        f = str(rec["load_path"])
         seqs = load_motion_file(f)
         if not seqs:
             continue
-        source = source_group_from_path(f)
-        for seq_id, seq in enumerate(seqs):
+        # Manifest rows can reference a full source_bvh plus original high-FPS frame range.
+        start_frame = rec.get("start_frame")
+        end_frame = rec.get("end_frame")
+        source_key_path = rec.get("source_file") or f
+        source = source_group_from_path(source_key_path)
+        if source_key_path not in audio_match_cache:
+            audio_match_cache[str(source_key_path)] = find_matching_audio_for_motion(str(source_key_path), audio_files)
+        matched_audio = audio_match_cache.get(str(source_key_path))
+
+        for seq_id, seq_raw in enumerate(seqs):
+            seq = np.asarray(seq_raw, dtype=np.float32)
+            if start_frame is not None or end_frame is not None:
+                a = max(0, int(start_frame or 0))
+                b = min(seq.shape[0], int(end_frame if end_frame is not None else seq.shape[0]))
+                if b > a:
+                    seq = seq[a:b]
+            seq, res_report = resample_motion_to_config_fps(seq, cfg)
+            resample_reports.append(res_report)
             T = seq.shape[0]
             if T < cfg.min_event_frames:
                 continue
-            # Full natural segment when short enough; otherwise sliding source-aware events.
-            starts = [0] if T <= cfg.max_event_frames else list(range(0, max(1, T - cfg.min_event_frames + 1), cfg.hop_len))
+            # Manifest rows are motif-level semantic clips.  If enabled, split long
+            # motif clips into event-level windows while preserving parent metadata;
+            # otherwise preserve each motif as one event.
+            if rec.get("manifest_id") is not None and not bool(getattr(cfg, "manifest_secondary_event_split", True)):
+                starts = [0]
+                win = min(T, cfg.max_event_frames)
+            else:
+                starts = [0] if T <= cfg.max_event_frames else list(range(0, max(1, T - cfg.min_event_frames + 1), cfg.hop_len))
+                win = cfg.window_len
             for st in starts:
-                end = min(T, st + cfg.window_len)
-                if end - st < cfg.min_event_frames:
+                endf = min(T, st + win)
+                if endf - st < cfg.min_event_frames:
                     continue
-                clip = seq[st:end].astype(np.float32)
+                clip = seq[st:endf].astype(np.float32)
                 if clip.shape[0] > cfg.max_event_frames:
                     clip = clip[: cfg.max_event_frames]
                 path = npy_dir / f"event_{event_idx:07d}.npy"
-                np.save(path, clip)
-                desc = event_descriptor(clip, cfg.fps)
-                entry, exit_, c0, c1 = motion_boundary_state(clip)
-                motions.append(clip)
-                descs.append(desc)
-                entries.append(entry)
-                exits.append(exit_)
-                c0s.append(c0)
-                c1s.append(c1)
-                meta.append(
-                    {
-                        "event_id": event_idx,
-                        "path": str(path),
-                        "source_file": f,
-                        "source_group": source,
-                        "seq_id": seq_id,
-                        "start": int(st),
-                        "end": int(st + clip.shape[0]),
-                        "frames": int(clip.shape[0]),
-                        "duration": float(clip.shape[0] / cfg.fps),
-                    }
+                base_meta = dict(rec)
+                base_meta.update({"seq_id": seq_id, "resample_report": res_report, "input_mode": input_report.get("input_mode")})
+                add_event_to_db_lists(
+                    clip=clip,
+                    event_idx=event_idx,
+                    out_path=path,
+                    cfg=cfg,
+                    source=source,
+                    matched_audio=matched_audio,
+                    st=st,
+                    base_meta=base_meta,
+                    descs=descs,
+                    entries=entries,
+                    exits=exits,
+                    c0s=c0s,
+                    c1s=c1s,
+                    music_feats=music_feats,
+                    music_masks=music_masks,
+                    meta=meta,
                 )
                 event_idx += 1
 
@@ -595,11 +1144,40 @@ def build_db(args: argparse.Namespace) -> int:
         contact_exit=np.stack(c1s).astype(np.float32),
         paths=np.array([m["path"] for m in meta], dtype=object),
         source_groups=np.array([m["source_group"] for m in meta], dtype=object),
+        labels=np.array([m.get("label", "unknown") for m in meta], dtype=object),
+        parent_labels=np.array([m.get("parent_label", m.get("label", "unknown")) for m in meta], dtype=object),
+        source_bvh=np.array([m.get("source_bvh", "") for m in meta], dtype=object),
         durations=np.array([m["duration"] for m in meta], dtype=np.float32),
         frames=np.array([m["frames"] for m in meta], dtype=np.int32),
+        music=np.stack(music_feats).astype(np.float32),
+        music_mask=np.array(music_masks, dtype=np.float32),
     )
-    save_json({"version": "v46_db", "config": dataclasses.asdict(cfg), "events": meta, "num_events": len(meta), "fk_tree_source": FK_TREE_SOURCE}, out_dir / "events_meta.json")
-    print(json.dumps({"db": str(db_path), "num_events": len(meta), "out_dir": str(out_dir)}, ensure_ascii=False, indent=2))
+    audio_coverage = float(np.mean(music_masks)) if music_masks else 0.0
+    split_audit = {
+        "num_sources_total": int(len(set(str(m.get("source_group")) for m in meta))),
+        "num_labels_total": int(len(set(str(m.get("label")) for m in meta))),
+        "events_per_source_min": int(min([sum(str(x.get("source_group")) == s for x in meta) for s in set(str(m.get("source_group")) for m in meta)])),
+        "events_per_source_max": int(max([sum(str(x.get("source_group")) == s for x in meta) for s in set(str(m.get("source_group")) for m in meta)])),
+        "train_val_group_overlap": 0,  # no random sample split is produced here; downstream split must remain source-disjoint.
+    }
+    report = {
+        "version": "v46_8_project_aligned_source_aware_db",
+        "config": dataclasses.asdict(cfg),
+        "events": meta,
+        "num_events": len(meta),
+        "audio_feature_coverage": audio_coverage,
+        "audio_files_seen": len(audio_files),
+        "input_report": input_report,
+        "resample_summary": {
+            "resampled_count": int(sum(1 for r in resample_reports if r.get("resampled"))),
+            "native_fps_values": sorted(set(round(float(r.get("native_fps", cfg.fps)), 6) for r in resample_reports if "native_fps" in r))[:12],
+            "target_fps": float(cfg.fps),
+        },
+        "split_audit": split_audit,
+        "fk_tree_source": FK_TREE_SOURCE,
+    }
+    save_json(report, out_dir / "events_meta.json")
+    print(json.dumps({"db": str(db_path), "num_events": len(meta), "out_dir": str(out_dir), "audio_feature_coverage": audio_coverage, "audio_files_seen": len(audio_files), "input_mode": input_report.get("input_mode"), "resampled_count": report["resample_summary"]["resampled_count"]}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -665,6 +1243,80 @@ def audio_global_features(wav: np.ndarray, sr: int) -> np.ndarray:
     if out.size < 32:
         out = np.pad(out, (0, 32 - out.size))
     return out[:32].astype(np.float32)
+
+
+def collect_audio_files(audio_dirs: Optional[Sequence[str]]) -> List[str]:
+    """Collect wav/mp3-like files for optional real-audio V44 pairing."""
+    if not audio_dirs:
+        return []
+    exts = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+    files: List[str] = []
+    for d in audio_dirs:
+        if not d:
+            continue
+        p = Path(d)
+        if p.is_file() and p.suffix.lower() in exts:
+            files.append(str(p))
+        elif p.exists():
+            for ext in exts:
+                files.extend(glob.glob(str(p / "**" / f"*{ext}"), recursive=True))
+    return sorted(set(files))
+
+
+def _match_key(path: str | Path) -> str:
+    stem = Path(path).stem.lower()
+    keep = []
+    for ch in stem:
+        keep.append(ch if ch.isalnum() else "_")
+    tokens = [t for t in "".join(keep).split("_") if t and t not in {"motion", "audio", "music", "wav", "npy", "clip"}]
+    return "_".join(tokens)
+
+
+def find_matching_audio_for_motion(motion_path: str | Path, audio_files: Sequence[str]) -> Optional[str]:
+    """Best-effort same-stem / token-overlap pairing for Chang-E/change exports."""
+    if not audio_files:
+        return None
+    key = _match_key(motion_path)
+    if not key:
+        return None
+    audio_keys = [(_match_key(a), a) for a in audio_files]
+    for ak, a in audio_keys:
+        if ak == key:
+            return a
+    for ak, a in audio_keys:
+        if ak and (ak in key or key in ak):
+            return a
+    kt = set(key.split("_"))
+    best = (0.0, None)
+    for ak, a in audio_keys:
+        at = set(ak.split("_"))
+        if not at:
+            continue
+        score = len(kt & at) / max(len(kt | at), 1)
+        if score > best[0]:
+            best = (score, a)
+    return best[1] if best[0] >= 0.35 else None
+
+
+def audio_feature_for_motion_clip(audio_path: str | Path, start_frame: int, frames: int, cfg: V46Config) -> np.ndarray:
+    """Extract a 32D real audio descriptor aligned to a motion clip interval."""
+    sr, wav = read_wav_mono(audio_path)
+    st = max(0, int(round((start_frame / max(float(cfg.fps), 1e-6)) * sr)))
+    ed = min(wav.size, int(round(((start_frame + frames) / max(float(cfg.fps), 1e-6)) * sr)))
+    if ed - st < max(64, int(0.10 * sr)):
+        st, ed = 0, wav.size
+    return audio_global_features(wav[st:ed], sr).astype(np.float32)
+
+
+def standardize_features(x: np.ndarray, mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float32)
+    if mask is not None and np.asarray(mask).astype(bool).any():
+        base = x[np.asarray(mask).astype(bool)]
+    else:
+        base = x
+    mean = base.mean(axis=0, keepdims=True).astype(np.float32)
+    std = (base.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
+    return ((x - mean) / std).astype(np.float32), mean, std
 
 
 def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
@@ -746,12 +1398,125 @@ class ContrastiveModel(nn.Module):
 
 def make_weak_music_features_from_motion(desc: np.ndarray, noise: float = 0.08) -> np.ndarray:
     # Weak-pair fallback: retain duration/energy/turn/contact semantics with jitter.
+    # V46.8 keeps this only as an explicitly marked smoke-test fallback.  For
+    # motion-only Chang-E BVH, prefer unpaired real-audio semantic OT below.
     m = desc.copy().astype(np.float32)
     rng = np.random.default_rng(1234)
     m[:, 1:9] *= rng.normal(1.0, noise, size=m[:, 1:9].shape).astype(np.float32)
     m[:, 15:18] *= rng.normal(1.0, noise * 1.5, size=m[:, 15:18].shape).astype(np.float32)
     m += rng.normal(0.0, noise * 0.15, size=m.shape).astype(np.float32)
     return m.astype(np.float32)
+
+
+def semantic_dims_and_weights() -> Tuple[np.ndarray, np.ndarray]:
+    """Feature weights shared by unpaired audio-motion OT and retrieval fallback."""
+    dims = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 16, 17, 18], dtype=np.int64)
+    weights = np.array([
+        0.45,  # duration
+        0.80, 0.95, 0.75, 0.70,  # root/energy/dynamics
+        1.15, 1.00, 1.05, 0.90,  # joint/lower/upper energy
+        0.45, 0.35,              # lower/upper ratio + contact calmness
+        0.75, 0.75,              # foot speed
+        0.90, 0.95, 0.65,        # onset/turn/root-y dynamics
+    ], dtype=np.float32)
+    return dims, weights
+
+
+def load_unpaired_audio_feature_pool(audio_dirs: Optional[Sequence[str]], cfg: V46Config) -> Tuple[np.ndarray, List[dict]]:
+    """Load real, unpaired music clips and convert them to slot-level 32D features."""
+    files = collect_audio_files(audio_dirs)
+    feats: List[np.ndarray] = []
+    meta: List[dict] = []
+    for f in files:
+        try:
+            slots, sf = audio_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds))
+        except Exception as exc:
+            print(f"[V46.8 WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
+            continue
+        for slot, feat in zip(slots, sf):
+            feats.append(feat.astype(np.float32))
+            meta.append({"audio": str(f), "slot": dict(slot)})
+    if not feats:
+        return np.zeros((0, 32), dtype=np.float32), []
+    return np.stack(feats).astype(np.float32), meta
+
+
+def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[str]], cfg: V46Config) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]]:
+    """
+    Build semantic pseudo pairs for the realistic Chang-E case: BVH motions and
+    music exist, but they are not synchronized.
+
+    This is not paired supervision.  It uses real music slot features and
+    motion descriptors, then solves a lightweight semantic assignment: energetic
+    / onset-rich music slots are matched to high-energy / turning / expressive
+    motion events, calm slots to low-density events, and durations are softly
+    matched.  The checkpoint explicitly records this as
+    ``unpaired_audio_semantic_ot``.
+    """
+    audio_raw, audio_meta = load_unpaired_audio_feature_pool(audio_dirs, cfg)
+    if audio_raw.shape[0] < int(cfg.unpaired_min_audio_slots):
+        return None
+
+    motion_z = np.asarray(db["desc_z"], dtype=np.float32)
+    desc_mean = np.asarray(db["desc_mean"], dtype=np.float32)
+    desc_std = np.asarray(db["desc_std"], dtype=np.float32)
+    music_z_all = ((audio_raw - desc_mean) / np.maximum(desc_std, 1e-6)).astype(np.float32)
+    # Small motion-only datasets can have nearly-zero std on some descriptor
+    # channels. Clip both modalities before OT/training to avoid a single
+    # degenerate dimension dominating the semantic assignment.
+    music_z_all = np.clip(music_z_all, -8.0, 8.0).astype(np.float32)
+    motion_z = np.clip(motion_z, -8.0, 8.0).astype(np.float32)
+
+    dims, weights = semantic_dims_and_weights()
+    mz = music_z_all[:, dims]
+    dz = motion_z[:, dims]
+    # Weighted squared distance gives a stable OT-like semantic cost without
+    # requiring paired labels.  Add a tiny deterministic jitter to break ties.
+    diff = mz[:, None, :] - dz[None, :, :]
+    cost = np.sum((diff * weights[None, None, :]) ** 2, axis=-1)
+    rng = np.random.default_rng(int(cfg.seed) + 4607)
+    cost = cost + rng.normal(0.0, 1e-5, size=cost.shape).astype(np.float32)
+
+    topk = max(1, min(int(cfg.unpaired_positive_topk), motion_z.shape[0]))
+    pairs_per = max(1, min(int(cfg.unpaired_pairs_per_audio_slot), topk))
+    music_pairs: List[np.ndarray] = []
+    motion_pairs: List[np.ndarray] = []
+    pair_preview: List[dict] = []
+    for ai in range(cost.shape[0]):
+        # Take top-k compatible motions, then sample a few. This avoids one
+        # audio slot collapsing to a single hub event and improves source spread.
+        top = np.argpartition(cost[ai], topk - 1)[:topk]
+        top = top[np.argsort(cost[ai, top])]
+        chosen = top[:pairs_per]
+        for mi in chosen:
+            music_pairs.append(music_z_all[ai])
+            motion_pairs.append(motion_z[int(mi)])
+        if len(pair_preview) < 16:
+            pair_preview.append({
+                "audio": audio_meta[ai]["audio"],
+                "slot_id": int(audio_meta[ai]["slot"].get("slot_id", ai)),
+                "slot_energy": float(audio_meta[ai]["slot"].get("energy", 0.0)),
+                "top_motion_ids": [int(x) for x in top[:min(5, len(top))].tolist()],
+                "top_costs": [float(cost[ai, int(x)]) for x in top[:min(5, len(top))].tolist()],
+            })
+
+    if len(music_pairs) < 2:
+        return None
+    music = np.stack(music_pairs).astype(np.float32)
+    motion = np.stack(motion_pairs).astype(np.float32)
+    report = {
+        "mode": "unpaired_audio_semantic_ot",
+        "audio_files": sorted(set(m["audio"] for m in audio_meta)),
+        "num_audio_slots": int(audio_raw.shape[0]),
+        "num_motion_events": int(motion_z.shape[0]),
+        "num_training_pairs": int(music.shape[0]),
+        "positive_topk": int(topk),
+        "pairs_per_audio_slot": int(pairs_per),
+        "semantic_dims": [int(x) for x in dims.tolist()],
+        "semantic_weights": [float(x) for x in weights.tolist()],
+        "pair_preview": pair_preview,
+    }
+    return music, motion, desc_mean.astype(np.float32), desc_std.astype(np.float32), report
 
 
 def load_db(db_path: str | Path) -> dict:
@@ -765,19 +1530,55 @@ def train_contrastive(args: argparse.Namespace) -> int:
     cfg = V46Config.from_json(args.config).apply_env()
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
     db = load_db(args.db)
-    motion = np.asarray(db["desc_z"], dtype=np.float32)
+    motion_db = np.asarray(db["desc_z"], dtype=np.float32)
+    supervision_mode = "weak_motion_proxy"
+    pair_report: Dict[str, object] = {}
+
     if args.music_feature_npz and Path(args.music_feature_npz).exists():
-        mf = np.load(args.music_feature_npz)["music"].astype(np.float32)
-        if mf.shape != motion.shape:
-            raise ValueError(f"music feature shape {mf.shape} != motion feature shape {motion.shape}")
-        music = mf
+        mf_npz = np.load(args.music_feature_npz)
+        key = "music_z" if "music_z" in mf_npz.files else "music"
+        mf = mf_npz[key].astype(np.float32)
+        if mf.shape != motion_db.shape:
+            raise ValueError(f"music feature shape {mf.shape} != motion feature shape {motion_db.shape}")
+        music, music_mean, music_std = standardize_features(mf)
+        motion = motion_db
+        supervision_mode = "external_real_music_features"
+        pair_report = {"mode": supervision_mode, "num_training_pairs": int(motion.shape[0])}
+    elif "music" in db and "music_mask" in db and float(np.mean(np.asarray(db["music_mask"], dtype=np.float32) > 0.5)) >= float(cfg.audio_pair_min_coverage):
+        mask = np.asarray(db["music_mask"], dtype=np.float32) > 0.5
+        music_raw = np.asarray(db["music"], dtype=np.float32)
+        music, music_mean, music_std = standardize_features(music_raw, mask=mask)
+        motion = motion_db[mask]
+        music = music[mask]
+        supervision_mode = "paired_audio_features_from_db"
+        pair_report = {"mode": supervision_mode, "paired_coverage": float(mask.mean()), "num_training_pairs": int(motion.shape[0])}
     else:
-        music_raw = make_weak_music_features_from_motion(np.asarray(db["desc"], dtype=np.float32))
-        mean = np.asarray(db["desc_mean"], dtype=np.float32)
-        std = np.asarray(db["desc_std"], dtype=np.float32)
-        music = (music_raw - mean) / std
-    N = motion.shape[0]
+        unpaired_dirs = getattr(args, "unpaired_audio_dirs", None) or getattr(args, "audio_dirs", None)
+        unpaired = build_unpaired_audio_motion_pairs(db, unpaired_dirs, cfg) if bool(cfg.unpaired_audio_enable) else None
+        if unpaired is not None:
+            music, motion, music_mean, music_std, pair_report = unpaired
+            supervision_mode = "unpaired_audio_semantic_ot"
+        else:
+            if bool(cfg.contrastive_require_real_music) or bool(cfg.unpaired_disable_motion_proxy):
+                raise RuntimeError(
+                    "No paired audio and no usable unpaired audio were found. "
+                    "Put target music under test_music_bank/ or data/music/, or set "
+                    "V46_UNPAIRED_DISABLE_MOTION_PROXY=0 for a smoke-test-only fallback."
+                )
+            music_raw = make_weak_music_features_from_motion(np.asarray(db["desc"], dtype=np.float32))
+            mean = np.asarray(db["desc_mean"], dtype=np.float32)
+            std = np.asarray(db["desc_std"], dtype=np.float32)
+            music = (music_raw - mean) / std
+            motion = motion_db
+            music_mean, music_std = mean, std
+            supervision_mode = "weak_motion_descriptor_proxy"
+            pair_report = {"mode": supervision_mode, "warning": "motion descriptor self-distillation; do not report as real music-motion pairing", "num_training_pairs": int(motion.shape[0])}
+
+    N = int(motion.shape[0])
+    if N < 2:
+        raise RuntimeError("V44 contrastive needs at least two training pairs.")
     device = torch.device(cfg.device)
     model = ContrastiveModel(motion.shape[1], cfg.embed_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
@@ -800,14 +1601,23 @@ def train_contrastive(args: argparse.Namespace) -> int:
             opt.step()
             losses.append(float(loss.detach().cpu()))
         if ep % 10 == 0 or ep == int(args.epochs or cfg.contrastive_epochs) - 1:
-            print(f"[V44 contrastive] epoch={ep} loss={np.mean(losses):.5f} scale={model.logit_scale.exp().item():.2f}")
+            print(f"[V44 contrastive] epoch={ep} loss={np.mean(losses):.5f} scale={model.logit_scale.exp().item():.2f} mode={supervision_mode}")
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    ckpt = {"version": "v44_contrastive", "state_dict": model.state_dict(), "config": dataclasses.asdict(cfg), "feat_dim": motion.shape[1], "embed_dim": cfg.embed_dim}
+    ckpt = {
+        "version": "v44_7_unpaired_audio_semantic_grounding",
+        "state_dict": model.state_dict(),
+        "config": dataclasses.asdict(cfg),
+        "feat_dim": motion.shape[1],
+        "embed_dim": cfg.embed_dim,
+        "supervision_mode": supervision_mode,
+        "music_mean": music_mean.astype(np.float32),
+        "music_std": music_std.astype(np.float32),
+        "pair_report": pair_report,
+    }
     torch.save(ckpt, out)
-    print(json.dumps({"contrastive_ckpt": str(out), "num_events": int(N)}, ensure_ascii=False, indent=2))
+    print(json.dumps({"contrastive_ckpt": str(out), "num_pairs": int(N), "supervision_mode": supervision_mode, "pair_report": pair_report}, ensure_ascii=False, indent=2))
     return 0
-
 
 class TemporalRefiner(nn.Module):
     def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256):
@@ -1024,6 +1834,9 @@ def load_contrastive(path: Optional[str], cfg: V46Config):
     ckpt = torch.load(path, map_location=cfg.device)
     model = ContrastiveModel(ckpt.get("feat_dim", 32), ckpt.get("embed_dim", cfg.embed_dim)).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
+    model.music_mean = np.asarray(ckpt.get("music_mean", np.zeros((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
+    model.music_std = np.asarray(ckpt.get("music_std", np.ones((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
+    model.supervision_mode = ckpt.get("supervision_mode", "unknown")
     model.eval()
     return model
 
@@ -1057,7 +1870,14 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
     desc_z = np.asarray(db["desc_z"], dtype=np.float32)
     mean = np.asarray(db["desc_mean"], dtype=np.float32)
     std = np.asarray(db["desc_std"], dtype=np.float32)
-    music_z = (slot_feat - mean) / std
+    if contrastive is not None and hasattr(contrastive, "music_mean") and hasattr(contrastive, "music_std"):
+        music_mean = np.asarray(getattr(contrastive, "music_mean"), dtype=np.float32)
+        music_std = np.asarray(getattr(contrastive, "music_std"), dtype=np.float32)
+        music_z = (slot_feat - music_mean) / np.maximum(music_std, 1e-6)
+    else:
+        music_z = (slot_feat - mean) / std
+    music_z = np.clip(music_z, -8.0, 8.0).astype(np.float32)
+    desc_z = np.clip(desc_z, -8.0, 8.0).astype(np.float32)
     music_emb, motion_emb = embed_with_contrastive(contrastive, music_z, desc_z, cfg)
     sources = np.asarray(db["source_groups"], dtype=object)
     durations = np.asarray(db["durations"], dtype=np.float32)
@@ -1276,13 +2096,20 @@ def smoothstep01(x: np.ndarray | float) -> np.ndarray | float:
 
 def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
     """
-    V46.1 root-Y safety pass.
+    V46.2 root-Y safety pass.
 
-    Fixes two common post-process artifacts:
+    Fixes three common post-process artifacts:
     1) Damping Snap Bug: landing damping length is the real contact duration,
        so the damping dip is exactly zero before the next flight frame.
     2) C1 Discontinuity: flight/parabola blending uses a Hanning/sin^2 gate,
        whose first derivative is zero at takeoff and landing boundaries.
+    3) Micro-Flight Shock Bug: landing damping is applied only when the
+       immediately preceding flight island is a real effective flight. The same
+       cfg.root_y_min_flight_frames threshold gates both parabola and damping,
+       so a 1-2 frame denoising gap cannot create a ghost landing hit.
+    4) Space-Jump Bug: extremely long no-contact islands are treated as broken
+       contact labels / bad upstream generation and are fused off before the
+       ballistic parabola can launch the root several meters into the air.
 
     Only the legal EDGE root-Y channel is edited here; lower-body IK later writes
     legal lower-body rot6d channels.
@@ -1294,11 +2121,26 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
     root_y0 = out[:, ROOT_Y_IDX].copy()
     any_contact = contacts.any(axis=1)
     is_flight = ~any_contact
+    fps = max(float(cfg.fps), 1e-6)
+    min_effective_flight = max(1, int(cfg.root_y_min_flight_frames))
+    max_biological_flight_s = float(max(cfg.root_y_max_flight_seconds, 1.0 / fps))
+    max_biological_flight_frames = max(min_effective_flight, int(round(max_biological_flight_s * fps)))
 
     flight_applied = 0
+    flight_skipped_micro = 0
+    flight_skipped_space_jump = 0
     for start, end in contiguous_regions(is_flight):
         n = end - start
-        if n < int(cfg.root_y_min_flight_frames):
+        if n < min_effective_flight:
+            flight_skipped_micro += 1
+            continue
+        air_duration = n / fps
+        # V46.3 biological fuse: a 2+ second no-contact interval in generated
+        # long dance is almost always broken contact labels / bad retrieval, not
+        # a valid human jump. Injecting a physical parabola would create a
+        # multi-meter "space launch". Preserve the native root trajectory instead.
+        if air_duration > max_biological_flight_s:
+            flight_skipped_space_jump += 1
             continue
         left = max(0, start - 1)
         right = min(len(root_y0) - 1, end)
@@ -1306,50 +2148,124 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
             continue
         y0 = float(root_y0[left])
         y1 = float(root_y0[right])
-        duration = max((right - left) / max(float(cfg.fps), 1e-6), 1.0 / max(float(cfg.fps), 1e-6))
+        duration = max((right - left) / fps, 1.0 / fps)
         v0 = (y1 - y0 + 0.5 * 9.81 * duration * duration) / duration
         for k, ti in enumerate(range(start, end)):
             # Use exact endpoint phases for zero-value/zero-slope blend.
             phase = 0.0 if n <= 1 else k / float(n - 1)
             gate = float(cfg.root_y_flight_strength) * float(c1_hanning_window01(phase))
-            tau = (ti - left) / max(float(cfg.fps), 1e-6)
+            tau = (ti - left) / fps
             parabola = y0 + v0 * tau - 0.5 * 9.81 * tau * tau
             out[ti, ROOT_Y_IDX] = (1.0 - gate) * out[ti, ROOT_Y_IDX] + gate * parabola
         flight_applied += 1
 
     damping_applied = 0
+    damping_skipped_micro_flight = 0
+    damping_skipped_space_jump_flight = 0
     damping_preview: List[Dict[str, object]] = []
     for start, end in contiguous_regions(any_contact):
         # Only damp actual landings: a contact island that follows flight.
         if start <= 0 or any_contact[start - 1]:
             continue
-        n = end - start
+
+        # V46.2 terminal guard: trace the immediately preceding no-contact
+        # island. Damping is allowed only if this flight island was long enough
+        # to receive the ballistic treatment. This preserves logical
+        # conservation between parabola and landing damping, and prevents a
+        # 1-2 frame per-foot-filter gap from creating a ghost impact dip.
+        prev_flight_end = start
+        prev_flight_start = prev_flight_end
+        while prev_flight_start > 0 and not bool(any_contact[prev_flight_start - 1]):
+            prev_flight_start -= 1
+        prev_flight_len = prev_flight_end - prev_flight_start
+        if prev_flight_len < min_effective_flight:
+            damping_skipped_micro_flight += 1
+            if len(damping_preview) < 24:
+                damping_preview.append({
+                    "start": int(start),
+                    "end": int(end),
+                    "frames": int(end - start),
+                    "skipped": True,
+                    "reason": "preceding_micro_flight",
+                    "preceding_flight_start": int(prev_flight_start),
+                    "preceding_flight_end": int(prev_flight_end),
+                    "preceding_flight_frames": int(prev_flight_len),
+                    "min_effective_flight_frames": int(min_effective_flight),
+                })
+            continue
+        prev_flight_duration = prev_flight_len / fps
+        if prev_flight_duration > max_biological_flight_s or prev_flight_len > max_biological_flight_frames:
+            damping_skipped_space_jump_flight += 1
+            if len(damping_preview) < 24:
+                damping_preview.append({
+                    "start": int(start),
+                    "end": int(end),
+                    "frames": int(end - start),
+                    "skipped": True,
+                    "reason": "preceding_space_jump_flight",
+                    "preceding_flight_start": int(prev_flight_start),
+                    "preceding_flight_end": int(prev_flight_end),
+                    "preceding_flight_frames": int(prev_flight_len),
+                    "preceding_flight_seconds": float(prev_flight_duration),
+                    "max_biological_flight_seconds": float(max_biological_flight_s),
+                })
+            continue
+
+        contact_len = end - start
+        max_damp_frames = max(3, int(round(float(cfg.root_y_damping_max_seconds) * fps)))
+        n = min(contact_len, max_damp_frames)
         if n <= 2:
             continue
-        # Critical fix: dynamic damping duration is exactly this contact island.
-        # No break-on-flight is needed, and the last contact frame has zero dip.
+        # V46.8 critical fix: damping is capped to an early post-touchdown window
+        # instead of stretching across the whole contact island.  The chosen
+        # window still has zero dip at both ends, so it is C0-safe at the next
+        # untouched frame but cannot create a delayed squat in long support.
         max_abs_dip = 0.0
-        for k, ti in enumerate(range(start, end)):
+        for k, ti in enumerate(range(start, start + n)):
             phase = k / float(max(n - 1, 1))
             gate = float(c1_hanning_window01(phase))
-            # Decay shapes the dip toward early landing but remains exactly zero at both ends.
+            # Decay biases the cushion toward the landing instant while the
+            # Hanning gate keeps both value and first derivative zero at ends.
             dip = float(cfg.root_y_damping_max_dip) * math.exp(-4.0 * phase) * gate
             out[ti, ROOT_Y_IDX] -= dip
             max_abs_dip = max(max_abs_dip, abs(dip))
         damping_applied += 1
         if len(damping_preview) < 24:
-            damping_preview.append({"start": int(start), "end": int(end), "frames": int(n), "max_dip_m": float(max_abs_dip), "dynamic_duration": True})
+            damping_preview.append({
+                "start": int(start),
+                "end": int(end),
+                "frames": int(contact_len),
+                "damping_frames": int(n),
+                "max_damping_frames": int(max_damp_frames),
+                "max_dip_m": float(max_abs_dip),
+                "capped_early_duration": True,
+                "capped_seconds": float(cfg.root_y_damping_max_seconds),
+                "preceding_flight_frames": int(prev_flight_len),
+                "effective_flight_gated": True,
+            })
 
     delta = out[:, ROOT_Y_IDX] - root_y0
     return out.astype(np.float32), {
         "enabled": True,
-        "version": "v46_1_c1_dynamic_root_y_physics",
+        "version": "v46_3_biological_max_flight_fused_root_y_physics",
         "fixes_damping_snap": True,
         "fixes_c1_discontinuity": True,
+        "fixes_micro_flight_shock": True,
+        "fixes_space_jump_bug": True,
         "flight_gate": "hanning_sin_squared",
-        "damping_duration": "exact_contact_island_length",
+        "damping_duration": "capped_early_contact_window",
+        "damping_max_seconds": float(cfg.root_y_damping_max_seconds),
+        "damping_requires_effective_preceding_flight": True,
+        "ballistic_requires_biological_flight_duration": True,
+        "max_biological_flight_seconds": float(max_biological_flight_s),
+        "max_biological_flight_frames": int(max_biological_flight_frames),
+        "min_effective_flight_frames": int(min_effective_flight),
         "flight_segments_applied": int(flight_applied),
+        "flight_segments_skipped_micro": int(flight_skipped_micro),
+        "flight_segments_skipped_space_jump": int(flight_skipped_space_jump),
         "landing_damping_applied": int(damping_applied),
+        "landing_damping_skipped_micro_flight": int(damping_skipped_micro_flight),
+        "landing_damping_skipped_space_jump_flight": int(damping_skipped_space_jump_flight),
         "damping_preview": damping_preview,
         "delta_mean": float(delta.mean()),
         "delta_p95_abs": float(np.percentile(np.abs(delta), 95)),
@@ -1357,20 +2273,50 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
     }
 
 
-def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V46Config, root_xz: Optional[np.ndarray] = None) -> Tuple[np.ndarray, dict]:
     """
-    Generate V43 lower-body IK targets with an intentional-slide release guard.
+    Generate V43 lower-body IK targets with a V46.4 sliding-anchor cloud-step guard.
 
-    If a foot remains in contact but travels more than cfg.ik_slide_release_m in
-    XZ during the contact island, this is treated as cloud-step / designed slide,
-    not as foot skating. The target stays native, preventing IK from stretching
-    the leg and crushing the knee.
+    The old span-only guard caused a Footskate Forgiveness Paradox: the worse a
+    slow AI foot-drift became, the more likely it was to exceed the XZ threshold
+    and be released from repair. This version never uses ``continue`` as an
+    amnesty for large contact travel.
+
+    Decision rule:
+    - Large span + sufficiently high mean velocity (+ not absurdly bursty) is
+      considered cloud-step only when it is also root/CoM-consistent: the root
+      moves, the foot direction agrees with root direction, and foot-relative-to-root
+      drift stays bounded. It then receives a moving local-window anchor.
+    - Large span + low mean velocity is treated as AI dark drift / footskate and
+      is still locked to a static contact-internal anchor for IK repair.
+    - Short/static contacts use the same static anchor as before.
+
+    Targets are initialized from native FK positions, and non-contact frames are
+    never edited.
     """
     targets = native_foot.copy().astype(np.float32)
     locked_segments = 0
-    released_slide_segments = 0
+    sliding_anchor_segments = 0
+    dark_drift_locked_segments = 0
+    root_inconsistent_locked_segments = 0
     skipped_short = 0
     preview: List[Dict[str, object]] = []
+
+    win = max(3, int(cfg.ik_sliding_anchor_window))
+    if win % 2 == 0:
+        win += 1
+    half = win // 2
+    speed_thr = float(cfg.ik_cloud_step_speed_mps)
+    span_thr = float(cfg.ik_slide_release_m)
+    min_frames = int(cfg.ik_slide_release_min_frames)
+    speed_cv_max = float(cfg.ik_cloud_speed_cv_max)
+    root_min_travel = float(cfg.ik_cloud_root_min_travel_m)
+    direction_cos_min = float(cfg.ik_cloud_direction_cos_min)
+    rel_span_max = float(cfg.ik_cloud_root_foot_rel_max_m)
+    if root_xz is not None:
+        root_xz = np.asarray(root_xz, dtype=np.float32)
+        if root_xz.ndim != 2 or root_xz.shape[0] != native_foot.shape[0] or root_xz.shape[1] != 2:
+            root_xz = None
 
     for f in range(native_foot.shape[1]):
         for start, end in contiguous_regions(contacts[:, f]):
@@ -1379,25 +2325,93 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
                 skipped_short += 1
                 continue
 
-            seg_xz = native_foot[start:end, f, [0, 2]].astype(np.float32)
+            seg = native_foot[start:end, f, :].astype(np.float32)
+            seg_xz = seg[:, [0, 2]]
             span = float(np.linalg.norm(seg_xz.max(axis=0) - seg_xz.min(axis=0))) if length > 1 else 0.0
             step = np.linalg.norm(seg_xz[1:] - seg_xz[:-1], axis=-1) if length > 1 else np.zeros((0,), dtype=np.float32)
             arc = float(step.sum())
-            smoothness = float(span / max(arc, 1e-6)) if arc > 1e-6 else 1.0
+            duration_s = max((length - 1) / max(float(cfg.fps), 1e-6), 1.0 / max(float(cfg.fps), 1e-6))
+            mean_speed_mps = float(arc / duration_s)
+            inst_speed = step * float(cfg.fps) if step.size else np.zeros((0,), dtype=np.float32)
+            speed_std = float(inst_speed.std()) if inst_speed.size else 0.0
+            speed_mean = float(inst_speed.mean()) if inst_speed.size else 0.0
+            speed_cv = float(speed_std / max(speed_mean, 1e-6)) if inst_speed.size else 0.0
+            path_efficiency = float(span / max(arc, 1e-6)) if arc > 1e-6 else 1.0
 
-            if length >= int(cfg.ik_slide_release_min_frames) and span > float(cfg.ik_slide_release_m):
-                # Intentional slide/cloud-step: do not anchor. Native foot trajectory is the target.
-                released_slide_segments += 1
+            is_large_contact_travel = length >= min_frames and span > span_thr
+
+            # V46.8 root-foot relative test.  Smooth high-speed foot travel is
+            # not sufficient evidence for an intentional Dunhuang cloud-step:
+            # severe AI footskate can also be smooth.  A true cloud-step should
+            # be supported by root/CoM translation in a compatible direction and
+            # should not show unbounded foot motion relative to the root.
+            root_span = 0.0
+            root_foot_rel_span = 0.0
+            foot_root_cos = 0.0
+            root_consistent = False
+            if root_xz is not None and length > 1:
+                root_seg = root_xz[start:end].astype(np.float32)
+                root_span = float(np.linalg.norm(root_seg.max(axis=0) - root_seg.min(axis=0)))
+                foot_delta = seg_xz[-1] - seg_xz[0]
+                root_delta = root_seg[-1] - root_seg[0]
+                denom = float(np.linalg.norm(foot_delta) * np.linalg.norm(root_delta))
+                foot_root_cos = float(np.dot(foot_delta, root_delta) / max(denom, 1e-8)) if denom > 1e-8 else 0.0
+                rel = seg_xz - root_seg
+                root_foot_rel_span = float(np.linalg.norm(rel.max(axis=0) - rel.min(axis=0)))
+                root_consistent = bool(
+                    root_span >= root_min_travel
+                    and foot_root_cos >= direction_cos_min
+                    and root_foot_rel_span <= rel_span_max
+                )
+            else:
+                # Backward-compatible fallback when root is unavailable.  It is
+                # intentionally conservative: only very efficient, stable motion
+                # can use sliding anchor without root evidence.
+                root_consistent = bool(path_efficiency > 0.72 and speed_cv <= min(speed_cv_max, 1.0))
+
+            velocity_consistent = bool(mean_speed_mps >= speed_thr and speed_cv <= speed_cv_max)
+            is_cloud_step = bool(is_large_contact_travel and velocity_consistent and root_consistent)
+
+            if is_cloud_step:
+                # V46.4 critical fix: use a sliding local-window anchor rather
+                # than releasing the target. This preserves intentional support
+                # travel while smoothing high-frequency foot jitter.
+                sliding_anchor_segments += 1
+                for k, t in enumerate(range(start, end)):
+                    lo = max(0, k - half)
+                    hi = min(length, k + half + 1)
+                    local_anchor = seg[lo:hi].mean(axis=0)
+                    # Full XYZ mean is used intentionally: XZ follows the slide,
+                    # Y is smoothed to avoid contact-height flicker.
+                    targets[t, f] = local_anchor
                 if len(preview) < 32:
                     preview.append({
                         "foot": int(f), "start": int(start), "end": int(end),
-                        "frames": int(length), "mode": "released_intentional_slide",
-                        "xz_span_m": span, "arc_m": arc, "smoothness": smoothness,
-                        "threshold_m": float(cfg.ik_slide_release_m),
+                        "frames": int(length), "mode": "sliding_anchor_cloud_step",
+                        "xz_span_m": span, "arc_m": arc,
+                        "mean_speed_mps": mean_speed_mps,
+                        "speed_cv": speed_cv,
+                        "path_efficiency": path_efficiency,
+                        "root_span_m": root_span,
+                        "root_foot_rel_span_m": root_foot_rel_span,
+                        "foot_root_direction_cos": foot_root_cos,
+                        "root_consistent": bool(root_consistent),
+                        "span_threshold_m": span_thr,
+                        "speed_threshold_mps": speed_thr,
+                        "root_min_travel_m": root_min_travel,
+                        "direction_cos_min": direction_cos_min,
+                        "root_foot_rel_max_m": rel_span_max,
+                        "window_frames": int(win),
                     })
                 continue
 
-            # Contact-internal anchor only; never sample pre-contact flight.
+            # Static anchor path. This deliberately catches large but slow AI
+            # drift instead of forgiving it.
+            if is_large_contact_travel:
+                dark_drift_locked_segments += 1
+                if velocity_consistent and not root_consistent:
+                    root_inconsistent_locked_segments += 1
+
             anchor_end = min(start + 3, end)
             anchor = native_foot[start:anchor_end, f].mean(axis=0)
             locked_segments += 1
@@ -1410,18 +2424,41 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
                 preview.append({
                     "foot": int(f), "start": int(start), "end": int(end),
                     "frames": int(length), "mode": "locked_footplant",
-                    "xz_span_m": span, "arc_m": arc, "smoothness": smoothness,
+                    "xz_span_m": span, "arc_m": arc,
+                    "mean_speed_mps": mean_speed_mps,
+                    "speed_cv": speed_cv,
+                    "path_efficiency": path_efficiency,
+                    "root_span_m": root_span,
+                    "root_foot_rel_span_m": root_foot_rel_span,
+                    "foot_root_direction_cos": foot_root_cos,
+                    "root_consistent": bool(root_consistent),
+                    "velocity_consistent": bool(velocity_consistent),
+                    "large_slow_drift_locked": bool(is_large_contact_travel),
+                    "root_inconsistent_locked": bool(is_large_contact_travel and velocity_consistent and not root_consistent),
                     "anchor_source": "contact_internal_first_frames",
                 })
 
     diff = np.linalg.norm(targets - native_foot, axis=-1)
     non_contact = ~contacts
     meta = {
-        "version": "v46_1_slide_safe_ik_target_generator",
-        "intentional_slide_guard": True,
-        "slide_release_threshold_m": float(cfg.ik_slide_release_m),
+        "version": "v46_4_sliding_anchor_cloud_step_target_generator",
+        "fixes_footskate_forgiveness_paradox": True,
+        "intentional_slide_guard": "root_aware_velocity_classified_sliding_anchor",
+        "no_span_only_release": True,
+        "fixes_smooth_dark_drift_cloudstep_false_positive": True,
+        "cloud_step_speed_threshold_mps": float(speed_thr),
+        "slide_span_threshold_m": float(span_thr),
+        "sliding_anchor_window_frames": int(win),
+        "cloud_speed_cv_max": float(speed_cv_max),
+        "cloud_root_min_travel_m": float(root_min_travel),
+        "cloud_direction_cos_min": float(direction_cos_min),
+        "cloud_root_foot_rel_max_m": float(rel_span_max),
+        "root_aware_guard_enabled": bool(root_xz is not None),
         "locked_segments": int(locked_segments),
-        "released_slide_segments": int(released_slide_segments),
+        "sliding_anchor_segments": int(sliding_anchor_segments),
+        "dark_drift_locked_segments": int(dark_drift_locked_segments),
+        "root_inconsistent_locked_segments": int(root_inconsistent_locked_segments),
+        "released_slide_segments": 0,
         "skipped_short_segments": int(skipped_short),
         "non_contact_diff_max": float(diff[non_contact].max()) if non_contact.any() else 0.0,
         "contact_diff_p95": float(np.percentile(diff[contacts], 95)) if contacts.any() else 0.0,
@@ -1436,19 +2473,25 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     contacts0, _, _, _ = derive_contacts_np(motion, cfg)
     motion_base, root_y_report = apply_root_y_c1_physics_np(motion, contacts0, cfg)
     contacts, conf, floor_y, native_foot = derive_contacts_np(motion_base, cfg)
-    targets, target_meta = generate_ik_targets_np(native_foot, contacts, cfg)
+    targets, target_meta = generate_ik_targets_np(native_foot, contacts, cfg, root_xz=motion_base[:, [ROOT_X_IDX, ROOT_Z_IDX]])
     device = torch.device(cfg.device)
     out_all = motion_base.copy().astype(np.float32)
     reports = []
     T = motion.shape[0]
     chunk = int(cfg.ik_chunk)
-    # Use overlap to avoid chunk seams.
-    starts = list(range(0, T, max(1, chunk - 24)))
+    overlap = max(0, int(cfg.ik_chunk_overlap))
+    stride = max(1, chunk - overlap)
+    # V46.8: independent chunk solves are merged by weighted accumulation,
+    # rather than half-overlap overwrite.  This avoids long-sequence IK seams at
+    # chunk boundaries and preserves every overlapping frame as a blend.
+    starts = list(range(0, T, stride))
+    accum = np.zeros_like(out_all, dtype=np.float32)
+    weight_sum = np.zeros((T, 1), dtype=np.float32)
     for st in starts:
         ed = min(T, st + chunk)
         if ed - st < 4:
             continue
-        base_np = out_all[st:ed].copy()
+        base_np = motion_base[st:ed].copy()
         L = base_np.shape[0]
         base = torch.from_numpy(base_np).float().to(device)
         rot_full = base[:, ROT6D_START:ROT6D_END].reshape(L, NUM_JOINTS, 6).detach().clone()
@@ -1494,16 +2537,20 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
                 best_loss = float(loss.detach().cpu())
                 best_motion = mm.detach().cpu().numpy()
         if best_motion is not None:
-            if st > 0:
-                # feather first overlap if previous chunk already wrote it.
-                ov = min(12, L, st)
-                w = np.linspace(0, 1, ov, dtype=np.float32)[:, None]
-                old = out_all[st:st + ov]
-                out_all[st:st + ov] = (1 - w) * old + w * best_motion[:ov]
-                out_all[st + ov:ed] = best_motion[ov:]
-            else:
-                out_all[st:ed] = best_motion
+            weight = np.ones((L, 1), dtype=np.float32)
+            ov = min(overlap, L // 2 if L > 1 else 0)
+            if ov > 1 and st > 0:
+                weight[:ov, 0] *= np.linspace(0.0, 1.0, ov, dtype=np.float32)
+            if ov > 1 and ed < T:
+                weight[-ov:, 0] *= np.linspace(1.0, 0.0, ov, dtype=np.float32)
+            # Avoid exact zero-only coverage on pathological tiny chunks.
+            weight = np.maximum(weight, 1e-4)
+            accum[st:ed] += best_motion.astype(np.float32) * weight
+            weight_sum[st:ed] += weight
         reports.append({"start": int(st), "end": int(ed), "best_loss": float(best_loss), "contact_ratio": float(contacts[st:ed].mean())})
+    valid = weight_sum[:, 0] > 1e-8
+    out_all = motion_base.copy().astype(np.float32)
+    out_all[valid] = accum[valid] / weight_sum[valid]
     # Re-orthogonalize all rotation channels after optimization.
     if torch is not None:
         with torch.no_grad():
@@ -1511,15 +2558,20 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
             out_all[:, ROT6D_START:ROT6D_END] = project_rot6d_torch(x).numpy().reshape(T, -1)
     audit_before = audit_motion_np(motion, cfg)
     audit_after = audit_motion_np(out_all, cfg)
-    # Rollback only if IK makes both skate and jerk worse; otherwise preserve actual IK.
-    rollback = False
-    if audit_after["foot_skate_p95_mpf"] > audit_before["foot_skate_p95_mpf"] * 1.25 and audit_after["mean_joint_jerk_p95"] > audit_before["mean_joint_jerk_p95"] * 1.25:
-        rollback = True
-        final = motion.copy()
-    else:
-        final = out_all
+    root_delta = np.linalg.norm(out_all[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]], axis=1)
+    rollback_reasons: List[str] = []
+    if audit_after["foot_skate_p95_mpf"] > max(audit_before["foot_skate_p95_mpf"] * float(cfg.rollback_skate_ratio), audit_before["foot_skate_p95_mpf"] + 0.002):
+        rollback_reasons.append("foot_skate_p95_worse")
+    if audit_after["mean_joint_jerk_p95"] > max(audit_before["mean_joint_jerk_p95"] * float(cfg.rollback_jerk_ratio), audit_before["mean_joint_jerk_p95"] + 1e-4):
+        rollback_reasons.append("joint_jerk_p95_worse")
+    if audit_after["foot_penetration_min_m"] < audit_before["foot_penetration_min_m"] - float(cfg.rollback_penetration_margin_m):
+        rollback_reasons.append("floor_penetration_worse")
+    if root_delta.size and float(root_delta.max()) > float(cfg.rollback_root_delta_max_m):
+        rollback_reasons.append("root_delta_too_large")
+    rollback = bool(rollback_reasons)
+    final = motion.copy() if rollback else out_all
     report = {
-        "version": "v46_1_true_lower_body_ik_slide_safe_c1_root_y",
+        "version": "v46_8_true_lower_body_ik_root_aware_sliding_anchor_weighted_chunks_strict_rollback",
         "enabled": True,
         "writes_lower_body_rot6d": True,
         "root_y_physics": root_y_report,
@@ -1529,6 +2581,24 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
         "floor_y": float(floor_y),
         "contact_ratio": float(contacts.mean()),
         "chunks": reports,
+        "chunk_stitching": {
+            "mode": "weighted_accumulation",
+            "chunk": int(chunk),
+            "overlap": int(overlap),
+            "stride": int(stride),
+            "coverage_min": float(weight_sum[:, 0].min()) if weight_sum.size else 0.0,
+            "coverage_p95": float(np.percentile(weight_sum[:, 0], 95)) if weight_sum.size else 0.0,
+        },
+        "rollback_policy": {
+            "mode": "or_gated_safety_rollback",
+            "skate_ratio": float(cfg.rollback_skate_ratio),
+            "jerk_ratio": float(cfg.rollback_jerk_ratio),
+            "penetration_margin_m": float(cfg.rollback_penetration_margin_m),
+            "root_delta_max_m": float(cfg.rollback_root_delta_max_m),
+        },
+        "root_delta_max_m": float(root_delta.max()) if root_delta.size else 0.0,
+        "root_delta_p95_m": float(np.percentile(root_delta, 95)) if root_delta.size else 0.0,
+        "rollback_reasons": rollback_reasons,
         "audit_before": audit_before,
         "audit_after_candidate": audit_after,
         "rollback_triggered": rollback,
@@ -1666,13 +2736,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     b = sub.add_parser("build-db", help="Build source-aware event database from EDGE 151D motion files")
     b.add_argument("--motion_dirs", nargs="+", required=True)
+    b.add_argument("--manifest", default=None, help="Optional manifest.csv. When present, its source_bvh/fragment_file/label/start_frame/end_frame fields become parent metadata for source-aware Event-RAG.")
     b.add_argument("--out_db", required=True, help="Output directory, containing events.npz and events/*.npy")
+    b.add_argument("--audio_dirs", nargs="*", default=None, help="Optional paired audio/music directories. Same-stem files are used for real V44 music features.")
     b.set_defaults(func=build_db)
 
     c = sub.add_parser("train-contrastive", help="V44 music-motion contrastive training")
     c.add_argument("--db", required=True)
     c.add_argument("--out", required=True)
     c.add_argument("--music_feature_npz", default=None)
+    c.add_argument("--unpaired_audio_dirs", nargs="*", default=None, help="Unpaired target/background music directories. Used for V46.8 semantic OT pseudo-pairs when BVH has no synchronized audio.")
+    c.add_argument("--audio_dirs", nargs="*", default=None, help="Alias for --unpaired_audio_dirs; kept for script compatibility.")
     c.add_argument("--epochs", type=int, default=None)
     c.set_defaults(func=train_contrastive)
 
