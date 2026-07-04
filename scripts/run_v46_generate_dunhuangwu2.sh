@@ -19,6 +19,15 @@ export V46_CLASSIFICATION_RETRIEVAL_WEIGHT="${V46_CLASSIFICATION_RETRIEVAL_WEIGH
 export V46_CLASSIFICATION_OT_WEIGHT="${V46_CLASSIFICATION_OT_WEIGHT:-0.45}"
 export V46_CLASSIFICATION_RETRIEVAL_BONUS="${V46_CLASSIFICATION_RETRIEVAL_BONUS:-0.28}"
 export V46_CLASSIFICATION_REPORT_TOPK="${V46_CLASSIFICATION_REPORT_TOPK:-8}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE="${V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE:-1}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED="${V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED:-0}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_DIRS="${V46_EXTERNAL_MUSIC_SEMANTIC_DIRS:-music_semantics:external_music_semantics:output/music_semantics}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_CMD="${V46_EXTERNAL_MUSIC_SEMANTIC_CMD:-}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR="${V46_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR:-output/v46_external_music_semantic_cache}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_WEIGHT="${V46_EXTERNAL_MUSIC_SEMANTIC_WEIGHT:-0.78}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE="${V46_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE:-0.65}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE="${V46_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE:-1}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY="${V46_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY:-1}"
 
 CFG="configs/v46_motionrag_diff_config.json"
 RUN_ROOT="${1:-$(cat output/LATEST_V46_MOTIONRAG_DIFF.txt)}"
@@ -26,11 +35,20 @@ DB="$RUN_ROOT/db/events.npz"
 AUDIO="test_music_bank/dunhuangwu2.wav"
 [[ -f "$AUDIO" ]] || AUDIO="data/music/dunhuangwu2.wav"
 [[ -f "$AUDIO" ]] || AUDIO="custom_music/dunhuangwu2.wav"
-OUT="$RUN_ROOT/dunhuangwu2_v46_8_MotionRAG_Diff_regen.npy"
-JSON="$RUN_ROOT/dunhuangwu2_v46_8_MotionRAG_Diff_regen.report.json"
-MP4="$RUN_ROOT/dunhuangwu2_v46_8_MotionRAG_Diff_regen.mp4"
+OUT="$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff_regen.npy"
+JSON="$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff_regen.report.json"
+MP4="$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff_regen.mp4"
+SEMANTIC_DIRS=()
+for d in music_semantics external_music_semantics output/music_semantics; do
+  [[ -e "$d" ]] && SEMANTIC_DIRS+=("$d")
+done
+MUSIC_SEMANTIC_ARGS=()
+if [[ ${#SEMANTIC_DIRS[@]} -gt 0 ]]; then
+  MUSIC_SEMANTIC_ARGS=(--music_semantic_dirs "${SEMANTIC_DIRS[@]}")
+fi
 python tools/v46_motionrag_diff.py --config "$CFG" generate \
   --audio "$AUDIO" \
+  "${MUSIC_SEMANTIC_ARGS[@]}" \
   --db "$DB" \
   --contrastive "$RUN_ROOT/v44_contrastive.pt" \
   --refiner "$RUN_ROOT/v45_refiner.pt" \

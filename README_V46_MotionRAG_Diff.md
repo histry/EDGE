@@ -1,57 +1,110 @@
-# V46.11 MotionRAG-Diff Strong Semantic RAG Patch
+# V46.12 MotionRAG-Diff: External Classical-Music Semantic Encoder
 
-本补丁面向当前 `histry/EDGE` 的 V42.2/V46 系列项目状态，适配 `EDGE/change/*.bvh` 中的 Chang-E Dunhuang BVH 数据，并将 RAG 动作语义标签与未配对音乐 slot 对齐标签升级为强分类语义版本。
+本补丁适配 `histry/EDGE` 当前代码和 `EDGE/change/*.bvh` 形式的 Chang-E/Dunhuang BVH 数据。核心原则：**不假设 BVH 与音乐逐段强配对**，而是把 BVH 文件名与运动学特征构建为 source-aware 强语义动作事件库，再把古典音乐模型输出的 slot-level 语义标签作为音乐查询，进行 semantic OT 和 RAG 检索路由。
 
-## 核心定位
+## 与 EDGE 当前代码的关系
 
-当前 `change/` 数据是 motion-only BVH，不假设存在逐帧同步的音乐-动作配对。因此 V46.11 不把 V44 写成强监督 paired music-motion learning，而是：
+当前仓库已有的音乐侧代码主要是：
 
-```text
-Chang-E BVH filename / motion statistics -> source-aware action event semantics
-unpaired target music -> slot-level music alignment semantics
-semantic OT + contrastive grounding -> weak cross-modal retrieval prior
-Beam/Viterbi routing -> source-aware schedule_report
-V43 IK + V45 Refiner + V46 residual diffusion -> boundary repair and regeneration
-```
+- `tools/extract_music_emotion_features.py`：librosa/rms/onset/tempo/arousal/calmness 等 8D 代理特征；
+- `tools/extract_music_event_stream.py`：在上述特征上构造 12D event stream 与 `calm_flow/accent/climax/build_up/release` 等规则标签；
+- `tools/extract_v21_music_features.py`：12D compact frame-level feature，包括 energy/onset/beat/tempo/arousal/tension/calm/novelty/brightness/section/accent。
 
-## 相比 V46.9 的新增内容
+这些是可用的音乐特征抽取器，但不是训练好的古典音乐语义分类模型。V46.12 因此新增外部语义编码接口：如果你已有训练好的古典音乐模型，只需让它输出 JSON/NPZ sidecar，或通过命令模板生成 sidecar。
 
-1. **完整 BVH 文件名作为 source_group**：`female_lotus.bvh -> female_lotus`，12 个 BVH 应得到 12 个 source group。
-2. **动作强分类语义**：为每个 event 写入 `energy_label / rhythm_label / body_focus_label / spatial_label / music_alignment_label / classification_text`。
-3. **音乐 slot 对齐标签**：音频 slot 自动推断 `calm_meditative / lyrical_flow / pose_hold / instrument_phrase / percussive_accent / turning_climax / footwork_flow`。
-4. **分类语义向量 `class_semantic[32]`**：与 `name_semantic[32]` 和 `desc_z[32]` 融合，用于 V44 semantic OT、检索排序和报告。
-5. **RAG 检索分类加权**：`retrieve_schedule()` 对符合 slot 偏好的舞蹈类别、语义角色和音乐对齐标签给予可控加权。
-6. **schedule_report 增强**：每个 slot 输出 top candidate 的 `label / dance_key / music_alignment_label / class_bonus / candidate_preview`。
+## 外部音乐语义标签体系
 
-
-## V46.11 canonical 修正
-
-本版专门修复 `female_mediation.bvh / male_mediation.bvh` 这类本地文件名拼写变体：
+固定使用 7 类，与 RAG 动作语义完全对齐：
 
 ```text
-source_group / source_bvh 保留原始 stem，例如 female_mediation，用于 source-aware 审计；
-内部 RAG 语义统一 canonicalize 为 revelation_meditation；
-dance_category 统一为 Revelation Meditation；
-music_alignment_label 统一为 calm_meditative；
-classification_text / semantic_text 不再出现 mediation。
+calm_meditative
+lyrical_flow
+pose_hold
+instrument_phrase
+percussive_accent
+turning_climax
+footwork_flow
 ```
 
-因此，重新建库后可以继续保留原始 BVH 文件名，不需要手动重命名文件。
+动作侧对应关系：
+
+```text
+revelation_meditation  -> calm_meditative
+thirty_six_postures    -> pose_hold
+lotus_steps            -> footwork_flow / lyrical_flow
+pipa_behind_back       -> instrument_phrase
+lei_gong_drum          -> percussive_accent
+ribbon_flow            -> turning_climax / lyrical_flow
+```
+
+## 外部模型 JSON 输出格式
+
+推荐让你的古典音乐模型对每首音乐输出：
+
+```json
+{
+  "audio": "test_music_bank/dunhuangwu2.wav",
+  "labels": ["calm_meditative", "lyrical_flow", "pose_hold", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow"],
+  "slots": [
+    {
+      "slot_id": 0,
+      "start_sec": 0.0,
+      "end_sec": 4.0,
+      "top_label": "calm_meditative",
+      "probs": {
+        "calm_meditative": 0.62,
+        "lyrical_flow": 0.18,
+        "pose_hold": 0.12,
+        "instrument_phrase": 0.03,
+        "percussive_accent": 0.02,
+        "turning_climax": 0.01,
+        "footwork_flow": 0.02
+      }
+    }
+  ]
+}
+```
+
+文件名可为：
+
+```text
+dunhuangwu2.music_semantic.json
+dunhuangwu2_semantic.json
+dunhuangwu2.json
+```
+
+放到以下任意目录：
+
+```text
+music_semantics/
+external_music_semantics/
+output/music_semantics/
+```
+
+也支持 NPZ：
+
+```text
+slot_start: [N]
+slot_end: [N]
+slot_label: [N]
+slot_probs: [N,7]
+label_names: [7]
+```
 
 ## 安装
 
 ```bash
-cd /mnt/data/V46_11_EDGE_MotionRAG_Diff_CANONICAL_SEMANTIC_PATCH
+cd /mnt/data/V46_12_EDGE_MotionRAG_Diff_EXTERNAL_MUSIC_SEMANTIC_PATCH
 bash install_v46_motionrag_diff_patch.sh /home/disk/lsm/storage/EDGE
 ```
 
-## 重建 change BVH 数据库
+## 重新建库
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
 export PYTHONPATH=$PWD:${PYTHONPATH:-}
 
-RUN_ROOT="output/v46_11_change_bvh_strong_semantic_db_$(date +%Y%m%d_%H%M%S)"
+RUN_ROOT="output/v46_12_change_bvh_external_music_semantic_db_$(date +%Y%m%d_%H%M%S)"
 DB_DIR="$RUN_ROOT/db"
 mkdir -p "$DB_DIR"
 echo "$RUN_ROOT" > output/LATEST_V46_CHANGE_BVH_DB.txt
@@ -59,13 +112,7 @@ echo "$RUN_ROOT" > output/LATEST_V46_CHANGE_BVH_DB.txt
 export V46_BVH_RESAMPLE_TO_CONFIG_FPS=1
 export V46_SOURCE_GROUP_MODE=filename
 export V46_FILENAME_SEMANTIC_ENABLE=1
-export V46_FILENAME_SEMANTIC_WEIGHT=0.35
 export V46_CLASSIFICATION_SEMANTIC_ENABLE=1
-export V46_CLASSIFICATION_SEMANTIC_RATIO=0.70
-export V46_CLASSIFICATION_RETRIEVAL_WEIGHT=0.34
-export V46_CLASSIFICATION_OT_WEIGHT=0.45
-export V46_CLASSIFICATION_RETRIEVAL_BONUS=0.28
-export V46_DEVICE=cuda
 
 python tools/v46_motionrag_diff.py \
   --config configs/v46_motionrag_diff_config.json \
@@ -74,66 +121,87 @@ python tools/v46_motionrag_diff.py \
   --out_db "$DB_DIR"
 ```
 
-## 检查建库结果
+## 使用外部古典音乐语义模型训练 V44
 
-```bash
-python - <<'PY'
-import json, numpy as np, os
-from collections import Counter
-run_root = open('output/LATEST_V46_CHANGE_BVH_DB.txt').read().strip()
-db = np.load(os.path.join(run_root, 'db/events.npz'), allow_pickle=True)
-meta = json.load(open(os.path.join(run_root, 'db/events_meta.json'), 'r', encoding='utf-8'))
-print('RUN_ROOT:', run_root)
-print('num_events:', meta.get('num_events'))
-print('source groups:', len(set(db['source_groups'].tolist())))
-print('class_semantic shape:', db['class_semantic'].shape)
-print('dance_key counts:', Counter(db['dance_keys'].tolist()))
-assert 'mediation' not in set(map(str, db['dance_keys'].tolist())), 'internal dance_key still contains mediation'
-assert 'revelation_meditation' in set(map(str, db['dance_keys'].tolist())), 'revelation_meditation missing after canonicalization'
-print('energy labels:', Counter(db['energy_labels'].tolist()))
-print('rhythm labels:', Counter(db['rhythm_labels'].tolist()))
-print('music alignment:', Counter(db['music_alignment_labels'].tolist()))
-for s in sorted(set(db['source_groups'].tolist())):
-    print(' ', s)
-print('first classification:', meta['events'][0].get('classification_text'))
-PY
-```
-
-预期 source groups 为 12：
-
-```text
-female_36pose_1, female_36pose_2, female_lotus, female_mediation 或 female_meditation,
-male_36pose_1, male_36pose_2, male_drum_1, male_drum_2,
-male_mediation 或 male_meditation, male_pipa_1, male_pipa_2, male_ribbon
-```
-
-## 训练与生成
+如果你的模型已经生成 sidecar：
 
 ```bash
 cd /home/disk/lsm/storage/EDGE
 RUN_ROOT="$(cat output/LATEST_V46_CHANGE_BVH_DB.txt)"
 DB="$RUN_ROOT/db/events.npz"
 
-python tools/v46_motionrag_diff.py --config configs/v46_motionrag_diff_config.json \
-  train-contrastive --db "$DB" \
+export V46_DEVICE=cuda
+export V46_UNPAIRED_AUDIO_ENABLE=1
+export V46_UNPAIRED_DISABLE_MOTION_PROXY=1
+export V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE=1
+export V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED=1
+export V46_EXTERNAL_MUSIC_SEMANTIC_DIRS="music_semantics:external_music_semantics:output/music_semantics"
+
+python tools/v46_motionrag_diff.py \
+  --config configs/v46_motionrag_diff_config.json \
+  train-contrastive \
+  --db "$DB" \
   --unpaired_audio_dirs test_music_bank data/music custom_music proxy_music \
+  --music_semantic_dirs music_semantics external_music_semantics output/music_semantics \
   --out "$RUN_ROOT/v44_contrastive.pt"
-
-python tools/v46_motionrag_diff.py --config configs/v46_motionrag_diff_config.json \
-  train-refiner --db "$DB" --out "$RUN_ROOT/v45_refiner.pt"
-
-python tools/v46_motionrag_diff.py --config configs/v46_motionrag_diff_config.json \
-  train-diffusion --db "$DB" --out "$RUN_ROOT/v46_diffusion.pt"
 ```
 
-## 关键环境开关
+如果你的模型可命令行调用，使用模板：
 
 ```bash
-export V46_CLASSIFICATION_SEMANTIC_ENABLE=1
-export V46_CLASSIFICATION_SEMANTIC_RATIO=0.70
-export V46_CLASSIFICATION_RETRIEVAL_WEIGHT=0.34
-export V46_CLASSIFICATION_OT_WEIGHT=0.45
-export V46_CLASSIFICATION_RETRIEVAL_BONUS=0.28
-export V46_CLASSIFICATION_REPORT_TOPK=8
+export V46_EXTERNAL_MUSIC_SEMANTIC_CMD='python /path/to/your_encoder.py --audio {audio} --out_json {out_json}'
 ```
 
+V46.12 会为每首音乐自动调用该命令并缓存输出。
+
+## 没有外部模型时的代理侧车文件
+
+可以先用内置代理脚本生成 JSON，验证流程：
+
+```bash
+mkdir -p music_semantics
+python tools/v46_classical_music_semantic_proxy.py \
+  --audio test_music_bank/dunhuangwu2.wav \
+  --out_json music_semantics/dunhuangwu2.music_semantic.json
+```
+
+注意：这个代理脚本不是训练好的模型，只是输出同一 JSON schema 的 fallback。
+
+## 训练 V45 / V46
+
+```bash
+python tools/v46_motionrag_diff.py \
+  --config configs/v46_motionrag_diff_config.json \
+  train-refiner \
+  --db "$DB" \
+  --out "$RUN_ROOT/v45_refiner.pt"
+
+python tools/v46_motionrag_diff.py \
+  --config configs/v46_motionrag_diff_config.json \
+  train-diffusion \
+  --db "$DB" \
+  --out "$RUN_ROOT/v46_diffusion.pt"
+```
+
+## 生成
+
+```bash
+python tools/v46_motionrag_diff.py \
+  --config configs/v46_motionrag_diff_config.json \
+  generate \
+  --audio test_music_bank/dunhuangwu2.wav \
+  --music_semantic_dirs music_semantics external_music_semantics output/music_semantics \
+  --db "$DB" \
+  --contrastive "$RUN_ROOT/v44_contrastive.pt" \
+  --refiner "$RUN_ROOT/v45_refiner.pt" \
+  --diffusion "$RUN_ROOT/v46_diffusion.pt" \
+  --out "$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff.npy" \
+  --json "$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff.report.json" \
+  --render_output "$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff.mp4"
+```
+
+## 论文口径
+
+建议写作：
+
+> 当前 Chang-E BVH 不提供逐段同步音乐监督。本文引入外部古典音乐语义编码器，将目标音乐解析为 slot-level 语义标签和概率分布，并与 source-aware 动作事件库中的动作类别、节奏属性、身体焦点和音乐对齐标签进行弱监督语义匹配。基于该外部语义先验，系统通过 semantic OT 构造伪正样本，训练 V44 检索对齐模型，并结合 V45 残差边界修复、V46 条件扩散重绘与 V43 真 lower-body IK，形成可追溯的 MotionRAG-Diff 框架。

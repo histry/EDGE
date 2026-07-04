@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.11 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
+V46.12 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
 ==================================================================
 
 This file is designed as a drop-in research patch for an EDGE-style repository.
@@ -15,7 +15,7 @@ Core versions included:
 - V44: music-motion contrastive learning for retrieval alignment.
 - V45: residual temporal Motion Refiner to escape pure stitching.
 - V46: retrieval-augmented conditional residual diffusion with IK finalization.
-- V46.11 canonical Chang-E semantic normalization plus V46.11 strong classification semantics and V46.9 project-alignment fixes: direct Chang-E BVH loading, 210fps-to-30fps resampling, filename-aware source semantics, optional manifest-aware metadata, unpaired slot-to-event semantic grounding, capped C1 landing damping, biological max-flight fuse, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
+- V46.12 External Classical-Music Semantic Encoder integration plus V46.11 canonical Chang-E semantics: direct Chang-E BVH loading, 210fps-to-30fps resampling, filename/source-aware RAG semantics, external slot-level music semantic labels, unpaired semantic OT, true lower-body IK, residual refiner, conditional diffusion, capped root-Y physics, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
 
 Expected EDGE 151D convention
 -----------------------------
@@ -608,6 +608,22 @@ class V46Config:
     classification_retrieval_bonus: float = 0.28
     classification_report_topk: int = 8
 
+    # V46.12: external classical-music semantic encoder.  The current EDGE
+    # repository contains rule/librosa music feature extractors, not a trained
+    # classical-music classifier.  When a trained external encoder exists, it
+    # can write slot-level JSON/NPZ semantics or be invoked through a command
+    # template.  These semantic probabilities then drive V44 unpaired OT and
+    # V46 retrieval reports.
+    external_music_semantic_enable: bool = True
+    external_music_semantic_required: bool = False
+    external_music_semantic_dirs: str = ""
+    external_music_semantic_cmd: str = ""
+    external_music_semantic_cache_dir: str = "output/v46_external_music_semantic_cache"
+    external_music_semantic_weight: float = 0.78
+    external_music_semantic_temperature: float = 0.65
+    external_music_semantic_proxy_enable: bool = True
+    external_music_semantic_filename_proxy: bool = True
+
     embed_dim: int = 128
     top_k: int = 32
     beam_size: int = 8
@@ -752,6 +768,15 @@ class V46Config:
             "V46_CLASSIFICATION_OT_WEIGHT": ("classification_ot_weight", float),
             "V46_CLASSIFICATION_RETRIEVAL_BONUS": ("classification_retrieval_bonus", float),
             "V46_CLASSIFICATION_REPORT_TOPK": ("classification_report_topk", int),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE": ("external_music_semantic_enable", lambda x: bool(int(x))),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED": ("external_music_semantic_required", lambda x: bool(int(x))),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_DIRS": ("external_music_semantic_dirs", str),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_CMD": ("external_music_semantic_cmd", str),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR": ("external_music_semantic_cache_dir", str),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_WEIGHT": ("external_music_semantic_weight", float),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE": ("external_music_semantic_temperature", float),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE": ("external_music_semantic_proxy_enable", lambda x: bool(int(x))),
+            "V46_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY": ("external_music_semantic_filename_proxy", lambda x: bool(int(x))),
             "V46_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
             "V46_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
         }
@@ -1142,6 +1167,317 @@ def audio_slot_classification_from_pseudo(pseudo: np.ndarray, duration: float, e
         "preferred_semantic_roles": [CHANG_E_CATEGORY_PROFILES.get(k, {}).get("semantic_role", CATEGORY_CLASS_OVERRIDES.get(k, {}).get("semantic_role", "")) for k in preferred],
     }
 
+
+
+
+# V46.12 external classical-music semantic interface.
+# Supported labels are deliberately identical to RAG event music_alignment labels,
+# so a trained classical model can supervise retrieval without paired BVH/audio.
+MUSIC_SEMANTIC_LABELS = MUSIC_ALIGNMENT_LABELS
+MUSIC_LABEL_TO_ACTION = {
+    "calm_meditative": ["revelation_meditation", "thirty_six_postures", "lotus_steps"],
+    "pose_hold": ["thirty_six_postures", "revelation_meditation", "lotus_steps"],
+    "lyrical_flow": ["lotus_steps", "ribbon_flow", "revelation_meditation", "thirty_six_postures"],
+    "instrument_phrase": ["pipa_behind_back", "lotus_steps", "ribbon_flow"],
+    "percussive_accent": ["lei_gong_drum", "pipa_behind_back", "ribbon_flow"],
+    "turning_climax": ["ribbon_flow", "lei_gong_drum", "pipa_behind_back"],
+    "footwork_flow": ["lotus_steps", "ribbon_flow", "thirty_six_postures"],
+}
+MUSIC_PROXY_NAME_LABELS = {
+    "pipa": "instrument_phrase",
+    "guzhen": "lyrical_flow",
+    "guzheng": "lyrical_flow",
+    "xiao": "calm_meditative",
+    "gu": "percussive_accent",
+    "drum": "percussive_accent",
+    "luo": "percussive_accent",
+    "gong": "percussive_accent",
+}
+
+
+def _split_path_list(value: object) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if str(x).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    parts: List[str] = []
+    for chunk in text.replace(";", os.pathsep).split(os.pathsep):
+        chunk = chunk.strip()
+        if chunk:
+            parts.append(chunk)
+    return parts
+
+
+def canonical_music_label(label: object) -> str:
+    text = str(label or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "meditation": "calm_meditative",
+        "meditative": "calm_meditative",
+        "calm": "calm_meditative",
+        "tranquil": "calm_meditative",
+        "hold": "pose_hold",
+        "pose": "pose_hold",
+        "sustain": "pose_hold",
+        "lyrical": "lyrical_flow",
+        "flow": "lyrical_flow",
+        "melodic": "lyrical_flow",
+        "instrument": "instrument_phrase",
+        "pipa": "instrument_phrase",
+        "plucked": "instrument_phrase",
+        "percussive": "percussive_accent",
+        "accent": "percussive_accent",
+        "drum": "percussive_accent",
+        "climax": "turning_climax",
+        "turn": "turning_climax",
+        "turning": "turning_climax",
+        "footwork": "footwork_flow",
+        "steps": "footwork_flow",
+        "step": "footwork_flow",
+    }
+    if text in aliases:
+        return aliases[text]
+    if text in MUSIC_SEMANTIC_LABELS:
+        return text
+    return text if text else "lyrical_flow"
+
+
+def normalize_music_probs(probs: object = None, top_label: object = None, temperature: float = 0.65) -> Dict[str, float]:
+    out = {k: 0.0 for k in MUSIC_SEMANTIC_LABELS}
+    if isinstance(probs, dict):
+        for k, v in probs.items():
+            ck = canonical_music_label(k)
+            if ck in out:
+                try:
+                    out[ck] += max(0.0, float(v))
+                except Exception:
+                    pass
+    elif probs is not None:
+        arr = np.asarray(probs, dtype=np.float32).reshape(-1)
+        for i, v in enumerate(arr[:len(MUSIC_SEMANTIC_LABELS)]):
+            out[MUSIC_SEMANTIC_LABELS[i]] += max(0.0, float(v))
+    if sum(out.values()) <= 1e-8 and top_label is not None:
+        label = canonical_music_label(top_label)
+        if label in out:
+            out[label] = 1.0
+    if sum(out.values()) <= 1e-8:
+        out["lyrical_flow"] = 1.0
+    # Temperature-sharpen while retaining soft alternatives from external model.
+    temp = max(0.05, float(temperature))
+    vals = np.asarray([out[k] for k in MUSIC_SEMANTIC_LABELS], dtype=np.float32)
+    vals = np.power(np.maximum(vals, 0.0) + 1e-8, 1.0 / temp)
+    vals = vals / max(float(vals.sum()), 1e-8)
+    return {k: float(vals[i]) for i, k in enumerate(MUSIC_SEMANTIC_LABELS)}
+
+
+def music_semantic_slot_from_probs(probs: Dict[str, float], duration: float = 4.0, source: str = "external") -> Dict[str, object]:
+    top_label = max(probs.items(), key=lambda kv: kv[1])[0]
+    preferred = MUSIC_LABEL_TO_ACTION.get(top_label, ["lotus_steps", "thirty_six_postures"])
+    if top_label == "percussive_accent":
+        role, energy_label, rhythm_label = "climax", "percussive", "percussive"
+    elif top_label == "turning_climax":
+        role, energy_label, rhythm_label = "build_up", "high", "accented"
+    elif top_label in {"calm_meditative", "pose_hold"}:
+        role, energy_label, rhythm_label = "calm" if top_label == "calm_meditative" else "release", "calm", "sustained"
+    elif top_label == "instrument_phrase":
+        role, energy_label, rhythm_label = "normal", "moderate", "accented"
+    elif top_label == "footwork_flow":
+        role, energy_label, rhythm_label = "normal", "moderate", "lyrical"
+    else:
+        role, energy_label, rhythm_label = "normal", "moderate", "lyrical"
+    return {
+        "role": role,
+        "music_alignment_label": top_label,
+        "energy_label": energy_label,
+        "rhythm_label": rhythm_label,
+        "preferred_dance_keys": preferred,
+        "preferred_semantic_roles": [str(CHANG_E_CATEGORY_PROFILES.get(k, {}).get("semantic_role", "")) for k in preferred],
+        "music_semantic_probs": {k: float(v) for k, v in probs.items()},
+        "music_semantic_top_label": top_label,
+        "external_music_semantic_source": source,
+    }
+
+
+def music_probs_to_pseudo_feature(probs: Dict[str, float], duration: float, cfg: V46Config) -> np.ndarray:
+    # Label prototypes occupy the same descriptor layout used by motion events.
+    prototypes = {
+        "calm_meditative": (0.020, 0.010, 0.012, 0.85),
+        "pose_hold": (0.030, 0.012, 0.010, 0.78),
+        "lyrical_flow": (0.055, 0.035, 0.040, 0.42),
+        "instrument_phrase": (0.070, 0.065, 0.055, 0.30),
+        "percussive_accent": (0.105, 0.125, 0.100, 0.12),
+        "turning_climax": (0.095, 0.080, 0.110, 0.08),
+        "footwork_flow": (0.065, 0.045, 0.070, 0.34),
+    }
+    energy = onset = dyn = calm = 0.0
+    for label, p in probs.items():
+        e, o, d, c = prototypes.get(label, prototypes["lyrical_flow"])
+        energy += float(p) * e
+        onset += float(p) * o
+        dyn += float(p) * d
+        calm += float(p) * c
+    pseudo = np.zeros(32, dtype=np.float32)
+    pseudo[0] = float(duration)
+    pseudo[1] = energy * 2.0
+    pseudo[2] = energy
+    pseudo[3] = max(energy, dyn)
+    pseudo[4] = dyn
+    pseudo[5] = energy + onset
+    pseudo[6] = onset + dyn
+    pseudo[7] = energy + 0.5 * onset
+    pseudo[8] = energy
+    pseudo[9] = 1.0 + onset
+    pseudo[10] = calm
+    pseudo[13] = max(0.02, onset)
+    pseudo[14] = onset
+    pseudo[16] = onset
+    pseudo[17] = dyn
+    pseudo[18] = dyn
+    sem = music_semantic_slot_from_probs(probs, duration, source="external")
+    pseudo[22] = _label_index(str(sem["energy_label"]), ENERGY_LABELS) / max(1, len(ENERGY_LABELS) - 1)
+    pseudo[23] = _label_index(str(sem["rhythm_label"]), RHYTHM_LABELS) / max(1, len(RHYTHM_LABELS) - 1)
+    pseudo[26] = _label_index(str(sem["music_alignment_label"]), MUSIC_ALIGNMENT_LABELS) / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
+    pseudo[28] = float(probs.get("calm_meditative", 0.0) + 0.5 * probs.get("pose_hold", 0.0))
+    pseudo[29] = float(probs.get("percussive_accent", 0.0) + 0.4 * probs.get("instrument_phrase", 0.0))
+    pseudo[30] = float(probs.get("turning_climax", 0.0) + 0.3 * probs.get("footwork_flow", 0.0))
+    pseudo[31] = 1.0
+    return pseudo.astype(np.float32)
+
+
+def sidecar_music_semantic_candidates(audio_path: str | Path, cfg: V46Config) -> List[Path]:
+    p = Path(audio_path)
+    names = [
+        f"{p.stem}.music_semantic.json", f"{p.stem}_music_semantic.json", f"{p.stem}.semantic.json", f"{p.stem}_semantic.json",
+        f"{p.stem}.music_semantic.npz", f"{p.stem}_music_semantic.npz", f"{p.stem}.semantic.npz", f"{p.stem}_semantic.npz",
+        f"{p.stem}.json", f"{p.stem}.npz",
+    ]
+    cands: List[Path] = [p.with_name(n) for n in names]
+    for d in _split_path_list(getattr(cfg, "external_music_semantic_dirs", "")):
+        dp = Path(d)
+        for n in names:
+            cands.append(dp / n)
+    return cands
+
+
+def run_external_music_semantic_cmd(audio_path: str | Path, cfg: V46Config) -> Optional[Path]:
+    cmd = str(getattr(cfg, "external_music_semantic_cmd", "") or "").strip()
+    if not cmd:
+        return None
+    cache = ensure_dir(getattr(cfg, "external_music_semantic_cache_dir", "output/v46_external_music_semantic_cache"))
+    audio_p = Path(audio_path)
+    out_json = cache / f"{audio_p.stem}.music_semantic.json"
+    out_npz = cache / f"{audio_p.stem}.music_semantic.npz"
+    if out_json.exists() or out_npz.exists():
+        return out_json if out_json.exists() else out_npz
+    expanded = cmd.format(audio=str(audio_p), out_json=str(out_json), out_npz=str(out_npz), stem=audio_p.stem)
+    try:
+        subprocess.run(expanded, shell=True, check=True)
+    except Exception as exc:
+        print(f"[V46.12 WARN] external music semantic command failed for {audio_p}: {exc}", file=sys.stderr)
+        return None
+    if out_json.exists() or out_npz.exists():
+        return out_json if out_json.exists() else out_npz
+    return None
+
+
+def parse_external_music_semantic_file(path: str | Path, cfg: V46Config) -> Optional[Tuple[List[dict], np.ndarray]]:
+    p = Path(path)
+    try:
+        if p.suffix.lower() == ".npz":
+            data = np.load(p, allow_pickle=True)
+            label_names = [canonical_music_label(x) for x in (data["label_names"] if "label_names" in data.files else np.asarray(MUSIC_SEMANTIC_LABELS, dtype=object)).tolist()]
+            probs_arr = np.asarray(data["slot_probs"] if "slot_probs" in data.files else data["probs"], dtype=np.float32)
+            starts = np.asarray(data["slot_start"] if "slot_start" in data.files else (data["start"] if "start" in data.files else np.arange(len(probs_arr))*4.0), dtype=np.float32)
+            ends = np.asarray(data["slot_end"] if "slot_end" in data.files else (data["end"] if "end" in data.files else starts + 4.0), dtype=np.float32)
+            labels = data["slot_label"].tolist() if "slot_label" in data.files else [label_names[int(np.argmax(r))] for r in probs_arr]
+            raw_slots = []
+            for i in range(len(probs_arr)):
+                probs = {label_names[j]: float(probs_arr[i, j]) for j in range(min(len(label_names), probs_arr.shape[1]))}
+                raw_slots.append({"slot_id": i, "start": float(starts[i]), "end": float(ends[i]), "top_label": labels[i], "probs": probs})
+        else:
+            obj = load_json(p)
+            raw_slots = obj.get("slots", obj.get("segments", obj if isinstance(obj, list) else []))
+            if not isinstance(raw_slots, list):
+                return None
+        slots: List[dict] = []
+        feats: List[np.ndarray] = []
+        for i, s in enumerate(raw_slots):
+            if not isinstance(s, dict):
+                continue
+            start = float(s.get("start_sec", s.get("start", s.get("t0", i * 4.0))))
+            end = float(s.get("end_sec", s.get("end", s.get("t1", start + float(getattr(cfg, "unpaired_audio_slot_seconds", 4.0))))))
+            duration = max(end - start, 1e-3)
+            top = s.get("top_label", s.get("label", s.get("music_alignment_label", None)))
+            probs = normalize_music_probs(s.get("probs", s.get("probabilities", s.get("slot_probs", None))), top, getattr(cfg, "external_music_semantic_temperature", 0.65))
+            pseudo = music_probs_to_pseudo_feature(probs, duration, cfg)
+            sem = music_semantic_slot_from_probs(probs, duration, source=str(p))
+            item = {"slot_id": int(s.get("slot_id", i)), "start": start, "end": end, "duration": duration,
+                    "energy": float(pseudo[2]), "onset": float(pseudo[16])}
+            item.update(sem)
+            slots.append(item)
+            feats.append(pseudo)
+        if not feats:
+            return None
+        return slots, np.stack(feats).astype(np.float32)
+    except Exception as exc:
+        print(f"[V46.12 WARN] failed parsing external music semantic {p}: {exc}", file=sys.stderr)
+        return None
+
+
+def filename_proxy_music_semantic(audio_path: str | Path, cfg: V46Config, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
+    if not bool(getattr(cfg, "external_music_semantic_filename_proxy", True)):
+        return None
+    stem = Path(audio_path).stem.lower()
+    label = None
+    for key, lab in MUSIC_PROXY_NAME_LABELS.items():
+        if key in stem:
+            label = lab
+            break
+    if label is None:
+        return None
+    try:
+        sr, wav = read_wav_mono(audio_path)
+        total = len(wav) / max(float(sr), 1.0)
+    except Exception:
+        total = float(slot_seconds)
+    n = max(1, int(math.ceil(total / max(float(slot_seconds), 1e-3))))
+    probs = normalize_music_probs(None, label, getattr(cfg, "external_music_semantic_temperature", 0.65))
+    slots, feats = [], []
+    for i in range(n):
+        start = i * float(slot_seconds)
+        end = min(total, (i + 1) * float(slot_seconds)) if total > 0 else (i + 1) * float(slot_seconds)
+        dur = max(end - start, 1e-3)
+        pseudo = music_probs_to_pseudo_feature(probs, dur, cfg)
+        sem = music_semantic_slot_from_probs(probs, dur, source=f"filename_proxy:{Path(audio_path).name}")
+        item = {"slot_id": i, "start": start, "end": end, "duration": dur, "energy": float(pseudo[2]), "onset": float(pseudo[16])}
+        item.update(sem)
+        slots.append(item)
+        feats.append(pseudo)
+    return slots, np.stack(feats).astype(np.float32)
+
+
+def load_external_music_semantic_slots(audio_path: str | Path, cfg: V46Config, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
+    if not bool(getattr(cfg, "external_music_semantic_enable", True)):
+        return None
+    for cand in sidecar_music_semantic_candidates(audio_path, cfg):
+        if cand.exists() and cand.is_file():
+            parsed = parse_external_music_semantic_file(cand, cfg)
+            if parsed is not None:
+                return parsed
+    cmd_out = run_external_music_semantic_cmd(audio_path, cfg)
+    if cmd_out is not None:
+        parsed = parse_external_music_semantic_file(cmd_out, cfg)
+        if parsed is not None:
+            return parsed
+    if bool(getattr(cfg, "external_music_semantic_proxy_enable", True)):
+        prox = filename_proxy_music_semantic(audio_path, cfg, slot_seconds)
+        if prox is not None:
+            return prox
+    if bool(getattr(cfg, "external_music_semantic_required", False)):
+        raise RuntimeError(f"External music semantic is required but no JSON/NPZ/command output was found for {audio_path}")
+    return None
 
 def semantic_label_match_bonus(slot: dict, db: dict, cfg: V46Config) -> np.ndarray:
     """Compute interpretable class-prior bonus for slot-to-event retrieval."""
@@ -1892,8 +2228,18 @@ def standardize_features(x: np.ndarray, mask: Optional[np.ndarray] = None) -> Tu
 
 def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
     if slots_json and Path(slots_json).exists():
+        # V46.12: slots_json can be either the old feature JSON or a new
+        # external classical-music semantic JSON/NPZ.
+        if str(slots_json).lower().endswith(".npz"):
+            parsed = parse_external_music_semantic_file(slots_json, cfg)
+            if parsed is not None:
+                return parsed
         data = load_json(slots_json)
         slots = data.get("slots", data if isinstance(data, list) else [])
+        if slots and isinstance(slots[0], dict) and ("probs" in slots[0] or "top_label" in slots[0] or "music_alignment_label" in slots[0]):
+            parsed = parse_external_music_semantic_file(slots_json, cfg)
+            if parsed is not None:
+                return parsed
         feats = []
         for s in slots:
             base = np.asarray(s.get("feature", []), dtype=np.float32)
@@ -1901,6 +2247,9 @@ def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slo
                 base = np.pad(base, (0, 32 - base.size))
             feats.append(base[:32])
         return slots, np.stack(feats).astype(np.float32)
+    external = load_external_music_semantic_slots(path, cfg, slot_seconds)
+    if external is not None:
+        return external
     sr, wav = read_wav_mono(path)
     total = wav.size / sr
     n_slots = max(1, int(math.ceil(total / slot_seconds)))
@@ -2075,6 +2424,8 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
                 "audio": audio_meta[ai]["audio"],
                 "slot_id": int(audio_meta[ai]["slot"].get("slot_id", ai)),
                 "slot_energy": float(audio_meta[ai]["slot"].get("energy", 0.0)),
+                "slot_music_semantic_label": str(audio_meta[ai]["slot"].get("music_semantic_top_label", audio_meta[ai]["slot"].get("music_alignment_label", ""))),
+                "slot_external_music_semantic_source": str(audio_meta[ai]["slot"].get("external_music_semantic_source", "")),
                 "top_motion_ids": [int(x) for x in top[:min(5, len(top))].tolist()],
                 "top_costs": [float(cost[ai, int(x)]) for x in top[:min(5, len(top))].tolist()],
             })
@@ -2083,8 +2434,10 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
         return None
     music = np.stack(music_pairs).astype(np.float32)
     motion = np.stack(motion_pairs).astype(np.float32)
+    has_external_sem = any(str(m.get("slot", {}).get("external_music_semantic_source", "")).startswith(("/", "filename_proxy", "output", ".")) for m in audio_meta)
+    report_mode = "external_classical_music_semantic_ot" if has_external_sem else "unpaired_audio_semantic_ot"
     report = {
-        "mode": "unpaired_audio_semantic_ot",
+        "mode": report_mode,
         "audio_files": sorted(set(m["audio"] for m in audio_meta)),
         "num_audio_slots": int(audio_raw.shape[0]),
         "num_motion_events": int(motion_z.shape[0]),
@@ -2107,6 +2460,11 @@ def train_contrastive(args: argparse.Namespace) -> int:
     if torch is None:
         raise RuntimeError("PyTorch is required for V44 training.")
     cfg = V46Config.from_json(args.config).apply_env()
+    sem_dirs = getattr(args, "music_semantic_dirs", None)
+    if sem_dirs:
+        cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in sem_dirs])
+    if getattr(args, "external_music_semantic_cmd", None):
+        cfg.external_music_semantic_cmd = str(args.external_music_semantic_cmd)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
@@ -2138,7 +2496,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
         unpaired = build_unpaired_audio_motion_pairs(db, unpaired_dirs, cfg) if bool(cfg.unpaired_audio_enable) else None
         if unpaired is not None:
             music, motion, music_mean, music_std, pair_report = unpaired
-            supervision_mode = "unpaired_audio_semantic_ot"
+            supervision_mode = str(pair_report.get("mode", "unpaired_audio_semantic_ot"))
         else:
             if bool(cfg.contrastive_require_real_music) or bool(cfg.unpaired_disable_motion_proxy):
                 raise RuntimeError(
@@ -2184,7 +2542,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
-        "version": "v44_11_unpaired_audio_canonical_strong_class_semantic_grounding",
+        "version": "v44_12_external_classical_music_semantic_grounding",
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "feat_dim": motion.shape[1],
@@ -2501,6 +2859,9 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
             "duration": slot.get("duration"),
             "slot_role": slot.get("role"),
             "slot_music_alignment_label": slot.get("music_alignment_label"),
+            "slot_music_semantic_top_label": slot.get("music_semantic_top_label", slot.get("music_alignment_label")),
+            "slot_music_semantic_probs": slot.get("music_semantic_probs", {}),
+            "slot_external_music_semantic_source": slot.get("external_music_semantic_source", ""),
             "slot_preferred_dance_keys": slot.get("preferred_dance_keys", []),
             "top_candidate": int(cand[0]),
             "top_candidate_label": str(labels_arr[cand[0]]),
@@ -3262,6 +3623,11 @@ def render_if_possible(motion_path: str, audio_path: Optional[str], output_mp4: 
 
 def generate(args: argparse.Namespace) -> int:
     cfg = V46Config.from_json(args.config).apply_env()
+    sem_dirs = getattr(args, "music_semantic_dirs", None)
+    if sem_dirs:
+        cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in sem_dirs])
+    if getattr(args, "external_music_semantic_cmd", None):
+        cfg.external_music_semantic_cmd = str(args.external_music_semantic_cmd)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     if torch is not None:
@@ -3357,6 +3723,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     c.add_argument("--music_feature_npz", default=None)
     c.add_argument("--unpaired_audio_dirs", nargs="*", default=None, help="Unpaired target/background music directories. Used for V46.8 semantic OT pseudo-pairs when BVH has no synchronized audio.")
     c.add_argument("--audio_dirs", nargs="*", default=None, help="Alias for --unpaired_audio_dirs; kept for script compatibility.")
+    c.add_argument("--music_semantic_dirs", nargs="*", default=None, help="V46.12 directories containing external classical-music semantic JSON/NPZ sidecars.")
+    c.add_argument("--external_music_semantic_cmd", default=None, help="Optional command template: use {audio}, {out_json}, {out_npz}, {stem} placeholders to call an external trained music semantic model.")
     c.add_argument("--epochs", type=int, default=None)
     c.set_defaults(func=train_contrastive)
 
@@ -3376,6 +3744,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     g = sub.add_parser("generate", help="Generate whole-song motion from music via V46 pipeline")
     g.add_argument("--audio", required=True)
     g.add_argument("--slots_json", default=None)
+    g.add_argument("--music_semantic_dirs", nargs="*", default=None, help="V46.12 directories containing external classical-music semantic JSON/NPZ sidecars.")
+    g.add_argument("--external_music_semantic_cmd", default=None, help="Optional command template for an external trained music semantic model.")
     g.add_argument("--slot_seconds", type=float, default=4.0)
     g.add_argument("--db", required=True)
     g.add_argument("--contrastive", default=None)

@@ -33,13 +33,22 @@ export V46_CLASSIFICATION_RETRIEVAL_WEIGHT="${V46_CLASSIFICATION_RETRIEVAL_WEIGH
 export V46_CLASSIFICATION_OT_WEIGHT="${V46_CLASSIFICATION_OT_WEIGHT:-0.45}"
 export V46_CLASSIFICATION_RETRIEVAL_BONUS="${V46_CLASSIFICATION_RETRIEVAL_BONUS:-0.28}"
 export V46_CLASSIFICATION_REPORT_TOPK="${V46_CLASSIFICATION_REPORT_TOPK:-8}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE="${V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE:-1}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED="${V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED:-0}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_DIRS="${V46_EXTERNAL_MUSIC_SEMANTIC_DIRS:-music_semantics:external_music_semantics:output/music_semantics}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_CMD="${V46_EXTERNAL_MUSIC_SEMANTIC_CMD:-}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR="${V46_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR:-output/v46_external_music_semantic_cache}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_WEIGHT="${V46_EXTERNAL_MUSIC_SEMANTIC_WEIGHT:-0.78}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE="${V46_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE:-0.65}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE="${V46_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE:-1}"
+export V46_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY="${V46_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY:-1}"
 export V46_UNPAIRED_AUDIO_ENABLE="${V46_UNPAIRED_AUDIO_ENABLE:-1}"
 export V46_UNPAIRED_AUDIO_SLOT_SECONDS="${V46_UNPAIRED_AUDIO_SLOT_SECONDS:-4.0}"
 export V46_UNPAIRED_POSITIVE_TOPK="${V46_UNPAIRED_POSITIVE_TOPK:-8}"
 export V46_UNPAIRED_PAIRS_PER_AUDIO_SLOT="${V46_UNPAIRED_PAIRS_PER_AUDIO_SLOT:-4}"
 
 CFG="configs/v46_motionrag_diff_config.json"
-RUN_ROOT="output/v46_11_semantic_bvh_motionrag_diff_$(date +%Y%m%d_%H%M%S)"
+RUN_ROOT="output/v46_12_external_music_semantic_motionrag_diff_$(date +%Y%m%d_%H%M%S)"
 DB_DIR="$RUN_ROOT/db"
 mkdir -p "$RUN_ROOT" "$DB_DIR" output
 echo "$RUN_ROOT" > output/LATEST_V46_MOTIONRAG_DIFF.txt
@@ -49,7 +58,7 @@ for d in change data/motions data/dunhuang_motion data/processed output/v34_even
   [[ -e "$d" ]] && MOTION_DIRS+=("$d")
 done
 if [[ ${#MOTION_DIRS[@]} -eq 0 ]]; then
-  echo "[V46.8 ERROR] no motion directory found. Put Chang-E BVH files under ./change." >&2
+  echo "[V46.12 ERROR] no motion directory found. Put Chang-E BVH files under ./change." >&2
   exit 2
 fi
 
@@ -62,11 +71,15 @@ AUDIO_DIRS=()
 for d in test_music_bank custom_music data/music proxy_music change/music change/audio; do
   [[ -e "$d" ]] && AUDIO_DIRS+=("$d")
 done
+SEMANTIC_DIRS=()
+for d in music_semantics external_music_semantics output/music_semantics; do
+  [[ -e "$d" ]] && SEMANTIC_DIRS+=("$d")
+done
 AUDIO="test_music_bank/dunhuangwu2.wav"
 [[ -f "$AUDIO" ]] || AUDIO="data/music/dunhuangwu2.wav"
 [[ -f "$AUDIO" ]] || AUDIO="custom_music/dunhuangwu2.wav"
 if [[ ! -f "$AUDIO" ]]; then
-  echo "[V46.8 ERROR] dunhuangwu2 audio not found under test_music_bank/, data/music/, or custom_music/." >&2
+  echo "[V46.12 ERROR] dunhuangwu2 audio not found under test_music_bank/, data/music/, or custom_music/." >&2
   exit 2
 fi
 
@@ -76,9 +89,14 @@ python tools/v46_motionrag_diff.py --config "$CFG" build-db \
   --audio_dirs "${AUDIO_DIRS[@]}" \
   --out_db "$DB_DIR"
 
+MUSIC_SEMANTIC_ARGS=()
+if [[ ${#SEMANTIC_DIRS[@]} -gt 0 ]]; then
+  MUSIC_SEMANTIC_ARGS=(--music_semantic_dirs "${SEMANTIC_DIRS[@]}")
+fi
 python tools/v46_motionrag_diff.py --config "$CFG" train-contrastive \
   --db "$DB_DIR/events.npz" \
   --unpaired_audio_dirs "${AUDIO_DIRS[@]}" \
+  "${MUSIC_SEMANTIC_ARGS[@]}" \
   --out "$RUN_ROOT/v44_contrastive.pt"
 
 python tools/v46_motionrag_diff.py --config "$CFG" train-refiner \
@@ -89,11 +107,12 @@ python tools/v46_motionrag_diff.py --config "$CFG" train-diffusion \
   --db "$DB_DIR/events.npz" \
   --out "$RUN_ROOT/v46_diffusion.pt"
 
-OUT="$RUN_ROOT/dunhuangwu2_v46_8_MotionRAG_Diff.npy"
-JSON="$RUN_ROOT/dunhuangwu2_v46_8_MotionRAG_Diff.report.json"
-MP4="$RUN_ROOT/dunhuangwu2_v46_8_MotionRAG_Diff.mp4"
+OUT="$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff.npy"
+JSON="$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff.report.json"
+MP4="$RUN_ROOT/dunhuangwu2_v46_12_MotionRAG_Diff.mp4"
 python tools/v46_motionrag_diff.py --config "$CFG" generate \
   --audio "$AUDIO" \
+  "${MUSIC_SEMANTIC_ARGS[@]}" \
   --db "$DB_DIR/events.npz" \
   --contrastive "$RUN_ROOT/v44_contrastive.pt" \
   --refiner "$RUN_ROOT/v45_refiner.pt" \
@@ -102,7 +121,7 @@ python tools/v46_motionrag_diff.py --config "$CFG" generate \
   --json "$JSON" \
   --render_output "$MP4"
 
-echo "[V46.8 DONE]"
+echo "[V46.12 DONE]"
 echo "[RUN_ROOT] $RUN_ROOT"
 echo "[MOTION]   $OUT"
 echo "[REPORT]   $JSON"
