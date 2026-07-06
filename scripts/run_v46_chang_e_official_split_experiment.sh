@@ -14,7 +14,7 @@ export PYTHONPATH="$EDGE_ROOT:${PYTHONPATH:-}"
 #   * all-change DB can be built only as qualitative_demo/upper_bound.
 # -----------------------------------------------------------------------------
 
-# Patch V46.20 contract guards into tools/v46_motionrag_diff.py.
+# Patch V46.21 contract guards into tools/v46_motionrag_diff.py.
 python tools/v46_research_contract_patch.py
 
 export V46_DEVICE="${V46_DEVICE:-cuda}"
@@ -53,12 +53,12 @@ export V46_DIFFUSION_TRAIN_STEPS="${V46_DIFFUSION_TRAIN_STEPS:-3000}"
 CFG="${V46_CONFIG:-configs/v46_motionrag_diff_config.json}"
 CHANGE_DIR="${V46_CHANGE_DIR:-change}"
 SPLIT_DIR="${V46_SPLIT_DIR:-$CHANGE_DIR/splits_official}"
-RUN_ROOT="${V46_RUN_ROOT:-output/v46_20_chang_e_official_$(date +%Y%m%d_%H%M%S)}"
+RUN_ROOT="${V46_RUN_ROOT:-output/v46_21_chang_e_official_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RUN_ROOT" output
 printf '%s\n' "$RUN_ROOT" > output/LATEST_V46_CHANG_E_OFFICIAL.txt
 
 if [[ ! -d "$CHANGE_DIR" ]]; then
-  echo "[V46.20 ERROR] $CHANGE_DIR not found. Put Chang-E BVH/manifest under EDGE/$CHANGE_DIR." >&2
+  echo "[V46.21 ERROR] $CHANGE_DIR not found. Put Chang-E BVH/manifest under EDGE/$CHANGE_DIR." >&2
   exit 2
 fi
 
@@ -87,7 +87,7 @@ for d in test_music_bank custom_music data/music proxy_music "$CHANGE_DIR/music"
   [[ -e "$d" ]] && AUDIO_DIRS+=("$d")
 done
 if [[ ${#AUDIO_DIRS[@]} -eq 0 ]]; then
-  echo "[V46.20 ERROR] no audio dirs found and motion-proxy fallback is disabled." >&2
+  echo "[V46.21 ERROR] no audio dirs found and motion-proxy fallback is disabled." >&2
   echo "Put music under test_music_bank/, custom_music/, data/music/, proxy_music/, $CHANGE_DIR/music/, or $CHANGE_DIR/audio/." >&2
   exit 2
 fi
@@ -110,7 +110,7 @@ if [[ -z "$AUDIO" ]]; then
   [[ -f "$AUDIO" ]] || AUDIO="$CHANGE_DIR/audio/dunhuangwu2.wav"
 fi
 if [[ ! -f "$AUDIO" ]]; then
-  echo "[V46.20 ERROR] target audio not found: $AUDIO" >&2
+  echo "[V46.21 ERROR] target audio not found: $AUDIO" >&2
   exit 2
 fi
 
@@ -126,7 +126,7 @@ build_one_db() {
   local split="$1"
   local manifest="$SPLIT_DIR/${split}_manifest.csv"
   local out_db="$RUN_ROOT/${split}_db"
-  echo "[V46.20] build ${split}_db from $manifest"
+  echo "[V46.21] build ${split}_db from $manifest"
   python tools/v46_motionrag_diff.py --config "$CFG" build-db \
     --motion_dirs "$CHANGE_DIR" \
     --manifest "$manifest" \
@@ -140,7 +140,7 @@ build_one_db val
 build_one_db test
 
 if [[ "${V46_BUILD_ALL_CHANGE_DEMO_DB:-0}" == "1" ]]; then
-  echo "[V46.20 WARN] Building all-change DB for qualitative demo / upper-bound only. Do NOT use in main table."
+  echo "[V46.21 WARN] Building all-change DB for qualitative demo / upper-bound only. Do NOT use in main table."
   python tools/v46_motionrag_diff.py --config "$CFG" build-db \
     --motion_dirs "$CHANGE_DIR" \
     --manifest "$SPLIT_DIR/all_manifest.csv" \
@@ -163,7 +163,7 @@ if [[ "$V46_ENABLE_CONTRASTIVE" == "1" ]]; then
     --out "$RUN_ROOT/v44_contrastive_train_only.pt"
   CONTRASTIVE_ARG=(--contrastive "$RUN_ROOT/v44_contrastive_train_only.pt")
 else
-  echo "[V46.20 INFO] V44 contrastive disabled. Generation will use descriptor retrieval fallback."
+  echo "[V46.21 INFO] V44 contrastive disabled. Generation will use descriptor retrieval fallback."
 fi
 
 if [[ "$V46_ENABLE_REFINER" == "1" ]]; then
@@ -173,7 +173,7 @@ if [[ "$V46_ENABLE_REFINER" == "1" ]]; then
     --out "$RUN_ROOT/v45_refiner_train_only.pt"
   REFINER_ARG=(--refiner "$RUN_ROOT/v45_refiner_train_only.pt")
 else
-  echo "[V46.20 INFO] V45 refiner disabled by V46_ENABLE_REFINER=0"
+  echo "[V46.21 INFO] V45 refiner disabled by V46_ENABLE_REFINER=0"
 fi
 
 if [[ "$V46_ENABLE_DIFFUSION" == "1" ]]; then
@@ -183,12 +183,12 @@ if [[ "$V46_ENABLE_DIFFUSION" == "1" ]]; then
     --out "$RUN_ROOT/v46_diffusion_train_only.pt"
   DIFFUSION_ARG=(--diffusion "$RUN_ROOT/v46_diffusion_train_only.pt")
 else
-  echo "[V46.20 INFO] V46 diffusion disabled by V46_ENABLE_DIFFUSION=0"
+  echo "[V46.21 INFO] V46 diffusion disabled by V46_ENABLE_DIFFUSION=0"
 fi
 
-OUT="$RUN_ROOT/dunhuangwu2_v46_20_official_train_db_only.npy"
-JSON="$RUN_ROOT/dunhuangwu2_v46_20_official_train_db_only.report.json"
-MP4="$RUN_ROOT/dunhuangwu2_v46_20_official_train_db_only.mp4"
+OUT="$RUN_ROOT/dunhuangwu2_v46_21_official_train_db_only.npy"
+JSON="$RUN_ROOT/dunhuangwu2_v46_21_official_train_db_only.report.json"
+MP4="$RUN_ROOT/dunhuangwu2_v46_21_official_train_db_only.mp4"
 
 # Official rule: generation/RAG memory uses train_db only.
 python tools/v46_motionrag_diff.py --config "$CFG" generate \
@@ -216,7 +216,7 @@ Official Chang-E Event-RAG policy for paper experiments
 7. If FK is unavailable in a metadata-polluted clip, contact fallback intentionally stays below ik_contact_high so strong IK foot-lock is softly suspended rather than forcing incorrect double-foot anchoring.
 EOF
 
-echo "[V46.20 OFFICIAL DONE]"
+echo "[V46.21 OFFICIAL DONE]"
 echo "[RUN_ROOT] $RUN_ROOT"
 echo "[SPLIT_REPORT] $RUN_ROOT/split_report.json"
 echo "[TRAIN_DB_AUDIT] $RUN_ROOT/train_db_audit.json"

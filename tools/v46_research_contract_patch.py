@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.20 research-contract patcher for tools/v46_motionrag_diff.py.
+V46.21 research-contract patcher for tools/v46_motionrag_diff.py.
 
 Purpose
 -------
@@ -35,7 +35,7 @@ TARGET = ROOT / "tools" / "v46_motionrag_diff.py"
 HELPERS = r'''
 
 # -----------------------------------------------------------------------------
-# V46.20 research contract guards for Chang-E/change RAG DB
+# V46.21 research contract guards for Chang-E/change RAG DB
 # -----------------------------------------------------------------------------
 def identity6d_np(shape_prefix: Tuple[int, ...] = ()) -> np.ndarray:
     """Return identity rotation in the repository's 6D convention."""
@@ -188,7 +188,7 @@ def enforce_edge151_contract_np(
     cfg = cfg or V46Config()
     x0 = np.asarray(motion, dtype=np.float32)
     report = {
-        "version": "v46_20_edge151_contract_guard",
+        "version": "v46_21_edge151_contract_guard",
         "source_hint": str(source_hint),
         "input_shape": list(x0.shape),
     }
@@ -510,6 +510,29 @@ def blend_motion_overlap_np(
     return out.astype(np.float32), report
 '''
 
+
+NEW_MATRIX_TO_ROT6D = r'''def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
+    """Convert rotation matrices to EDGE/Zhou 6D in column-concatenated form.
+
+    V46.21 critical fix:
+    The inverse of rot6d_to_matrix_np() must concatenate the first two matrix
+    columns as [R[:,0], R[:,1]].  The previous row-major expression
+    ``mat[..., :, 0:2].reshape(..., 6)`` interleaves rows as
+    [R00, R01, R10, R11, R20, R21], which turns the identity matrix into
+    [1, 0, 0, 1, 0, 0] instead of [1, 0, 0, 0, 1, 0].  That silently corrupts
+    saved Event-RAG clips and makes strict raw-rot6d audit fail even after
+    projection.
+    """
+    m = np.asarray(mat, dtype=np.float32)
+    if m.shape[-2:] != (3, 3):
+        raise ValueError(f"matrix_to_rot6d_np expects [...,3,3], got {m.shape}")
+    c0 = m[..., :, 0]
+    c1 = m[..., :, 1]
+    return np.concatenate([c0, c1], axis=-1).astype(np.float32)
+
+
+'''
+
 NEW_RESAMPLE = r'''def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
     """Resample BVH-derived EDGE-like arrays to cfg.fps before event slicing.
 
@@ -809,6 +832,7 @@ def replace_between(text: str, start_pat: str, end_pat: str, replacement: str, l
 
 def replace_helper_block(text: str) -> str:
     old_markers = [
+        "# V46.21 research contract guards for Chang-E/change RAG DB",
         "# V46.20 research contract guards for Chang-E/change RAG DB",
         "# V46.19 research contract guards for Chang-E/change RAG DB",
         "# V46.18 research contract guards for Chang-E/change RAG DB",
@@ -863,6 +887,14 @@ def main() -> None:
 
     text = replace_helper_block(text)
     text = ensure_env_lines(text)
+
+    text = replace_between(
+        text,
+        "def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:\n",
+        "def fk_24_np(motion: np.ndarray) -> np.ndarray:\n",
+        NEW_MATRIX_TO_ROT6D,
+        "matrix_to_rot6d_np",
+    )
 
     text = replace_between(
         text,

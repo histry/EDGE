@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Strict audit for V46 Event-RAG databases.
+"""Strict audit for V46 Event-RAG databases (V46.21 rot6d convention aware).
 
 Independent from tools/v46_motionrag_diff.py so it can be run before and after
 patching.  It checks saved events against the EDGE-151D contract:
@@ -144,6 +144,11 @@ def audit_event(path: str) -> dict:
         reasons.append("rot6d_distribution_suspicious")
     if raw_bad_finite_ratio > 0.0 or raw_degenerate_ratio > 0.0:
         reasons.append("raw_rot6d_contains_nan_or_degenerate_vectors")
+    # Strong signature of the historical row-major matrix_to_rot6d bug: the
+    # second 6D vector has near-zero norm and/or becomes almost collinear with
+    # the first vector after saving.
+    if raw_n2_err > 0.80 and raw_dot_err > 0.80:
+        reasons.append("rot6d_row_major_matrix_to_6d_bug_signature")
     if raw_n1_err > 0.15 or raw_n2_err > 0.15 or raw_dot_err > 0.20:
         reasons.append("raw_rot6d_not_projected")
     if orth_p95 > 1e-3 or det_err_p95 > 1e-3:
