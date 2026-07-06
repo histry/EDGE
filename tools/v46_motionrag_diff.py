@@ -166,13 +166,41 @@ def load_json(path: Optional[str | Path], default: Optional[dict] = None) -> dic
     return base
 
 
-def save_json(obj: object, path: str | Path) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+def _v46_json_safe(x):
+    """Make report/meta objects JSON serializable.
+
+    V46.31 hotfix:
+    Chang-E semantic ontology may contain Python set values, e.g. aliases.
+    events_meta.json must remain writable, so convert sets/numpy/Path safely.
+    """
+    import dataclasses as _dataclasses
+    import numpy as _np
+    from pathlib import Path as _Path
+
+    if _dataclasses.is_dataclass(x):
+        return _v46_json_safe(_dataclasses.asdict(x))
+    if isinstance(x, dict):
+        return {str(k): _v46_json_safe(v) for k, v in x.items()}
+    if isinstance(x, set):
+        return sorted([_v46_json_safe(v) for v in x], key=lambda z: str(z))
+    if isinstance(x, (list, tuple)):
+        return [_v46_json_safe(v) for v in x]
+    if isinstance(x, _Path):
+        return str(x)
+    if isinstance(x, _np.ndarray):
+        return _v46_json_safe(x.tolist())
+    if isinstance(x, _np.generic):
+        return x.item()
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+    return str(x)
 
 
+def save_json(obj, path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_v46_json_safe(obj), f, ensure_ascii=False, indent=2)
 def smooth_np(x: np.ndarray, sigma: float) -> np.ndarray:
     if sigma <= 0 or ndi is None:
         return x
@@ -499,7 +527,7 @@ def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
 def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
     """Convert rotation matrices to EDGE/Zhou 6D in column-concatenated form.
 
-    V46.21 critical fix:
+    V46.21/V46.31 critical fix:
     The inverse of rot6d_to_matrix_np() must concatenate the first two matrix
     columns as [R[:,0], R[:,1]].  The previous row-major expression
     ``mat[..., :, 0:2].reshape(..., 6)`` interleaves rows as
@@ -623,6 +651,32 @@ class V46Config:
     classification_ot_weight: float = 0.45
     classification_retrieval_bonus: float = 0.28
     classification_report_topk: int = 8
+    # V46.31: Chang-E event-level semantic routing.
+    chang_e_event_semantic_enable: bool = True
+    semantic_routing_weight: float = 0.72
+    event_family_bonus: float = 0.58
+    motion_stage_role_bonus: float = 0.36
+    preferred_dance_key_bonus: float = 0.28
+    route_natural_duration_weight: float = 0.20
+    route_family_balance_penalty: float = 0.18
+    route_family_recent_window: int = 8
+    route_family_penalty_cap: float = 0.25
+    route_dance_key_repeat_penalty: float = 0.16
+    route_family_repeat_penalty: float = 0.12
+    route_source_repeat_penalty: float = 0.10
+    route_motif_recall_bonus: float = 0.12
+    route_debug_topk: int = 10
+    # V46.31: convert long Chang-E BVH into a curated 72BVH-like semantic event library.
+    chang_e_boundary_event_split: bool = True
+    chang_e_boundary_max_extra_starts: int = 96
+    chang_e_min_event_quality: float = 0.22
+    chang_e_keep_pose_anchor_quality: float = 0.16
+    event_quality_weight: float = 0.22
+    route_support_bonus: float = 0.12
+    route_locomotion_bonus: float = 0.14
+    route_stage_sequence_weight: float = 0.16
+    route_source_run_hard_penalty: float = 0.30
+    route_semantic_bonus_scale: float = 1.50
 
     # V46.12: external classical-music semantic encoder.  The current EDGE
     # repository contains rule/librosa music feature extractors, not a trained
@@ -746,6 +800,30 @@ class V46Config:
             "V46_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
             "V46_TOP_K": ("top_k", int),
             "V46_BEAM_SIZE": ("beam_size", int),
+            "V46_CHANG_E_EVENT_SEMANTIC_ENABLE": ("chang_e_event_semantic_enable", lambda x: bool(int(x))),
+            "V46_SEMANTIC_ROUTING_WEIGHT": ("semantic_routing_weight", float),
+            "V46_EVENT_FAMILY_BONUS": ("event_family_bonus", float),
+            "V46_MOTION_STAGE_ROLE_BONUS": ("motion_stage_role_bonus", float),
+            "V46_PREFERRED_DANCE_KEY_BONUS": ("preferred_dance_key_bonus", float),
+            "V46_ROUTE_NATURAL_DURATION_WEIGHT": ("route_natural_duration_weight", float),
+            "V46_ROUTE_FAMILY_BALANCE_PENALTY": ("route_family_balance_penalty", float),
+            "V46_ROUTE_FAMILY_RECENT_WINDOW": ("route_family_recent_window", int),
+            "V46_ROUTE_FAMILY_PENALTY_CAP": ("route_family_penalty_cap", float),
+            "V46_ROUTE_DANCE_KEY_REPEAT_PENALTY": ("route_dance_key_repeat_penalty", float),
+            "V46_ROUTE_FAMILY_REPEAT_PENALTY": ("route_family_repeat_penalty", float),
+            "V46_ROUTE_SOURCE_REPEAT_PENALTY": ("route_source_repeat_penalty", float),
+            "V46_ROUTE_MOTIF_RECALL_BONUS": ("route_motif_recall_bonus", float),
+            "V46_ROUTE_DEBUG_TOPK": ("route_debug_topk", int),
+            "V46_CHANG_E_BOUNDARY_EVENT_SPLIT": ("chang_e_boundary_event_split", lambda x: bool(int(x))),
+            "V46_CHANG_E_BOUNDARY_MAX_EXTRA_STARTS": ("chang_e_boundary_max_extra_starts", int),
+            "V46_CHANG_E_MIN_EVENT_QUALITY": ("chang_e_min_event_quality", float),
+            "V46_CHANG_E_KEEP_POSE_ANCHOR_QUALITY": ("chang_e_keep_pose_anchor_quality", float),
+            "V46_EVENT_QUALITY_WEIGHT": ("event_quality_weight", float),
+            "V46_ROUTE_SUPPORT_BONUS": ("route_support_bonus", float),
+            "V46_ROUTE_LOCOMOTION_BONUS": ("route_locomotion_bonus", float),
+            "V46_ROUTE_STAGE_SEQUENCE_WEIGHT": ("route_stage_sequence_weight", float),
+            "V46_ROUTE_SOURCE_RUN_HARD_PENALTY": ("route_source_run_hard_penalty", float),
+            "V46_ROUTE_SEMANTIC_BONUS_SCALE": ("route_semantic_bonus_scale", float),
             "V46_OVERLAP": ("overlap", int),
             "V46_WINDOW_LEN": ("window_len", int),
             "V46_HOP_LEN": ("hop_len", int),
@@ -888,8 +966,28 @@ def motion_boundary_state(motion: np.ndarray) -> Tuple[np.ndarray, np.ndarray, n
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # -----------------------------------------------------------------------------
-# V46.21 research contract guards for Chang-E/change RAG DB
+# V46.31 research contract guards for Chang-E/change RAG DB
 # -----------------------------------------------------------------------------
 def identity6d_np(shape_prefix: Tuple[int, ...] = ()) -> np.ndarray:
     """Return identity rotation in the repository's 6D convention."""
@@ -908,9 +1006,16 @@ def sanitize_rot6d_np(rot6d: np.ndarray) -> Tuple[np.ndarray, dict]:
     finite = np.isfinite(r).all(axis=-1)
     a1 = r[..., 0:3]
     a2 = r[..., 3:6]
-    n1 = np.linalg.norm(np.nan_to_num(a1, nan=0.0, posinf=0.0, neginf=0.0), axis=-1)
-    n2 = np.linalg.norm(np.nan_to_num(a2, nan=0.0, posinf=0.0, neginf=0.0), axis=-1)
-    bad = (~finite) | (n1 < 1e-5) | (n2 < 1e-5)
+    a1_clean = np.nan_to_num(a1, nan=0.0, posinf=0.0, neginf=0.0)
+    a2_clean = np.nan_to_num(a2, nan=0.0, posinf=0.0, neginf=0.0)
+    n1 = np.linalg.norm(a1_clean, axis=-1)
+    n2 = np.linalg.norm(a2_clean, axis=-1)
+    # V46.31: also reject near-collinear 6D vectors.  Gram-Schmidt
+    # can collapse when a1 and a2 are parallel/anti-parallel even if both
+    # vector norms are valid, which can happen during early diffusion denoising.
+    denom = np.maximum(n1 * n2, 1e-8)
+    cross_norm = np.linalg.norm(np.cross(a1_clean, a2_clean), axis=-1) / denom
+    bad = (~finite) | (n1 < 1e-5) | (n2 < 1e-5) | (cross_norm < 1e-5)
     bad_count = int(np.sum(bad))
     r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     if bad_count:
@@ -920,6 +1025,8 @@ def sanitize_rot6d_np(rot6d: np.ndarray) -> Tuple[np.ndarray, dict]:
         "bad_joint_ratio": float(bad_count / max(1, bad.size)),
         "min_a1_norm_before_identity": float(np.nanmin(n1)) if n1.size else 0.0,
         "min_a2_norm_before_identity": float(np.nanmin(n2)) if n2.size else 0.0,
+        "min_cross_norm_before_identity": float(np.nanmin(cross_norm)) if cross_norm.size else 0.0,
+        "near_collinear_joint_count": int(np.sum(cross_norm < 1e-5)) if cross_norm.size else 0,
     }
     return r.reshape(np.asarray(rot6d).shape).astype(np.float32), report
 
@@ -936,6 +1043,39 @@ def project_edge151_rot6d_np(motion: np.ndarray) -> Tuple[np.ndarray, dict]:
     ).reshape(x.shape[0], -1)
     sanitize_report["projected"] = True
     return x.astype(np.float32), sanitize_report
+
+
+def rotate_motion_around_y_np(motion: np.ndarray, yaw_delta: float, pivot_xz: Optional[np.ndarray] = None) -> np.ndarray:
+    """Rotate a whole EDGE-151D motion around the vertical Y axis.
+
+    This is a world-space rigid yaw transform for event stitching. It rotates
+    the root XZ trajectory around ``pivot_xz`` and left-multiplies the root
+    joint rotation by R_y(yaw_delta). Child joint local rotations remain valid
+    because the root orientation carries the global heading change.
+    """
+    out = np.asarray(motion, dtype=np.float32).copy()
+    if out.ndim != 2 or out.shape[1] < ROT6D_END or out.shape[0] <= 0:
+        return out.astype(np.float32)
+    yaw = float(yaw_delta)
+    if not np.isfinite(yaw) or abs(yaw) < 1e-8:
+        return out.astype(np.float32)
+    c = float(np.cos(yaw))
+    ss = float(np.sin(yaw))
+    if pivot_xz is None:
+        pivot = out[0, [ROOT_X_IDX, ROOT_Z_IDX]].astype(np.float32)
+    else:
+        pivot = np.asarray(pivot_xz, dtype=np.float32).reshape(2)
+    rel_x = out[:, ROOT_X_IDX].copy() - float(pivot[0])
+    rel_z = out[:, ROOT_Z_IDX].copy() - float(pivot[1])
+    out[:, ROOT_X_IDX] = c * rel_x + ss * rel_z + float(pivot[0])
+    out[:, ROOT_Z_IDX] = -ss * rel_x + c * rel_z + float(pivot[1])
+
+    ry = np.asarray([[c, 0.0, ss], [0.0, 1.0, 0.0], [-ss, 0.0, c]], dtype=np.float32)
+    root6 = out[:, ROT6D_START:ROT6D_START + 6].reshape(out.shape[0], 1, 6)
+    root_r = rot6d_to_matrix_np(root6)
+    root_r = np.matmul(ry[None, None, :, :], root_r).astype(np.float32)
+    out[:, ROT6D_START:ROT6D_START + 6] = matrix_to_rot6d_np(root_r).reshape(out.shape[0], 6)
+    return out.astype(np.float32)
 
 
 def _safe_percentile(arr: np.ndarray, q: float, default: float = 0.0) -> float:
@@ -1042,7 +1182,7 @@ def enforce_edge151_contract_np(
     cfg = cfg or V46Config()
     x0 = np.asarray(motion, dtype=np.float32)
     report = {
-        "version": "v46_21_edge151_contract_guard",
+        "version": "v46_24_edge151_contract_guard",
         "source_hint": str(source_hint),
         "input_shape": list(x0.shape),
     }
@@ -1632,6 +1772,381 @@ def class_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = None)
     return base.astype(np.float32)
 
 
+
+
+
+
+
+
+
+
+
+
+CHANG_E_CATEGORY_PROFILES = {
+    "flying_apsaras": {"aliases": {"flying", "apsaras", "flying_apsara", "flying_apsaras", "feitian", "fei_tian", "sky_dance"}, "energy": 0.52, "onset": 0.28, "travel": 0.32, "turn": 0.38, "lower": 0.38, "upper": 0.72, "floorwork": 0.10, "jump": 0.35, "spin": 0.35, "pose_hold": 0.25, "instrument": 0.0, "prop": 0.85, "display": "Flying Apsaras", "semantic_role": "aerial_graceful_flow", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "upper_body", "spatial_label": "aerial_leaning", "music_alignment_label": "lyrical_flow", "music_alignment_tags": ["lyrical_flow", "turning_climax", "calm_meditative", "aerial_curve"], "preferred_music_roles": ["intro", "build_up", "climax"], "preferred_dance_keys": ["flying_apsaras", "sogdian_whirl", "lotus_steps"], "cultural_motif": "flying_apsara", "prop_proxy_label": "sash_ribbon_proxy", "locomotion_label": "floating_leaning", "support_label": "low_contact_flight_like", "event_family": "aerial_curve", "motion_stage_role": "opening_or_climax", "natural_duration_range_sec": [2.0, 5.5]},
+    "lotus_steps": {"aliases": {"lotus", "lotussteps", "lotus_step", "lotus_steps"}, "energy": 0.48, "onset": 0.35, "travel": 0.62, "turn": 0.20, "lower": 0.78, "upper": 0.38, "floorwork": 0.05, "jump": 0.12, "spin": 0.10, "pose_hold": 0.20, "instrument": 0.0, "prop": 0.0, "display": "Lotus Steps", "semantic_role": "flowing_footwork", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "lower_body", "spatial_label": "traveling", "music_alignment_label": "footwork_flow", "music_alignment_tags": ["footwork_flow", "lyrical_flow", "calm_meditative"], "preferred_music_roles": ["normal", "development"], "preferred_dance_keys": ["lotus_steps", "flying_apsaras", "sogdian_whirl"], "cultural_motif": "lotus_step", "prop_proxy_label": "none", "locomotion_label": "traveling_steps", "support_label": "alternating_foot_support", "event_family": "footwork_flow", "motion_stage_role": "development", "natural_duration_range_sec": [1.5, 4.0]},
+    "thirty_six_postures": {"aliases": {"36pose", "36posture", "36postures", "thirtysix", "thirty_six", "thirty_six_postures", "jiyuetian"}, "energy": 0.36, "onset": 0.18, "travel": 0.12, "turn": 0.12, "lower": 0.28, "upper": 0.42, "floorwork": 0.18, "jump": 0.02, "spin": 0.05, "pose_hold": 0.90, "instrument": 0.0, "prop": 0.0, "display": "Ji Yue Tian Thirty-Six Postures", "semantic_role": "iconic_pose_sequence", "energy_label": "moderate", "rhythm_label": "sustained", "body_focus_label": "pose", "spatial_label": "in_place", "music_alignment_label": "pose_hold", "music_alignment_tags": ["pose_hold", "calm_meditative", "lyrical_flow"], "preferred_music_roles": ["intro", "release", "resolution"], "preferred_dance_keys": ["thirty_six_postures", "revelation_meditation", "lotus_steps"], "cultural_motif": "jiyuetian_pose", "prop_proxy_label": "none", "locomotion_label": "in_place_pose", "support_label": "static_or_low_motion_support", "event_family": "pose_motif", "motion_stage_role": "anchor_or_resolution", "natural_duration_range_sec": [1.2, 3.8]},
+    "revelation_meditation": {"aliases": {"meditation", "mediation", "revelation", "revelation_meditation", "revelation_mediation"}, "energy": 0.20, "onset": 0.08, "travel": 0.10, "turn": 0.08, "lower": 0.20, "upper": 0.36, "floorwork": 0.38, "jump": 0.0, "spin": 0.03, "pose_hold": 0.78, "instrument": 0.0, "prop": 0.0, "display": "Revelation Meditation", "semantic_role": "calm_meditative_flow", "energy_label": "calm", "rhythm_label": "sustained", "body_focus_label": "full_body", "spatial_label": "in_place", "music_alignment_label": "calm_meditative", "music_alignment_tags": ["calm_meditative", "pose_hold", "lyrical_flow"], "preferred_music_roles": ["intro", "calm", "release", "resolution"], "preferred_dance_keys": ["revelation_meditation", "thirty_six_postures", "flying_apsaras"], "cultural_motif": "buddhist_meditation", "prop_proxy_label": "none", "locomotion_label": "slow_weight_shift", "support_label": "stable_support", "event_family": "calm_flow", "motion_stage_role": "intro_or_resolution", "natural_duration_range_sec": [2.0, 6.0]},
+    "sogdian_whirl": {"aliases": {"ribbon", "ribbon_flow", "sash", "silk", "whirl", "sogdian", "sogdian_whirl", "turn", "turning"}, "energy": 0.72, "onset": 0.40, "travel": 0.50, "turn": 0.90, "lower": 0.68, "upper": 0.65, "floorwork": 0.02, "jump": 0.20, "spin": 0.95, "pose_hold": 0.15, "instrument": 0.0, "prop": 0.75, "display": "Sogdian Whirl / Ribbon Flow", "semantic_role": "flowing_turning_motif", "energy_label": "high", "rhythm_label": "lyrical", "body_focus_label": "turning_flow", "spatial_label": "turning", "music_alignment_label": "turning_climax", "music_alignment_tags": ["turning_climax", "lyrical_flow", "footwork_flow"], "preferred_music_roles": ["build_up", "climax"], "preferred_dance_keys": ["sogdian_whirl", "flying_apsaras", "lotus_steps"], "cultural_motif": "sogdian_whirl", "prop_proxy_label": "ribbon_sash_proxy", "locomotion_label": "turning_travel", "support_label": "alternating_or_pivot_support", "event_family": "turning_flow", "motion_stage_role": "climax", "natural_duration_range_sec": [1.6, 4.5]},
+    "pipa_behind_back": {"aliases": {"pipa", "pipa1", "pipa2", "playing_pipa", "playing_the_pipa", "pipa_behind_back"}, "energy": 0.46, "onset": 0.42, "travel": 0.16, "turn": 0.20, "lower": 0.30, "upper": 0.82, "floorwork": 0.06, "jump": 0.05, "spin": 0.10, "pose_hold": 0.45, "instrument": 1.0, "prop": 0.70, "display": "Playing the Pipa Behind the Back", "semantic_role": "instrument_upper_body_motif", "energy_label": "moderate", "rhythm_label": "accented", "body_focus_label": "upper_body", "spatial_label": "in_place", "music_alignment_label": "instrument_phrase", "music_alignment_tags": ["instrument_phrase", "lyrical_flow", "percussive_accent"], "preferred_music_roles": ["motif", "normal", "build_up"], "preferred_dance_keys": ["pipa_behind_back", "sogdian_whirl", "lei_gong_drum"], "cultural_motif": "pipa_instrument_pose", "prop_proxy_label": "pipa_proxy", "locomotion_label": "upper_body_phrase", "support_label": "stable_support", "event_family": "instrument_motif", "motion_stage_role": "motif_recall", "natural_duration_range_sec": [1.6, 4.5]},
+    "lei_gong_drum": {"aliases": {"drum", "lei_gong", "leigong", "lei_gong_drum"}, "energy": 0.82, "onset": 0.88, "travel": 0.52, "turn": 0.35, "lower": 0.75, "upper": 0.76, "floorwork": 0.04, "jump": 0.32, "spin": 0.20, "pose_hold": 0.10, "instrument": 0.65, "prop": 0.55, "display": "Lei Gong Drum", "semantic_role": "percussive_high_energy", "energy_label": "percussive", "rhythm_label": "percussive", "body_focus_label": "full_body", "spatial_label": "traveling", "music_alignment_label": "percussive_accent", "music_alignment_tags": ["percussive_accent", "turning_climax", "footwork_flow"], "preferred_music_roles": ["accent", "climax"], "preferred_dance_keys": ["lei_gong_drum", "pipa_behind_back", "sogdian_whirl"], "cultural_motif": "thunder_drum", "prop_proxy_label": "drum_proxy", "locomotion_label": "accented_travel", "support_label": "strong_foot_contact", "event_family": "percussive_accent", "motion_stage_role": "accent_or_climax", "natural_duration_range_sec": [1.2, 3.5]},
+    "unknown": {"aliases": set(), "energy": 0.45, "onset": 0.30, "travel": 0.30, "turn": 0.20, "lower": 0.45, "upper": 0.45, "floorwork": 0.0, "jump": 0.0, "spin": 0.0, "pose_hold": 0.25, "instrument": 0.0, "prop": 0.0, "display": "Unknown Chang-E Motion", "semantic_role": "unknown_motion", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "full_body", "spatial_label": "in_place", "music_alignment_label": "lyrical_flow", "music_alignment_tags": ["lyrical_flow"], "preferred_music_roles": ["normal"], "preferred_dance_keys": ["lotus_steps", "thirty_six_postures"], "cultural_motif": "unknown", "prop_proxy_label": "unknown", "locomotion_label": "unknown", "support_label": "unknown", "event_family": "unknown", "motion_stage_role": "development", "natural_duration_range_sec": [1.5, 4.0]},
+}
+
+ENERGY_LABELS = ["calm", "moderate", "high", "percussive"]
+RHYTHM_LABELS = ["sustained", "lyrical", "accented", "percussive"]
+BODY_FOCUS_LABELS = ["pose", "lower_body", "upper_body", "full_body", "turning_flow"]
+SPATIAL_LABELS = ["in_place", "traveling", "turning", "aerial_leaning"]
+MUSIC_ALIGNMENT_LABELS = ["calm_meditative", "lyrical_flow", "pose_hold", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow", "aerial_curve"]
+EVENT_FAMILY_LABELS = ["calm_flow", "pose_motif", "footwork_flow", "turning_flow", "instrument_motif", "percussive_accent", "aerial_curve", "unknown"]
+STAGE_ROLE_LABELS = ["intro", "development", "build_up", "motif_recall", "anchor_or_resolution", "intro_or_resolution", "opening_or_climax", "accent_or_climax", "climax", "resolution"]
+CATEGORY_CLASS_OVERRIDES = {}
+
+
+def canonicalize_chang_e_key(key: object) -> str:
+    key_s = str(key or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
+    try:
+        key_s = re.sub(r"_take\d+$", "", key_s)
+    except Exception:
+        pass
+    aliases = {"mediation": "revelation_meditation", "female_mediation": "revelation_meditation", "male_mediation": "revelation_meditation", "meditation": "revelation_meditation", "36pose": "thirty_six_postures", "36postures": "thirty_six_postures", "thirtysix": "thirty_six_postures", "lotus": "lotus_steps", "pipa": "pipa_behind_back", "drum": "lei_gong_drum", "leigong": "lei_gong_drum", "ribbon": "sogdian_whirl", "ribbon_flow": "sogdian_whirl", "sogdian": "sogdian_whirl", "whirl": "sogdian_whirl", "flying": "flying_apsaras", "apsaras": "flying_apsaras", "feitian": "flying_apsaras"}
+    if key_s in aliases:
+        return aliases[key_s]
+    for k, prof in CHANG_E_CATEGORY_PROFILES.items():
+        if key_s == k or key_s in set(prof.get("aliases", set())):
+            return k
+    return key_s if key_s in CHANG_E_CATEGORY_PROFILES else "unknown"
+
+
+def _safe_profile_key(meta: dict) -> str:
+    return canonicalize_chang_e_key(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or meta.get("source_bvh") or "unknown")
+
+
+def _label_index(label: str, labels: Sequence[str]) -> int:
+    try:
+        return list(labels).index(str(label))
+    except ValueError:
+        return -1
+
+
+def _parse_numeric_semantic(meta: dict) -> Dict[str, float]:
+    keys = ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]
+    vals = [x for x in re.split(r"[;, ]+", str(meta.get("semantic_numeric", "") or "")) if x]
+    out = {}
+    for k, v in zip(keys, vals):
+        try: out[k] = float(v)
+        except Exception: pass
+    return out
+
+
+def strong_action_semantics_from_meta(meta: dict, desc: Optional[np.ndarray] = None) -> Dict[str, object]:
+    key = _safe_profile_key(meta)
+    base_prof = dict(CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"]))
+    numeric = {k: float(base_prof.get(k, 0.0)) for k in ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]}
+    numeric.update(_parse_numeric_semantic(meta))
+    if desc is not None and len(desc) >= 20:
+        numeric["travel"] = max(numeric["travel"], float(np.clip(desc[1] / 1.2, 0.0, 1.0)))
+        numeric["energy"] = max(numeric["energy"], float(np.clip(desc[5] / 0.14, 0.0, 1.0)))
+        numeric["lower"] = max(numeric["lower"], float(np.clip(desc[7] / 0.10, 0.0, 1.0)))
+        numeric["upper"] = max(numeric["upper"], float(np.clip(desc[8] / 0.10, 0.0, 1.0)))
+        numeric["turn"] = max(numeric["turn"], float(np.clip(abs(desc[17]) / 0.22, 0.0, 1.0)))
+        numeric["jump"] = max(numeric["jump"], float(np.clip(desc[18] / 0.20, 0.0, 1.0)))
+        numeric["pose_hold"] = max(numeric["pose_hold"], float(np.clip(1.0 - desc[5] / 0.12, 0.0, 1.0)))
+    prof = dict(base_prof)
+    for field in ["energy_label", "rhythm_label", "body_focus_label", "spatial_label", "music_alignment_label", "semantic_role", "cultural_motif", "prop_proxy_label", "locomotion_label", "support_label", "event_family", "motion_stage_role"]:
+        if meta.get(field):
+            prof[field] = str(meta.get(field))
+    if meta.get("music_alignment_tags"):
+        prof["music_alignment_tags"] = [x for x in re.split(r"[;|,]", str(meta.get("music_alignment_tags"))) if x]
+    if meta.get("preferred_dance_keys"):
+        prof["preferred_dance_keys"] = [canonicalize_chang_e_key(x) for x in re.split(r"[;|,]", str(meta.get("preferred_dance_keys"))) if x]
+    tags = list(dict.fromkeys([str(prof.get("music_alignment_label"))] + [str(x) for x in prof.get("music_alignment_tags", [])]))
+    prof["music_alignment_tags"] = tags
+    prof.setdefault("preferred_music_roles", base_prof.get("preferred_music_roles", ["normal"]))
+    prof.setdefault("preferred_dance_keys", base_prof.get("preferred_dance_keys", [key]))
+    prof["semantic_numeric"] = ";".join(str(float(numeric[k])) for k in ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"])
+    prof["classification_text"] = f"action={key}; motif={prof.get('cultural_motif')}; family={prof.get('event_family')}; stage={prof.get('motion_stage_role')}; music_align={prof.get('music_alignment_label')}; numeric={prof['semantic_numeric']}"
+    return refine_chang_e_event_semantics(meta, desc, prof)
+
+
+def _float_meta(meta: dict, key: str, default: float = 0.0) -> float:
+    try:
+        v = meta.get(key, default)
+        if v is None or str(v).lower() in {"nan", "none", "null", ""}:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _bounded01(x: float) -> float:
+    try:
+        return float(np.clip(float(x), 0.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def chang_e_event_quality_from_numbers(nums: Dict[str, float], family: str, duration: float, natural_range: Sequence[float]) -> float:
+    """Quality gate for converting long Chang-E BVH into 72BVH-like RAG events."""
+    energy = _bounded01(nums.get("energy", 0.0)); travel = _bounded01(nums.get("travel", 0.0))
+    turn = _bounded01(nums.get("turn", 0.0)); lower = _bounded01(nums.get("lower", 0.0)); upper = _bounded01(nums.get("upper", 0.0))
+    pose_hold = _bounded01(nums.get("pose_hold", 0.0)); jump = _bounded01(nums.get("jump", 0.0)); onset = _bounded01(nums.get("onset", 0.0))
+    contact_ratio = _bounded01(nums.get("contact_ratio", 0.5))
+    root_y = max(0.0, float(nums.get("root_y_range", 0.0)))
+    lo, hi = 1.5, 4.0
+    try:
+        if natural_range and len(natural_range) >= 2:
+            lo, hi = float(natural_range[0]), float(natural_range[-1])
+    except Exception:
+        pass
+    dur = max(1e-3, float(duration or 0.0))
+    center = max(1e-3, 0.5 * (lo + hi))
+    dur_score = 1.0 if (lo <= dur <= hi) else float(np.exp(-abs(np.log(dur / center))))
+    content = max(energy, travel, turn, lower, upper, onset, jump)
+    if family in {"pose_motif", "calm_flow"}:
+        content = max(content * 0.65, pose_hold)
+    # V46.31: stationary Dunhuang postures / meditation motifs are supposed to
+    # have long stable support. Do not score contact_ratio=1.0 as bad gait.
+    if family in {"pose_motif", "calm_flow"} or pose_hold > 0.70:
+        contact_score = 1.0 if contact_ratio >= 0.70 else float(contact_ratio / 0.70)
+    else:
+        contact_score = 1.0 - min(1.0, abs(contact_ratio - 0.46) / 0.54)
+    root_y_penalty = max(0.0, min(0.25, (root_y - 0.35) * 0.35))
+    dead_penalty = 0.0
+    if family not in {"pose_motif", "calm_flow"} and content < 0.20 and pose_hold < 0.45:
+        dead_penalty = 0.25
+    q = 0.42 * content + 0.22 * pose_hold + 0.20 * dur_score + 0.16 * contact_score - root_y_penalty - dead_penalty
+    return float(np.clip(q, 0.02, 1.0))
+
+
+def chang_e_semantic_event_starts(seq: np.ndarray, cfg: V46Config) -> List[int]:
+    """Boundary-aware starts for Chang-E long BVH.
+
+    The old 72BVH data behaved well because each file was already a compact
+    action unit. Chang-E files are long performances, so we preserve uniform
+    coverage and add motion-novelty anchors around energy/yaw/contact changes.
+    """
+    x = np.asarray(seq, dtype=np.float32)
+    T = int(x.shape[0])
+    win = max(1, min(int(getattr(cfg, "window_len", 120)), T))
+    hop = max(1, int(getattr(cfg, "hop_len", max(1, win // 2))))
+    minf = max(1, int(getattr(cfg, "min_event_frames", 45)))
+    if T <= max(win, minf):
+        return [0]
+    starts = set([0, max(0, T - win)])
+    for st in range(0, max(1, T - minf + 1), hop):
+        starts.add(int(min(max(0, st), max(0, T - minf))))
+    try:
+        joints = fk_24_np(x)
+        v = np.zeros_like(joints)
+        if T > 1:
+            v[1:] = joints[1:] - joints[:-1]
+        energy = np.linalg.norm(v.reshape(T, -1, 3), axis=-1).mean(axis=1)
+        root = x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+        root_v = np.zeros((T,), dtype=np.float32)
+        if T > 1:
+            root_v[1:] = np.linalg.norm(root[1:, [0, 2]] - root[:-1, [0, 2]], axis=-1)
+        yaw = root_yaw_np(x)
+        yaw_v = np.zeros((T,), dtype=np.float32)
+        if T > 1:
+            yaw_v[1:] = np.abs(angle_diff(yaw[1:], yaw[:-1]))
+        foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
+        floor = np.percentile(foot[..., 1].reshape(-1), 5)
+        near = (foot[..., 1] < floor + 0.05).mean(axis=1)
+        novelty = energy + 0.65 * root_v + 0.55 * yaw_v + 0.20 * np.abs(np.diff(near, prepend=near[:1]))
+        if novelty.size > 7:
+            k = np.ones(5, dtype=np.float32) / 5.0
+            novelty = np.convolve(novelty, k, mode="same")
+        thr = float(np.percentile(novelty, 72)) if novelty.size else 0.0
+        order = np.argsort(-novelty)
+        extra = 0
+        max_extra = int(getattr(cfg, "chang_e_boundary_max_extra_starts", 96))
+        min_sep = max(8, min(hop, win // 3))
+        selected_centers: List[int] = []
+        for c in order.tolist():
+            if novelty[int(c)] < thr or extra >= max_extra:
+                break
+            c = int(c)
+            if any(abs(c - q) < min_sep for q in selected_centers):
+                continue
+            selected_centers.append(c)
+            starts.add(int(np.clip(c - win // 2, 0, max(0, T - minf))))
+            starts.add(int(np.clip(c - win // 3, 0, max(0, T - minf))))
+            extra += 2
+    except Exception:
+        pass
+    out = sorted(starts)
+    merged: List[int] = []
+    min_start_sep = max(6, min(hop // 2, win // 4))
+    tail = max(0, T - win)
+    # V46.31: if the sequence is only slightly longer than one window, [0:win]
+    # and [tail:T] are >95% overlapping twins. Keep one centered representative
+    # rather than polluting the RAG DB with near-identical embeddings.
+    if 0 < tail < min_start_sep:
+        return [int(max(0, tail // 2))]
+    for st in out:
+        st = int(st)
+        # V46.31: keep coverage endpoints without creating near-duplicate twins.
+        # When a novelty start lies too close to the required tail window, replace
+        # the previous start with the exact tail start instead of appending both.
+        if st == 0:
+            if not merged:
+                merged.append(0)
+            continue
+        if st == tail:
+            if merged and abs(st - merged[-1]) < min_start_sep:
+                # V46.31: protect the unique opener for very short sequences.
+                # If T is only slightly larger than win, tail can be only a few
+                # frames after 0. Replacing [0] with [tail] permanently drops
+                # opening frames. Keep the opener and add the tail only in this
+                # unique two-endpoint case; otherwise replace the near-duplicate.
+                if len(merged) == 1 and merged[-1] == 0 and st != 0:
+                    merged.append(st)
+                elif not (len(merged) == 1 and merged[-1] == 0):
+                    merged[-1] = st
+            elif not merged or merged[-1] != st:
+                merged.append(st)
+            continue
+        if not merged or abs(st - merged[-1]) >= min_start_sep:
+            merged.append(st)
+    if merged:
+        if abs(tail - merged[-1]) < min_start_sep:
+            if len(merged) == 1 and merged[-1] == 0 and tail != 0:
+                merged.append(tail)
+            elif not (len(merged) == 1 and merged[-1] == 0):
+                merged[-1] = tail
+        elif merged[-1] != tail:
+            merged.append(tail)
+    else:
+        merged = [0, tail] if tail > 0 else [0]
+    return sorted(set(int(x) for x in merged))
+
+
+def refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof: Dict[str, object]) -> Dict[str, object]:
+    # V46.31 window-level semantics for Chang-E event slicing.
+    # Chang-E is a long, category-complete MoCap corpus; each local window is
+    # converted into a curated semantic event comparable to the old 72BVH units.
+    out = dict(prof)
+    key = _safe_profile_key(meta)
+    nums = _parse_numeric_semantic(out)
+    if desc is not None and len(desc) >= 20:
+        nums["duration"] = float(desc[0])
+        nums["travel"] = max(float(nums.get("travel", 0.0)), float(np.clip(desc[1] / 1.15, 0.0, 1.0)))
+        nums["energy"] = max(float(nums.get("energy", 0.0)), float(np.clip(desc[5] / 0.135, 0.0, 1.0)))
+        nums["lower"] = max(float(nums.get("lower", 0.0)), float(np.clip(desc[7] / 0.10, 0.0, 1.0)))
+        nums["upper"] = max(float(nums.get("upper", 0.0)), float(np.clip(desc[8] / 0.10, 0.0, 1.0)))
+        nums["turn"] = max(float(nums.get("turn", 0.0)), float(np.clip(abs(desc[17]) / 0.20, 0.0, 1.0)))
+        nums["root_y_range"] = float(desc[18])
+        nums["contact_ratio"] = float(desc[10])
+        local_hold = float(np.clip(1.0 - desc[5] / 0.115, 0.0, 1.0)) * float(np.clip(0.55 + desc[10], 0.0, 1.0))
+        nums["pose_hold"] = max(float(nums.get("pose_hold", 0.0)), local_hold)
+        nums["jump"] = max(float(nums.get("jump", 0.0)), float(np.clip((desc[18] - 0.035) / 0.16, 0.0, 1.0)))
+        nums["spin"] = max(float(nums.get("spin", 0.0)), float(np.clip(abs(desc[17]) / 0.22, 0.0, 1.0)))
+    frac_mid = _float_meta(meta, "event_position_mid", _float_meta(meta, "event_position_fraction", 0.5))
+    duration = float(nums.get("duration", _float_meta(meta, "duration", 0.0)))
+    energy = float(nums.get("energy", 0.0)); onset = float(nums.get("onset", 0.0))
+    travel = float(nums.get("travel", 0.0)); turn = float(nums.get("turn", 0.0))
+    lower = float(nums.get("lower", 0.0)); upper = float(nums.get("upper", 0.0))
+    pose_hold = float(nums.get("pose_hold", 0.0)); jump = float(nums.get("jump", 0.0)); spin = float(nums.get("spin", 0.0))
+    contact_ratio = float(nums.get("contact_ratio", 0.5))
+    if pose_hold > 0.72 and energy < 0.60:
+        family = "pose_motif"
+    elif turn > 0.68 or spin > 0.68:
+        family = "turning_flow"
+    elif onset > 0.72 or (energy > 0.78 and key == "lei_gong_drum"):
+        family = "percussive_accent"
+    elif key == "pipa_behind_back" and upper >= lower * 1.12:
+        family = "instrument_motif"
+    elif travel > 0.50 or lower > upper * 1.18:
+        family = "footwork_flow"
+    elif key == "flying_apsaras" or jump > 0.45:
+        family = "aerial_curve"
+    elif energy < 0.34:
+        family = "calm_flow"
+    else:
+        family = str(out.get("event_family", "footwork_flow"))
+    out["event_family"] = family
+    if frac_mid < 0.12:
+        stage = "intro"
+    elif frac_mid > 0.88:
+        stage = "resolution"
+    elif family in {"percussive_accent", "turning_flow"} and energy > 0.55:
+        stage = "climax"
+    elif family == "instrument_motif":
+        stage = "motif_recall"
+    elif pose_hold > 0.70:
+        stage = "anchor_or_resolution"
+    elif energy > 0.58 or travel > 0.55:
+        stage = "build_up"
+    else:
+        stage = "development"
+    out["motion_stage_role"] = stage
+    if contact_ratio < 0.18 or jump > 0.45:
+        out["support_label"] = "low_contact_flight_like"
+    elif pose_hold > 0.72:
+        out["support_label"] = "stable_support"
+    elif turn > 0.55:
+        out["support_label"] = "alternating_or_pivot_support"
+    elif travel > 0.45 or lower > 0.60:
+        out["support_label"] = "alternating_foot_support"
+    else:
+        out.setdefault("support_label", "stable_support")
+    if turn > 0.60:
+        out["locomotion_label"] = "turning_travel"; out["spatial_label"] = "turning"
+    elif travel > 0.50:
+        out["locomotion_label"] = "traveling_steps"; out["spatial_label"] = "traveling"
+    elif pose_hold > 0.70:
+        out["locomotion_label"] = "in_place_pose"; out["spatial_label"] = "in_place"
+    elif energy < 0.34:
+        out["locomotion_label"] = "slow_weight_shift"; out["spatial_label"] = "in_place"
+    family_to_align = {"calm_flow": "calm_meditative", "pose_motif": "pose_hold", "footwork_flow": "footwork_flow", "turning_flow": "turning_climax", "instrument_motif": "instrument_phrase", "percussive_accent": "percussive_accent", "aerial_curve": "lyrical_flow"}
+    out["music_alignment_label"] = family_to_align.get(family, str(out.get("music_alignment_label", "lyrical_flow")))
+    tags = [out["music_alignment_label"], family, stage, str(out.get("support_label", "")), str(out.get("locomotion_label", ""))]
+    tags += [str(x) for x in out.get("music_alignment_tags", [])]
+    out["music_alignment_tags"] = list(dict.fromkeys([x for x in tags if x]))
+    out["event_position_mid"] = float(frac_mid)
+    natural_range = out.get("natural_duration_range_sec", CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"]).get("natural_duration_range_sec", [1.5, 4.0]))
+    q = chang_e_event_quality_from_numbers(nums, family, duration, natural_range)
+    out["event_quality_score"] = float(q)
+    out["semantic_confidence"] = float(np.clip(0.25 + 0.50 * q + 0.25 * max(energy, pose_hold, turn, travel, upper, lower), 0.10, 1.0))
+    keys = ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]
+    out["semantic_numeric"] = ";".join(str(float(nums.get(k, 0.0))) for k in keys)
+    out["classification_text"] = (
+        f"action={key}; motif={out.get('cultural_motif')}; family={out.get('event_family')}; "
+        f"stage={out.get('motion_stage_role')}; support={out.get('support_label')}; "
+        f"locomotion={out.get('locomotion_label')}; music_align={out.get('music_alignment_label')}; "
+        f"event_mid={float(frac_mid):.3f}; quality={q:.3f}; semantic_conf={out['semantic_confidence']:.3f}; numeric={out['semantic_numeric']}"
+    )
+    return out
+
+
+def class_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = None) -> np.ndarray:
+    key = _safe_profile_key(meta)
+    base = filename_semantic_vector_from_meta(meta, cfg).copy()
+    cls = strong_action_semantics_from_meta(meta)
+    nums = _parse_numeric_semantic(cls)
+    for k in ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]:
+        nums.setdefault(k, float(CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"]).get(k, 0.0)))
+    known = [k for k in CHANG_E_CATEGORY_PROFILES.keys() if k != "unknown"]
+    ci = known.index(key) if key in known else -1
+    align_i = _label_index(str(cls.get("music_alignment_label")), MUSIC_ALIGNMENT_LABELS)
+    family_i = _label_index(str(cls.get("event_family")), EVENT_FAMILY_LABELS)
+    stage_i = _label_index(str(cls.get("motion_stage_role")), STAGE_ROLE_LABELS)
+    v = base.astype(np.float32)
+    for i,k in enumerate(["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]):
+        v[8+i] = nums[k]
+    v[20] = 0.0 if ci < 0 else ci / max(1, len(known) - 1)
+    v[21] = 0.0 if align_i < 0 else align_i / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
+    v[22] = 0.0 if family_i < 0 else family_i / max(1, len(EVENT_FAMILY_LABELS) - 1)
+    v[23] = 0.0 if stage_i < 0 else stage_i / max(1, len(STAGE_ROLE_LABELS) - 1)
+    tags = set(str(x) for x in cls.get("music_alignment_tags", []))
+    v[28] = 1.0 if ("calm_meditative" in tags or cls.get("event_family") == "calm_flow") else 0.0
+    v[29] = 1.0 if ("percussive_accent" in tags or nums["onset"] > 0.65) else 0.0
+    v[30] = 1.0 if ("turning_climax" in tags or nums["spin"] > 0.65 or nums["turn"] > 0.65) else 0.0
+    v[31] = 1.0
+    return np.clip(v, 0.0, 1.0).astype(np.float32)
+
+
 def audio_slot_classification_from_pseudo(pseudo: np.ndarray, duration: float, energy: float, onset: float, dyn: float) -> Dict[str, object]:
     """Infer slot-level music labels for unpaired alignment and schedule reports."""
     if energy < 0.035 and onset < 0.015:
@@ -1984,7 +2499,7 @@ def load_external_music_semantic_slots(audio_path: str | Path, cfg: V46Config, s
     return None
 
 def semantic_label_match_bonus(slot: dict, db: dict, cfg: V46Config) -> np.ndarray:
-    """Compute interpretable class-prior bonus for slot-to-event retrieval."""
+    """V46.31 interpretable music-router bonus for Chang-E semantic Event-RAG."""
     n = len(db.get("paths", []))
     bonus = np.zeros(n, dtype=np.float32)
     if not bool(getattr(cfg, "classification_semantic_enable", True)) or n == 0:
@@ -1994,26 +2509,52 @@ def semantic_label_match_bonus(slot: dict, db: dict, cfg: V46Config) -> np.ndarr
     energy = np.asarray(db.get("energy_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
     rhythm = np.asarray(db.get("rhythm_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
     align = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    preferred = [str(x) for x in slot.get("preferred_dance_keys", [])]
+    families = np.asarray(db.get("event_families", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    stages = np.asarray(db.get("motion_stage_roles", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    motifs = np.asarray(db.get("cultural_motifs", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    locomotion = np.asarray(db.get("locomotion_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    support = np.asarray(db.get("support_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
+    quality = np.asarray(db.get("event_quality_scores", np.ones(n, dtype=np.float32)), dtype=np.float32)
+    preferred = [canonicalize_chang_e_key(x) for x in slot.get("preferred_dance_keys", [])]
     preferred_roles = [str(x) for x in slot.get("preferred_semantic_roles", [])]
-    slot_align = str(slot.get("music_alignment_label", ""))
-    slot_energy = str(slot.get("energy_label", ""))
-    slot_rhythm = str(slot.get("rhythm_label", ""))
+    slot_align = str(slot.get("music_alignment_label", slot.get("music_semantic_top_label", "")))
+    slot_energy = str(slot.get("energy_label", "")); slot_rhythm = str(slot.get("rhythm_label", "")); slot_role = str(slot.get("role", "normal"))
+    route_family_map = {"calm_meditative": ["calm_flow", "pose_motif", "aerial_curve"], "pose_hold": ["pose_motif", "calm_flow", "instrument_motif"], "lyrical_flow": ["aerial_curve", "footwork_flow", "instrument_motif", "calm_flow"], "footwork_flow": ["footwork_flow", "turning_flow", "aerial_curve"], "instrument_phrase": ["instrument_motif", "aerial_curve", "pose_motif"], "percussive_accent": ["percussive_accent", "turning_flow", "instrument_motif"], "turning_climax": ["turning_flow", "aerial_curve", "percussive_accent"], "aerial_curve": ["aerial_curve", "turning_flow", "footwork_flow"]}
+    route_stage_map = {"intro": ["intro", "intro_or_resolution", "anchor_or_resolution"], "calm": ["intro", "intro_or_resolution", "resolution", "anchor_or_resolution"], "normal": ["development", "build_up", "motif_recall"], "development": ["development", "build_up"], "build_up": ["build_up", "development", "opening_or_climax"], "motif": ["motif_recall", "development"], "motif_recall": ["motif_recall", "anchor_or_resolution"], "accent": ["accent_or_climax", "climax", "build_up"], "climax": ["climax", "accent_or_climax", "opening_or_climax"], "release": ["resolution", "anchor_or_resolution", "intro_or_resolution"], "resolution": ["resolution", "anchor_or_resolution", "intro_or_resolution"]}
+    route_support_map = {"calm_meditative": ["stable_support", "static_or_low_motion_support"], "pose_hold": ["stable_support", "static_or_low_motion_support"], "footwork_flow": ["alternating_foot_support", "alternating_or_pivot_support"], "turning_climax": ["alternating_or_pivot_support", "low_contact_flight_like"], "percussive_accent": ["strong_foot_contact", "alternating_foot_support"], "lyrical_flow": ["alternating_foot_support", "low_contact_flight_like", "stable_support"], "instrument_phrase": ["stable_support", "alternating_foot_support"]}
+    route_loco_map = {"calm_meditative": ["slow_weight_shift", "in_place_pose", "floating_leaning"], "pose_hold": ["in_place_pose", "slow_weight_shift"], "footwork_flow": ["traveling_steps", "turning_travel"], "turning_climax": ["turning_travel", "floating_leaning"], "percussive_accent": ["accented_travel", "turning_travel", "traveling_steps"], "lyrical_flow": ["floating_leaning", "traveling_steps", "upper_body_phrase"], "instrument_phrase": ["upper_body_phrase", "in_place_pose"]}
     for k in preferred:
-        bonus += (dance_keys == k).astype(np.float32) * 1.00
+        if k:
+            bonus += (dance_keys == k).astype(np.float32) * float(getattr(cfg, "preferred_dance_key_bonus", 0.28))
     for r in preferred_roles:
         if r:
-            bonus += (roles == r).astype(np.float32) * 0.45
+            bonus += (roles == r).astype(np.float32) * 0.25
     if slot_align:
-        bonus += (align == slot_align).astype(np.float32) * 0.70
+        bonus += (align == slot_align).astype(np.float32) * 0.45
+        for rank, fam in enumerate(route_family_map.get(slot_align, [])):
+            bonus += (families == fam).astype(np.float32) * float(getattr(cfg, "event_family_bonus", 0.58)) / float(rank + 1)
+        for rank, sup in enumerate(route_support_map.get(slot_align, [])):
+            bonus += (support == sup).astype(np.float32) * float(getattr(cfg, "route_support_bonus", 0.12)) / float(rank + 1)
+        for rank, loc in enumerate(route_loco_map.get(slot_align, [])):
+            bonus += (locomotion == loc).astype(np.float32) * float(getattr(cfg, "route_locomotion_bonus", 0.14)) / float(rank + 1)
+    if slot_role:
+        for rank, st in enumerate(route_stage_map.get(slot_role, [])):
+            bonus += (stages == st).astype(np.float32) * float(getattr(cfg, "motion_stage_role_bonus", 0.36)) / float(rank + 1)
     if slot_energy:
-        bonus += (energy == slot_energy).astype(np.float32) * 0.25
+        bonus += (energy == slot_energy).astype(np.float32) * 0.14
     if slot_rhythm:
-        bonus += (rhythm == slot_rhythm).astype(np.float32) * 0.20
-    # Normalize so the configured weight is comparable across slots.
-    if bonus.max() > 1e-6:
-        bonus = bonus / float(bonus.max())
-    return bonus.astype(np.float32)
+        bonus += (rhythm == slot_rhythm).astype(np.float32) * 0.12
+    if slot_align == "instrument_phrase":
+        bonus += np.isin(motifs, ["pipa_instrument_pose", "thunder_drum"]).astype(np.float32) * 0.16
+    conf = np.asarray(db.get("semantic_confidence", np.ones(n, dtype=np.float32)), dtype=np.float32)
+    q_gate = np.clip(0.45 + 0.55 * quality, 0.25, 1.15)
+    bonus *= np.clip(0.65 + 0.35 * conf, 0.5, 1.15) * q_gate
+    # V46.31: never normalize by the current candidate max.  That dynamic
+    # min-max scaling can turn a weak accidental match in a vague slot into a
+    # full-strength routing reward.  Use a fixed saturating scale instead.
+    scale = max(0.25, float(getattr(cfg, "route_semantic_bonus_scale", 1.50)))
+    bonus = 1.0 - np.exp(-np.maximum(bonus, 0.0) / scale)
+    return np.clip(bonus, 0.0, 1.0).astype(np.float32)
 
 
 def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
@@ -2269,12 +2810,24 @@ def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[n
         return x.astype(np.float32), {"resampled": False, "reason": "too_short"}
 
     ch0 = x[:, 0]
-    ch0_med = float(np.nanmedian(ch0)) if np.isfinite(ch0).any() else 0.0
-    ch0_std = float(np.nanstd(ch0)) if np.isfinite(ch0).any() else 0.0
-    ch0_p05 = float(np.nanpercentile(ch0, 5)) if np.isfinite(ch0).any() else 0.0
-    ch0_p95 = float(np.nanpercentile(ch0, 95)) if np.isfinite(ch0).any() else 0.0
+    finite_ch0 = ch0[np.isfinite(ch0)]
+    if finite_ch0.size:
+        ch0_med = float(np.nanmedian(finite_ch0))
+        ch0_p05 = float(np.nanpercentile(finite_ch0, 5))
+        ch0_p95 = float(np.nanpercentile(finite_ch0, 95))
+        # V46.31: FPS metadata written by the BVH loader is nearly constant, but
+        # a few boundary/cropping frames may contain small jitter.  Use the middle
+        # 90% band for the main constant-column test and keep raw std only for
+        # diagnostics.  This avoids silently skipping required high-FPS -> 30 FPS
+        # resampling because of a few outlier rows.
+        trimmed = finite_ch0[(finite_ch0 >= ch0_p05) & (finite_ch0 <= ch0_p95)]
+        ch0_std = float(np.nanstd(finite_ch0))
+        ch0_trimmed_std = float(np.nanstd(trimmed)) if trimmed.size else ch0_std
+    else:
+        ch0_med = ch0_p05 = ch0_p95 = ch0_std = ch0_trimmed_std = 0.0
     looks_like_fps_metadata = bool(
-        ch0_med > 2.0 and ch0_p05 > 1.0 and ch0_p95 < 400.0 and ch0_std < max(0.5, ch0_med * 0.05)
+        ch0_med > 2.0 and ch0_p05 > 1.0 and ch0_p95 < 400.0
+        and ch0_trimmed_std < max(0.75, ch0_med * 0.08)
     )
     native = ch0_med if looks_like_fps_metadata else float(cfg.fps)
     target = float(cfg.fps)
@@ -2287,6 +2840,7 @@ def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[n
             "target_fps": float(target),
             "frames": int(len(x)),
             "fps_metadata_detected": looks_like_fps_metadata,
+            "channel0_trimmed_std": float(ch0_trimmed_std),
             "note": "channel0_not_overwritten_EDGE_contact_contract",
         }
 
@@ -2299,6 +2853,7 @@ def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[n
         "frames_before": int(len(x)),
         "frames_after": int(new_len),
         "fps_metadata_detected": looks_like_fps_metadata,
+        "channel0_trimmed_std": float(ch0_trimmed_std),
         "note": "channel0_preserved_until_event_contract_guard_rebuilds_contacts",
     }
 
@@ -2510,8 +3065,11 @@ def build_db(args: argparse.Namespace) -> int:
                 starts = [0]
                 win = min(T, cfg.max_event_frames)
             else:
-                starts = [0] if T <= cfg.max_event_frames else list(range(0, max(1, T - cfg.min_event_frames + 1), cfg.hop_len))
-                win = cfg.window_len
+                win = min(int(cfg.window_len), T)
+                if bool(getattr(cfg, "chang_e_boundary_event_split", True)):
+                    starts = chang_e_semantic_event_starts(seq, cfg)
+                else:
+                    starts = [0] if T <= cfg.max_event_frames else list(range(0, max(1, T - cfg.min_event_frames + 1), cfg.hop_len))
             for st in starts:
                 endf = min(T, st + win)
                 if endf - st < cfg.min_event_frames:
@@ -2521,7 +3079,17 @@ def build_db(args: argparse.Namespace) -> int:
                     clip = clip[: cfg.max_event_frames]
                 path = npy_dir / f"event_{event_idx:07d}.npy"
                 base_meta = dict(rec)
-                base_meta.update({"seq_id": seq_id, "resample_report": res_report, "input_mode": input_report.get("input_mode")})
+                event_mid = (float(st) + 0.5 * float(endf - st)) / max(float(T), 1.0)
+                base_meta.update({
+                    "seq_id": seq_id,
+                    "resample_report": res_report,
+                    "input_mode": input_report.get("input_mode"),
+                    "event_start": int(st),
+                    "event_end": int(endf),
+                    "event_source_frames": int(T),
+                    "event_position_mid": float(event_mid),
+                    "event_position_fraction": float(event_mid),
+                })
                 add_event_to_db_lists(
                     clip=clip,
                     event_idx=event_idx,
@@ -2578,6 +3146,17 @@ def build_db(args: argparse.Namespace) -> int:
         spatial_labels=np.array([m.get("spatial_label", "unknown") for m in meta], dtype=object),
         music_alignment_labels=np.array([m.get("music_alignment_label", "unknown") for m in meta], dtype=object),
         classification_texts=np.array([m.get("classification_text", "") for m in meta], dtype=object),
+        event_families=np.array([m.get("event_family", "unknown") for m in meta], dtype=object),
+        motion_stage_roles=np.array([m.get("motion_stage_role", "unknown") for m in meta], dtype=object),
+        cultural_motifs=np.array([m.get("cultural_motif", "unknown") for m in meta], dtype=object),
+        prop_proxy_labels=np.array([m.get("prop_proxy_label", "unknown") for m in meta], dtype=object),
+        locomotion_labels=np.array([m.get("locomotion_label", "unknown") for m in meta], dtype=object),
+        support_labels=np.array([m.get("support_label", "unknown") for m in meta], dtype=object),
+        event_position_mid=np.array([float(m.get("event_position_mid", 0.5)) for m in meta], dtype=np.float32),
+        semantic_confidence=np.array([float(m.get("semantic_confidence", 0.5)) for m in meta], dtype=np.float32),
+        event_quality_scores=np.array([float(m.get("event_quality_score", 0.5)) for m in meta], dtype=np.float32),
+        natural_duration_min=np.array([float((m.get("natural_duration_range_sec", [1.5, 4.0]) or [1.5, 4.0])[0]) for m in meta], dtype=np.float32),
+        natural_duration_max=np.array([float((m.get("natural_duration_range_sec", [1.5, 4.0]) or [1.5, 4.0])[-1]) for m in meta], dtype=np.float32),
         take_ids=np.array([int(m.get("take_id", -1) if m.get("take_id", -1) is not None else -1) for m in meta], dtype=np.int32),
         name_semantic=name_semantic.astype(np.float32),
         class_semantic=class_semantic.astype(np.float32),
@@ -3355,6 +3934,7 @@ def transition_cost(exit_state: np.ndarray, entry_state: np.ndarray, cexit: np.n
 
 
 def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V46Config, contrastive=None) -> Tuple[List[int], List[dict]]:
+    """V46.31 retrieval: contrastive similarity + curated Chang-E semantic event router."""
     desc = np.asarray(db["desc"], dtype=np.float32)
     desc_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "classification_retrieval_weight", getattr(cfg, "filename_semantic_retrieval_weight", 0.20))))
     mean = np.asarray(db["desc_mean"], dtype=np.float32)
@@ -3370,69 +3950,82 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
     music_emb, motion_emb = embed_with_contrastive(contrastive, music_z, desc_z, cfg)
     sources = np.asarray(db["source_groups"], dtype=object)
     durations = np.asarray(db["durations"], dtype=np.float32)
-    entries = np.asarray(db["entry"], dtype=np.float32)
-    exits = np.asarray(db["exit"], dtype=np.float32)
-    centry = np.asarray(db["contact_entry"], dtype=np.float32)
-    cexit = np.asarray(db["contact_exit"], dtype=np.float32)
-
+    entries = np.asarray(db["entry"], dtype=np.float32); exits = np.asarray(db["exit"], dtype=np.float32)
+    centry = np.asarray(db["contact_entry"], dtype=np.float32); cexit = np.asarray(db["contact_exit"], dtype=np.float32)
+    dance_keys = np.asarray(db.get("dance_keys", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    labels_arr = np.asarray(db.get("labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    align_arr = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    families = np.asarray(db.get("event_families", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    stages = np.asarray(db.get("motion_stage_roles", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    locomotion = np.asarray(db.get("locomotion_labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    support = np.asarray(db.get("support_labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
+    sem_conf = np.asarray(db.get("semantic_confidence", np.ones(len(desc), dtype=np.float32)), dtype=np.float32)
+    event_quality = np.asarray(db.get("event_quality_scores", np.ones(len(desc), dtype=np.float32)), dtype=np.float32)
+    nat_min = np.asarray(db.get("natural_duration_min", np.ones(len(desc), dtype=np.float32) * 1.5), dtype=np.float32)
+    nat_max = np.asarray(db.get("natural_duration_max", np.ones(len(desc), dtype=np.float32) * 4.0), dtype=np.float32)
     beams: List[Tuple[float, List[int], Dict[str, int]]] = [(0.0, [], {})]
     reports: List[dict] = []
     for i, slot in enumerate(slots):
         sim = music_emb[i] @ motion_emb.T
-        dur_cost = np.abs(np.log(np.maximum(durations, 1e-4) / max(float(slot["duration"]), 1e-4)))
+        slot_dur = max(float(slot.get("duration", durations.mean() if len(durations) else 1.0)), 1e-4)
+        dur_cost = np.abs(np.log(np.maximum(durations, 1e-4) / slot_dur))
         class_bonus = semantic_label_match_bonus(slot, db, cfg)
-        base_score = sim - cfg.retrieval_warp_penalty * dur_cost + float(getattr(cfg, "classification_retrieval_bonus", 0.28)) * class_bonus
-        cand = np.argsort(-base_score)[: max(cfg.top_k, cfg.beam_size)].tolist()
+        in_range = ((slot_dur >= nat_min) & (slot_dur <= nat_max)).astype(np.float32)
+        center = np.maximum((nat_min + nat_max) * 0.5, 1e-4)
+        natural_score = in_range + (1.0 - in_range) * np.exp(-np.abs(np.log(slot_dur / center))).astype(np.float32)
+        quality_term = np.clip(event_quality, 0.0, 1.0)
+        low_quality_penalty = np.maximum(0.0, float(getattr(cfg, "chang_e_min_event_quality", 0.22)) - quality_term)
+        base_score = (sim - cfg.retrieval_warp_penalty * dur_cost + float(getattr(cfg, "semantic_routing_weight", 0.72)) * class_bonus + float(getattr(cfg, "route_natural_duration_weight", 0.20)) * natural_score + float(getattr(cfg, "event_quality_weight", 0.22)) * quality_term + 0.04 * np.clip(sem_conf, 0.0, 1.0) - 0.75 * low_quality_penalty)
+        cand = np.argsort(-base_score)[: max(cfg.top_k, cfg.beam_size, int(getattr(cfg, "route_debug_topk", 10)))].tolist()
         new_beams: List[Tuple[float, List[int], Dict[str, int]]] = []
-        for score, path, src_counts in beams:
+        for score, path, usage in beams:
             prev = path[-1] if path else None
             for idx in cand:
                 sc = float(base_score[idx])
-                src = str(sources[idx])
-                sc -= cfg.retrieval_source_penalty * src_counts.get(src, 0)
+                src = str(sources[idx]); dk = str(dance_keys[idx]); fam = str(families[idx]); stg = str(stages[idx])
+                sc -= float(getattr(cfg, "route_source_repeat_penalty", cfg.retrieval_source_penalty)) * usage.get("src::" + src, 0)
+                sc -= float(getattr(cfg, "route_dance_key_repeat_penalty", 0.16)) * usage.get("dance::" + dk, 0)
+                # V46.31: family diversity is local-window based and capped.
+                # For 3-5 minute dances, global family counts inevitably grow;
+                # an unbounded penalty can overpower the music semantic match and
+                # force wrong rare families in the later song.
+                fam_recent_window = max(1, int(getattr(cfg, "route_family_recent_window", 8)))
+                fam_recent_count = sum(1 for p_idx in path[-fam_recent_window:] if str(families[p_idx]) == fam)
+                fam_pen = float(getattr(cfg, "route_family_balance_penalty", 0.18)) * max(0, fam_recent_count - 1)
+                fam_pen = min(float(getattr(cfg, "route_family_penalty_cap", 0.25)), fam_pen)
+                sc -= fam_pen
+                # V46.31: source-run hard penalty is consecutive-run only.
+                # Global source usage above remains a soft diversity prior; do not
+                # blacklist high-quality sources for the entire later song merely
+                # because they were selected twice earlier.
+                run_count = 0
+                for p_idx in reversed(path):
+                    if str(sources[p_idx]) == src:
+                        run_count += 1
+                    else:
+                        break
+                if run_count >= 2:
+                    sc -= float(getattr(cfg, "route_source_run_hard_penalty", 0.30))
+                if str(slot.get("role", "")) in {"motif", "motif_recall"} and usage.get("fam::" + fam, 0) > 0:
+                    sc += float(getattr(cfg, "route_motif_recall_bonus", 0.12))
+                if i == 0 and stg in {"intro", "intro_or_resolution"}:
+                    sc += float(getattr(cfg, "route_stage_sequence_weight", 0.16))
+                elif i >= len(slots) - 2 and stg in {"resolution", "anchor_or_resolution", "intro_or_resolution"}:
+                    sc += float(getattr(cfg, "route_stage_sequence_weight", 0.16))
+                elif str(slot.get("role", "")) in {"build_up", "climax", "accent"} and stg in {"build_up", "climax", "accent_or_climax"}:
+                    sc += float(getattr(cfg, "route_stage_sequence_weight", 0.16)) * 0.8
                 if prev is not None:
                     sc -= cfg.retrieval_transition_penalty * transition_cost(exits[prev], entries[idx], cexit[prev], centry[idx])
                     if src == str(sources[prev]):
                         sc -= cfg.retrieval_repeat_penalty
-                ns = dict(src_counts)
-                ns[src] = ns.get(src, 0) + 1
+                    if fam == str(families[prev]):
+                        sc -= float(getattr(cfg, "route_family_repeat_penalty", 0.12))
+                ns = dict(usage)
+                ns["src::" + src] = ns.get("src::" + src, 0) + 1; ns["dance::" + dk] = ns.get("dance::" + dk, 0) + 1; ns["fam::" + fam] = ns.get("fam::" + fam, 0) + 1
                 new_beams.append((score + sc, path + [int(idx)], ns))
-        new_beams.sort(key=lambda x: x[0], reverse=True)
-        beams = new_beams[: cfg.beam_size]
+        new_beams.sort(key=lambda x: x[0], reverse=True); beams = new_beams[: cfg.beam_size]
         preview_n = max(1, min(int(getattr(cfg, "classification_report_topk", 8)), len(cand)))
-        dance_keys = np.asarray(db.get("dance_keys", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
-        labels_arr = np.asarray(db.get("labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
-        align_arr = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
-        sources_arr = np.asarray(db.get("source_groups", np.array(["unknown"] * len(desc), dtype=object)), dtype=object)
-        reports.append({
-            "slot": i,
-            "start": slot.get("start"),
-            "end": slot.get("end"),
-            "duration": slot.get("duration"),
-            "slot_role": slot.get("role"),
-            "slot_music_alignment_label": slot.get("music_alignment_label"),
-            "slot_music_semantic_top_label": slot.get("music_semantic_top_label", slot.get("music_alignment_label")),
-            "slot_music_semantic_probs": slot.get("music_semantic_probs", {}),
-            "slot_external_music_semantic_source": slot.get("external_music_semantic_source", ""),
-            "slot_preferred_dance_keys": slot.get("preferred_dance_keys", []),
-            "top_candidate": int(cand[0]),
-            "top_candidate_label": str(labels_arr[cand[0]]),
-            "top_candidate_dance_key": str(dance_keys[cand[0]]),
-            "top_candidate_music_alignment_label": str(align_arr[cand[0]]),
-            "beam_best_score": float(beams[0][0]),
-            "candidate_preview": [
-                {
-                    "event_id": int(j),
-                    "score": float(base_score[int(j)]),
-                    "class_bonus": float(class_bonus[int(j)]),
-                    "source": str(sources_arr[int(j)]),
-                    "label": str(labels_arr[int(j)]),
-                    "dance_key": str(dance_keys[int(j)]),
-                    "music_alignment_label": str(align_arr[int(j)]),
-                }
-                for j in cand[:preview_n]
-            ],
-        })
+        reports.append({"slot": i, "start": slot.get("start"), "end": slot.get("end"), "duration": slot.get("duration"), "slot_role": slot.get("role"), "slot_music_alignment_label": slot.get("music_alignment_label"), "slot_music_semantic_top_label": slot.get("music_semantic_top_label", slot.get("music_alignment_label")), "slot_preferred_dance_keys": slot.get("preferred_dance_keys", []), "top_candidate": int(cand[0]), "top_candidate_label": str(labels_arr[cand[0]]), "top_candidate_dance_key": str(dance_keys[cand[0]]), "top_candidate_event_family": str(families[cand[0]]), "top_candidate_stage_role": str(stages[cand[0]]), "top_candidate_support_label": str(support[cand[0]]), "top_candidate_locomotion_label": str(locomotion[cand[0]]), "top_candidate_event_quality": float(event_quality[cand[0]]), "top_candidate_music_alignment_label": str(align_arr[cand[0]]), "beam_best_score": float(beams[0][0]), "routing_policy": "V46.31 curated semantic Event-RAG: contrastive/descriptor + family/stage/support/locomotion + quality + diversity", "candidate_preview": [{"event_id": int(j), "score": float(base_score[int(j)]), "semantic_route_bonus": float(class_bonus[int(j)]), "natural_duration_score": float(natural_score[int(j)]), "event_quality": float(event_quality[int(j)]), "source": str(sources[int(j)]), "label": str(labels_arr[int(j)]), "dance_key": str(dance_keys[int(j)]), "event_family": str(families[int(j)]), "motion_stage_role": str(stages[int(j)]), "support_label": str(support[int(j)]), "locomotion_label": str(locomotion[int(j)]), "music_alignment_label": str(align_arr[int(j)])} for j in cand[:preview_n]]})
     return beams[0][1], reports
 
 
@@ -3451,38 +4044,86 @@ def align_next_to_prev(prev: np.ndarray, nxt: np.ndarray) -> np.ndarray:
 def concat_events(event_paths: Sequence[str], target_durations: Sequence[float], cfg: V46Config) -> Tuple[np.ndarray, List[dict]]:
     """Concatenate retrieved RAG events under the EDGE-151D contract.
 
-    V46.19 fix:
-    RAG event boundary overlap no longer linearly interpolates Rot6D channels.
-    Root/contact/scalar channels use linear boundary weights, while rotations use
-    the same sign-aligned quaternion fusion used by long-window inference.
+    V46.31 fix:
+    The overlap cross-fade is now compensated locally per segment, not by a
+    whole-song global resample.  Every music slot keeps its assigned net frame
+    budget after overlap trimming, so local beat/phrase boundaries do not drift.
+    We also keep the V46.28/V46.29 yaw-aligned overlap start, no root-Y ramp,
+    ov==1 midpoint weighting, and safe one-frame overlap slicing.
     """
     pieces: List[np.ndarray] = []
     rep: List[dict] = []
+    target_lens = [max(cfg.min_event_frames, int(round(float(d) * cfg.fps))) for d in target_durations]
     for i, (p, dur) in enumerate(zip(event_paths, target_durations)):
         m_raw = np.load(str(p)).astype(np.float32)
         m, pre_report = enforce_edge151_contract_np(
             m_raw, cfg, source_hint=f"concat_load:{p}", derive_contact=True, project_rot=True
         )
-        target_len = max(cfg.min_event_frames, int(round(float(dur) * cfg.fps)))
-        warp = target_len / max(1, m.shape[0])
-        m = resample_motion_np(m, target_len).astype(np.float32)
+        target_len = int(target_lens[i])
+        # V46.31: compensate overlap locally.  Incoming clips lose ov frames
+        # when m = m[ov:] removes the overlapped prefix.  Rather than globally
+        # resampling the entire final song, pre-extend non-first clips by the
+        # maximum plausible overlap and then locally normalize their post-overlap
+        # remainder back to target_len.  This preserves per-slot music timing.
+        overlap_budget = int(max(0, getattr(cfg, "overlap", 0))) if pieces else 0
+        local_resample_len = int(max(cfg.min_event_frames, target_len + overlap_budget))
+        warp = local_resample_len / max(1, m.shape[0])
+        m = resample_motion_np(m, local_resample_len).astype(np.float32)
         m, post_resample_report = enforce_edge151_contract_np(
-            m, cfg, source_hint=f"concat_resample:{p}", derive_contact=True, project_rot=True
+            m, cfg, source_hint=f"concat_resample_local_timing:{p}", derive_contact=True, project_rot=True
         )
         used_overlap = 0
         align_report = None
         blend_report = None
+        local_timing_report = {
+            "expected_net_frames": int(target_len),
+            "local_resample_frames_before_overlap": int(local_resample_len),
+            "overlap_budget_frames": int(overlap_budget),
+            "overlap_trim_frames": 0,
+            "post_overlap_frames_before_local_fix": int(local_resample_len),
+            "local_timing_fix_applied": False,
+            "local_timing_fix_mode": "none",
+        }
         if pieces:
-            m = align_next_to_prev(pieces[-1], m)
-            m, align_report = enforce_edge151_contract_np(
-                m, cfg, source_hint=f"concat_align:{p}", derive_contact=True, project_rot=True
-            )
             ov = min(int(cfg.overlap), len(pieces[-1]) // 3, len(m) // 3)
             used_overlap = int(max(0, ov))
             if ov > 0:
+                # Align incoming m[0] to the previous overlap start in both yaw
+                # and XZ position.  This avoids both speed surge and cross-heading
+                # tearing inside the quaternion overlap window.
+                ref = pieces[-1][-ov].copy()
+                try:
+                    yaw_ref = float(root_yaw_np(pieces[-1][-ov:][:1])[0])
+                    yaw_m = float(root_yaw_np(m[:1])[0])
+                    dyaw = float(np.arctan2(np.sin(yaw_ref - yaw_m), np.cos(yaw_ref - yaw_m)))
+                except Exception:
+                    yaw_ref, yaw_m, dyaw = 0.0, 0.0, 0.0
+                m = rotate_motion_around_y_np(m, dyaw, pivot_xz=m[0, [ROOT_X_IDX, ROOT_Z_IDX]])
+                delta_xz = ref[[ROOT_X_IDX, ROOT_Z_IDX]] - m[0, [ROOT_X_IDX, ROOT_Z_IDX]]
+                m[:, ROOT_X_IDX] += float(delta_xz[0])
+                m[:, ROOT_Z_IDX] += float(delta_xz[1])
+                # Deliberately do not apply any root-Y ramp.  Height/contact
+                # continuity is handled only inside the real overlap blend.
+                m, align_report = enforce_edge151_contract_np(
+                    m, cfg, source_hint=f"concat_overlap_start_yaw_align:{p}", derive_contact=True, project_rot=True
+                )
+                if align_report is None:
+                    align_report = {}
+                align_report.update({
+                    "overlap_alignment_mode": "yaw_and_xz_to_overlap_start_no_root_y_ramp",
+                    "overlap_ref_frame": "previous_event[-overlap]",
+                    "yaw_ref": float(yaw_ref),
+                    "yaw_incoming_before": float(yaw_m),
+                    "dyaw_applied": float(dyaw),
+                    "delta_xz_applied": [float(delta_xz[0]), float(delta_xz[1])],
+                    "root_y_ramp_applied": False,
+                })
                 a = pieces[-1][-ov:].copy()
                 b = m[:ov].copy()
-                w_b = np.linspace(0.0, 1.0, ov, dtype=np.float32)[:, None]
+                if ov == 1:
+                    w_b = np.asarray([[0.5]], dtype=np.float32)
+                else:
+                    w_b = np.linspace(0.0, 1.0, ov, dtype=np.float32)[:, None]
                 blend, blend_report = blend_motion_overlap_np(
                     a, b, w_b, cfg, source_hint=f"concat_overlap_quat:{Path(str(p)).name}"
                 )
@@ -3491,11 +4132,38 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
                     pieces[-1], cfg, source_hint="concat_piece_after_quat_overlap", derive_contact=True, project_rot=True
                 )
                 m = m[ov:]
+                local_timing_report["overlap_trim_frames"] = int(ov)
+                local_timing_report["post_overlap_frames_before_local_fix"] = int(m.shape[0])
+            else:
+                m = align_next_to_prev(pieces[-1], m)
+                m, align_report = enforce_edge151_contract_np(
+                    m, cfg, source_hint=f"concat_align_no_overlap:{p}", derive_contact=True, project_rot=True
+                )
+                local_timing_report["post_overlap_frames_before_local_fix"] = int(m.shape[0])
+
+            # V46.31: after overlap handling, repair only this incoming segment's
+            # net length.  This prevents whole-song interpolation from smearing
+            # contact steps and preserves local music slot boundaries.
+            if int(m.shape[0]) != int(target_len):
+                m = resample_motion_np(m, int(target_len)).astype(np.float32)
+                m, local_fix_report = enforce_edge151_contract_np(
+                    m, cfg, source_hint=f"concat_local_timing_fix:{p}", derive_contact=True, project_rot=True
+                )
+                local_timing_report.update({
+                    "local_timing_fix_applied": True,
+                    "local_timing_fix_mode": "segment_local_resample_after_overlap_trim",
+                    "frames_after_local_timing_fix": int(m.shape[0]),
+                    "contract_after_local_timing_fix": local_fix_report,
+                })
+            else:
+                local_timing_report["frames_after_local_timing_fix"] = int(m.shape[0])
+
         pieces.append(m.astype(np.float32))
         rep.append({
             "path": str(p),
             "target_frames": int(target_len),
             "source_frames": int(m_raw.shape[0]),
+            "local_resample_frames": int(local_resample_len),
             "warp": float(warp),
             "overlap": int(used_overlap),
             "boundary_blend_mode": "quaternion_rotation" if used_overlap > 0 else "none",
@@ -3503,12 +4171,43 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
             "contract_after_resample": post_resample_report,
             "contract_after_align": align_report,
             "contract_overlap_blend": blend_report,
+            "segment_local_timing": local_timing_report,
         })
+
     final = np.concatenate(pieces, axis=0).astype(np.float32)
+    total_target_frames = int(sum(target_lens))
+    timing_report = {
+        "target_total_frames": int(total_target_frames),
+        "frames_before_terminal_guard": int(final.shape[0]),
+        "timing_frame_delta_before_terminal_guard": int(total_target_frames - final.shape[0]),
+        "timing_compensation_applied": False,
+        "timing_compensation_mode": "segment_local_overlap_compensation_no_global_resample",
+        "global_resample_applied": False,
+    }
+    # Terminal guard only.  It should normally be a no-op because each segment is
+    # locally length-corrected.  If a pathological one-frame edge case remains,
+    # trim or hold the last frame instead of globally resampling thousands of
+    # frames, so local beat/contact timing is not redistributed across the song.
+    if total_target_frames > 0 and int(final.shape[0]) != int(total_target_frames):
+        delta = int(total_target_frames - final.shape[0])
+        if delta > 0:
+            pad = np.repeat(final[-1:, :], delta, axis=0).astype(np.float32)
+            final = np.concatenate([final, pad], axis=0).astype(np.float32)
+            mode = "terminal_hold_last_frame_pad_no_global_resample"
+        else:
+            final = final[:total_target_frames].astype(np.float32)
+            mode = "terminal_trim_no_global_resample"
+        timing_report.update({
+            "timing_compensation_applied": True,
+            "timing_compensation_mode": mode,
+            "terminal_delta_frames": int(delta),
+        })
+    timing_report["frames_after_terminal_guard"] = int(final.shape[0])
     final, final_report = enforce_edge151_contract_np(
         final, cfg, source_hint="concat_final", derive_contact=True, project_rot=True
     )
     if rep:
+        rep[-1]["concat_timing_compensation"] = timing_report
         rep[-1]["concat_final_contract"] = final_report
     return final.astype(np.float32), rep
 

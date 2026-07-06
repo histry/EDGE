@@ -19,6 +19,7 @@ export PYTHONPATH="$EDGE_ROOT:${PYTHONPATH:-}"
 # -----------------------------------------------------------------------------
 
 python tools/v46_research_contract_patch.py
+python tools/v46_json_safety_hotfix.py
 
 export V46_DEVICE="${V46_DEVICE:-cuda}"
 export V46_BVH_RESAMPLE_TO_CONFIG_FPS="${V46_BVH_RESAMPLE_TO_CONFIG_FPS:-1}"

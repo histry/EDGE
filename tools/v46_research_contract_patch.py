@@ -997,34 +997,55 @@ def replace_between(text: str, start_pat: str, end_pat: str, replacement: str, l
 def replace_helper_block(text: str) -> str:
     """Replace any existing V46 research-contract helper block robustly.
 
-    V46.31 fix:
-    Older patchers used a hand-written marker list and could miss intermediate
-    versions such as V46.21--V46.23 on cluster nodes.  Use a version-agnostic
-    regex marker instead so the patch is idempotent across all V46.x helpers.
+    V46.31 hotfix:
+    Do not replace through ``def _clean_stem`` when the Chang-E semantic
+    ontology sits between the V46 helper marker and _clean_stem. Otherwise the
+    patcher deletes CHANG_E_CATEGORY_PROFILES in memory and the later semantic
+    replacement cannot find its anchor.
     """
     match = re.search(r"# V46\.\d+ research contract guards for Chang-E/change RAG DB", text)
     if match:
         start = text.rfind("# -----------------------------------------------------------------------------", 0, match.start())
         if start < 0:
             start = match.start()
-        end = text.find("def _clean_stem(path: str | Path) -> str:", match.start())
-        if end < 0:
+
+        anchors = [
+            "CHANG_E_CATEGORY_PROFILES = {",
+            "def audio_slot_classification_from_pseudo",
+            "def _clean_stem(path: str | Path) -> str:",
+        ]
+        candidates = []
+        for anchor in anchors:
+            pos = text.find(anchor, match.start())
+            if pos >= 0:
+                candidates.append(pos)
+
+        if not candidates:
             raise RuntimeError("Cannot locate end of existing V46 helper block after regex marker.")
+
+        end = min(candidates)
         return text[:start] + HELPERS + "\n" + text[end:]
+
     anchor = "    return entry.astype(np.float32), exit_.astype(np.float32), contact[0], contact[-1]\n\n\n"
     if anchor not in text:
         raise RuntimeError("Cannot locate motion_boundary_state insertion anchor.")
     return text.replace(anchor, anchor + HELPERS, 1)
 
-
 def replace_chang_e_semantics(text: str) -> str:
-    """Replace V46.11 filename-only Chang-E semantics with V46.31 enriched ontology."""
+    """Replace V46 filename-only Chang-E semantics with V46.31 enriched ontology."""
     start = text.find("CHANG_E_CATEGORY_PROFILES = {")
-    end = text.find("def audio_slot_classification_from_pseudo", start)
-    if start < 0 or end < 0:
-        raise RuntimeError("Cannot locate Chang-E semantic block for V46.31 replacement.")
-    return text[:start] + NEW_CHANG_E_SEMANTICS + text[end:]
+    end = text.find("def audio_slot_classification_from_pseudo", start if start >= 0 else 0)
 
+    if start >= 0 and end >= 0:
+        return text[:start] + NEW_CHANG_E_SEMANTICS + text[end:]
+
+    # Fallback for partially patched files: if the ontology block is missing but
+    # the downstream audio-slot semantic function is still present, insert the
+    # full V46.31 ontology immediately before it.
+    if start < 0 and end >= 0:
+        return text[:end] + NEW_CHANG_E_SEMANTICS + text[end:]
+
+    raise RuntimeError("Cannot locate Chang-E semantic block for V46.31 replacement.")
 
 def ensure_v46_24_config_fields(text: str) -> str:
     anchor = '    classification_report_topk: int = 8\n'
