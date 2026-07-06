@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Strict audit for V46 Event-RAG databases (V46.21 rot6d convention aware).
+"""Strict audit for V46 Event-RAG databases (V46.31 semantic-event aware).
 
 Independent from tools/v46_motionrag_diff.py so it can be run before and after
 patching.  It checks saved events against the EDGE-151D contract:
@@ -62,27 +62,31 @@ def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
     return np.stack([b1, b2, b3], axis=-1).astype(np.float32)
 
 
-def raw_rot6d_error(rot6d: np.ndarray) -> tuple[float, float, float, float, float]:
+def raw_rot6d_error(rot6d: np.ndarray) -> tuple[float, float, float, float, float, float]:
     """Check whether raw saved 6D rotations already look projected."""
     try:
         rot = rot6d.reshape(-1, NUM_JOINTS, 6)
         a1 = rot[..., 0:3]
         a2 = rot[..., 3:6]
         finite = np.isfinite(rot).all(axis=-1)
-        n1 = np.linalg.norm(np.nan_to_num(a1, nan=0.0, posinf=0.0, neginf=0.0), axis=-1)
-        n2 = np.linalg.norm(np.nan_to_num(a2, nan=0.0, posinf=0.0, neginf=0.0), axis=-1)
-        dot = np.sum(np.nan_to_num(a1, nan=0.0) * np.nan_to_num(a2, nan=0.0), axis=-1)
+        a1c = np.nan_to_num(a1, nan=0.0, posinf=0.0, neginf=0.0)
+        a2c = np.nan_to_num(a2, nan=0.0, posinf=0.0, neginf=0.0)
+        n1 = np.linalg.norm(a1c, axis=-1)
+        n2 = np.linalg.norm(a2c, axis=-1)
+        dot = np.sum(a1c * a2c, axis=-1)
+        cross_norm = np.linalg.norm(np.cross(a1c, a2c), axis=-1) / np.maximum(n1 * n2, 1e-8)
         bad_finite_ratio = float(1.0 - np.mean(finite)) if finite.size else 1.0
-        degenerate_ratio = float(np.mean((n1 < 1e-5) | (n2 < 1e-5))) if n1.size else 1.0
+        degenerate_ratio = float(np.mean((n1 < 1e-5) | (n2 < 1e-5) | (cross_norm < 1e-5))) if n1.size else 1.0
         return (
             pct(np.abs(n1 - 1.0), 95, 999.0),
             pct(np.abs(n2 - 1.0), 95, 999.0),
             pct(np.abs(dot), 95, 999.0),
             bad_finite_ratio,
             degenerate_ratio,
+            pct(cross_norm, 5, 0.0),
         )
     except Exception:
-        return 999.0, 999.0, 999.0, 1.0, 1.0
+        return 999.0, 999.0, 999.0, 1.0, 1.0, 0.0
 
 
 def rot6d_orthogonality_error(rot6d: np.ndarray) -> tuple[float, float]:
@@ -127,7 +131,7 @@ def audit_event(path: str) -> dict:
     root_abs_p99 = pct(np.abs(root), 99)
     rot_abs_p95 = pct(np.abs(rot), 95)
     rot_abs_p50 = pct(np.abs(rot), 50)
-    raw_n1_err, raw_n2_err, raw_dot_err, raw_bad_finite_ratio, raw_degenerate_ratio = raw_rot6d_error(rot)
+    raw_n1_err, raw_n2_err, raw_dot_err, raw_bad_finite_ratio, raw_degenerate_ratio, raw_cross_norm_p05 = raw_rot6d_error(rot)
     orth_p95, det_err_p95 = rot6d_orthogonality_error(rot)
 
     if not out["finite"]:
@@ -171,6 +175,7 @@ def audit_event(path: str) -> dict:
         "raw_rot6d_dot_abs_p95": raw_dot_err,
         "raw_rot6d_bad_finite_ratio": raw_bad_finite_ratio,
         "raw_rot6d_degenerate_ratio": raw_degenerate_ratio,
+        "raw_rot6d_cross_norm_p05": raw_cross_norm_p05,
         "rot6d_orth_err_p95": orth_p95,
         "rot6d_det_err_p95": det_err_p95,
         "bad": bool(reasons),
@@ -206,11 +211,18 @@ def main() -> None:
         "raw_rot6d_n2_err_global_p95": pct([r.get("raw_rot6d_n2_err_p95", 0.0) for r in rows], 95),
         "raw_rot6d_dot_abs_global_p95": pct([r.get("raw_rot6d_dot_abs_p95", 0.0) for r in rows], 95),
         "raw_rot6d_degenerate_ratio_global_p95": pct([r.get("raw_rot6d_degenerate_ratio", 0.0) for r in rows], 95),
+        "raw_rot6d_cross_norm_global_p05": pct([r.get("raw_rot6d_cross_norm_p05", 1.0) for r in rows], 5),
         "rot6d_orth_err_global_p95": pct([r.get("rot6d_orth_err_p95", 0.0) for r in rows], 95),
         "rot6d_det_err_global_p95": pct([r.get("rot6d_det_err_p95", 0.0) for r in rows], 95),
         "bad_preview": bad[:args.max_preview],
     }
-    for key in ["source_groups", "dance_keys", "music_alignment_labels", "labels"]:
+    if "event_quality_scores" in db.files:
+        q = np.asarray(db["event_quality_scores"], dtype=np.float32).reshape(-1)
+        summary["event_quality_p05"] = pct(q, 5)
+        summary["event_quality_p50"] = pct(q, 50)
+        summary["event_quality_p95"] = pct(q, 95)
+        summary["event_quality_lt_0_22_ratio"] = float(np.mean(q < 0.22)) if q.size else 0.0
+    for key in ["source_groups", "dance_keys", "music_alignment_labels", "labels", "event_families", "motion_stage_roles", "cultural_motifs", "prop_proxy_labels", "locomotion_labels", "support_labels"]:
         if key in db.files:
             vals = as_iterable_values(db[key])
             summary[key + "_counts"] = Counter(map(str, vals)).most_common(30)

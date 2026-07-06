@@ -67,7 +67,7 @@ def main() -> None:
     }
     bad = {k: v for k, v in leakage.items() if v}
     summary = {
-        "version": "v46_17_official_split_audit",
+        "version": "v46_23_official_enriched_split_audit",
         "split_dir": str(split_dir),
         "num_records": {s: len(rows[s]) for s in rows},
         "num_sources": {s: len(sources[s]) for s in sources},
