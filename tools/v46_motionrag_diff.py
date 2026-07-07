@@ -3346,7 +3346,7 @@ def standardize_features(x: np.ndarray, mask: Optional[np.ndarray] = None) -> Tu
     return ((x - mean) / std).astype(np.float32), mean, std
 
 
-def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
+def audio_slots_v46_default(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
     if slots_json and Path(slots_json).exists():
         # V46.12: slots_json can be either the old feature JSON or a new
         # external classical-music semantic JSON/NPZ.
@@ -3414,6 +3414,209 @@ def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slo
         feats.append(pseudo.astype(np.float32))
     return slots, np.stack(feats).astype(np.float32)
 
+
+
+
+
+
+
+
+# ===== V46.34 PRETRAINED ROUTER SLOT PATCH START =====
+def _v46_34_env_bool(name: str, default: bool = False) -> bool:
+    try:
+        return bool(int(os.environ.get(name, "1" if default else "0")))
+    except Exception:
+        return bool(default)
+
+
+_V46_34_SEMANTIC_LABELS = [
+    "calm_meditative",
+    "lyrical_flow",
+    "pose_hold",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+]
+
+
+def _v46_34_normalize_probs(obj, top_label=None):
+    if isinstance(obj, dict):
+        raw = {str(k): float(v) for k, v in obj.items() if str(k) in _V46_34_SEMANTIC_LABELS}
+    else:
+        raw = {}
+    if not raw and top_label in _V46_34_SEMANTIC_LABELS:
+        raw = {k: 0.02 for k in _V46_34_SEMANTIC_LABELS}
+        raw[str(top_label)] = 0.88
+    if not raw:
+        raw = {k: 1.0 / len(_V46_34_SEMANTIC_LABELS) for k in _V46_34_SEMANTIC_LABELS}
+    s = sum(max(0.0, float(v)) for v in raw.values())
+    if s <= 1e-8:
+        return {k: 1.0 / len(_V46_34_SEMANTIC_LABELS) for k in _V46_34_SEMANTIC_LABELS}
+    return {k: float(max(0.0, raw.get(k, 0.0)) / s) for k in _V46_34_SEMANTIC_LABELS}
+
+
+def _v46_34_top_label(probs):
+    p = _v46_34_normalize_probs(probs)
+    return max(p.items(), key=lambda kv: kv[1])[0]
+
+
+def _v46_34_feature_from_slot(slot: dict) -> np.ndarray:
+    dur = float(slot.get("duration", slot.get("duration_sec", 4.0)))
+    probs = _v46_34_normalize_probs(slot.get("music_semantic_probs", {}), slot.get("music_semantic_top_label", slot.get("music_alignment_label")))
+    energy = float(slot.get("energy", slot.get("music_energy", slot.get("slot_energy", 0.06))))
+    onset = float(slot.get("onset", slot.get("accent", slot.get("music_accent_score", 0.02))))
+    dyn = float(slot.get("dynamic", slot.get("beat_density", 0.04)))
+    x = np.zeros(32, dtype=np.float32)
+    x[0] = dur
+    x[1] = 2.0 * energy + 0.25 * probs["footwork_flow"] + 0.25 * probs["percussive_accent"]
+    x[2] = energy
+    x[3] = float(slot.get("energy_p90", energy))
+    x[4] = dyn
+    x[5] = energy + onset + 0.35 * probs["percussive_accent"]
+    x[6] = float(slot.get("onset_p90", onset))
+    x[7] = energy + 0.5 * onset + 0.25 * probs["footwork_flow"]
+    x[8] = energy
+    x[9] = 1.0 + onset + 0.35 * probs["turning_climax"]
+    x[10] = 0.65 * probs["calm_meditative"] + 0.45 * probs["pose_hold"]
+    x[11] = probs["pose_hold"]
+    x[12] = probs["calm_meditative"]
+    x[13] = max(0.02, onset + 0.2 * probs["percussive_accent"])
+    x[15] = 0.25 * probs["turning_climax"]
+    x[16] = probs["turning_climax"]
+    x[17] = probs["footwork_flow"]
+    x[18] = probs["instrument_phrase"]
+    x[19] = probs["lyrical_flow"]
+    x[20] = probs["percussive_accent"]
+    x[21] = probs["calm_meditative"]
+    x[22] = probs["pose_hold"]
+    for i, lab in enumerate(_V46_34_SEMANTIC_LABELS):
+        if 23 + i < 32:
+            x[23 + i] = probs[lab]
+    x[31] = 1.0
+    return x.astype(np.float32)
+
+
+def _v46_34_find_slots_in_json(data):
+    if isinstance(data, dict):
+        if isinstance(data.get("slots"), list):
+            return data.get("slots"), data
+        sr = data.get("stage_reports")
+        if isinstance(sr, dict) and isinstance(sr.get("retrieval"), list):
+            slots = []
+            for r in sr.get("retrieval", []):
+                if not isinstance(r, dict):
+                    continue
+                slots.append({
+                    "slot_id": r.get("slot", r.get("slot_id", len(slots))),
+                    "duration": r.get("duration", 4.0),
+                    "music_alignment_label": r.get("slot_music_alignment_label", r.get("music_alignment_label", "calm_meditative")),
+                    "music_semantic_top_label": r.get("slot_music_semantic_top_label", r.get("slot_music_alignment_label", "calm_meditative")),
+                    "music_semantic_probs": r.get("slot_music_semantic_probs", {}),
+                    "preferred_dance_keys": r.get("slot_preferred_dance_keys", []),
+                })
+            if slots:
+                return slots, data
+        for v in data.values():
+            got, meta = _v46_34_find_slots_in_json(v)
+            if got is not None:
+                return got, meta
+    elif isinstance(data, list):
+        if data and all(isinstance(x, dict) for x in data):
+            keys = set()
+            for x in data[: min(8, len(data))]:
+                keys.update(x.keys())
+            if "duration" in keys or {"start", "end"}.issubset(keys):
+                return data, {"version": "list_slots"}
+        for v in data:
+            got, meta = _v46_34_find_slots_in_json(v)
+            if got is not None:
+                return got, meta
+    return None, {}
+
+
+def _v46_34_load_slots_json(slots_json: str | Path, cfg: V46Config) -> Tuple[List[dict], np.ndarray, dict]:
+    data = load_json(slots_json)
+    slots, meta = _v46_34_find_slots_in_json(data)
+    if not slots:
+        raise RuntimeError(f"V46.34 slots_json has no slots: {slots_json}")
+    fps = float(getattr(cfg, "fps", 30.0))
+    out_slots: List[dict] = []
+    feats: List[np.ndarray] = []
+    cursor = 0.0
+    for i, s0 in enumerate(slots):
+        s = dict(s0)
+        dur = s.get("duration", s.get("duration_sec", None))
+        st = s.get("start", s.get("start_sec", s.get("music_start", None)))
+        ed = s.get("end", s.get("end_sec", s.get("music_end", None)))
+        if dur is None and st is not None and ed is not None:
+            dur = float(ed) - float(st)
+        if dur is None:
+            dur = 4.0
+        dur = max(0.10, float(dur))
+        if st is None:
+            st = cursor
+        st = float(st)
+        if ed is None:
+            ed = st + dur
+        ed = float(ed)
+        dur = max(0.10, ed - st)
+        cursor = ed
+        probs = _v46_34_normalize_probs(s.get("music_semantic_probs", {}), s.get("music_semantic_top_label", s.get("music_alignment_label")))
+        top = s.get("music_semantic_top_label", s.get("music_alignment_label", _v46_34_top_label(probs)))
+        if top not in _V46_34_SEMANTIC_LABELS:
+            top = _v46_34_top_label(probs)
+        base = np.asarray(s.get("feature", []), dtype=np.float32)
+        if base.size < 32 or float(np.max(np.abs(base))) == 0.0:
+            base = _v46_34_feature_from_slot({**s, "duration": dur, "music_semantic_probs": probs, "music_semantic_top_label": top})
+        if base.size < 32:
+            base = np.pad(base, (0, 32 - base.size))
+        s.update({
+            "slot_id": int(s.get("slot_id", s.get("slot", i))),
+            "start": float(st),
+            "end": float(ed),
+            "duration": float(dur),
+            "target_frames": int(s.get("target_frames", round(float(dur) * fps))),
+            "music_alignment_label": str(s.get("music_alignment_label", top)),
+            "music_semantic_top_label": str(top),
+            "music_semantic_probs": probs,
+            "slot_plan_source": str(s.get("slot_plan_source", meta.get("slot_source", "v46_34_slots_json"))),
+            "feature": base[:32].astype(float).tolist(),
+        })
+        out_slots.append(s)
+        feats.append(base[:32].astype(np.float32))
+    return out_slots, np.stack(feats).astype(np.float32), meta if isinstance(meta, dict) else {}
+
+
+def audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
+    """V46.34 router-aware slot loader.
+
+    Scientific mode: set V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 and pass
+    --slots_json generated by tools/v46_34_pretrained_music_slot_plan.py.  This
+    prevents accidental fallback to regular fixed-window audio slots.
+    """
+    strict = _v46_34_env_bool("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS", False)
+    if slots_json and Path(slots_json).exists():
+        slots, feats, meta = _v46_34_load_slots_json(slots_json, cfg)
+        allowed = not strict
+        src = str(meta.get("slot_source", ""))
+        raw = str(meta.get("router_ckpt", "")) + " " + str(meta.get("planner_ckpt", "")) + " " + src
+        if ("v21" in raw.lower()) or ("v26" in raw.lower()) or ("pretrained" in raw.lower()) or ("router" in raw.lower()):
+            allowed = True
+        if not allowed:
+            raise RuntimeError(
+                "V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but slots_json is not marked as pretrained V21/V26 router output. "
+                f"slots_json={slots_json}, slot_source={src}"
+            )
+        print(f"[V46.34] loaded pretrained router slot plan: {slots_json} slots={len(slots)} source={src}")
+        return slots, feats
+    if strict:
+        raise RuntimeError(
+            "V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but --slots_json was not provided or does not exist. "
+            "Generate it with tools/v46_34_pretrained_music_slot_plan.py."
+        )
+    return audio_slots_v46_default(path, cfg, slot_seconds, slots_json)
+# ===== V46.34 PRETRAINED ROUTER SLOT PATCH END =====
 
 class MLPEncoder(nn.Module):
     def __init__(self, in_dim: int = 32, emb_dim: int = 128):
@@ -3713,6 +3916,8 @@ def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[V46Co
         out = resample_motion_np(m, target_len)
     out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"sample_motion_window:{p}", derive_contact=True, project_rot=True)
     return out.astype(np.float32)
+
+
 
 
 
@@ -4599,6 +4804,394 @@ def _v46_33_choose_core_and_transition_lengths(source_len: int, target_len: int,
     return int(core), int(trans), info
 
 
+
+# === V46.33 reference-conditioned transition budget begin ===
+def _v46_33_env_bool(name: str, default: bool) -> bool:
+    if name in os.environ:
+        try:
+            return bool(int(os.environ[name]))
+        except Exception:
+            return str(os.environ[name]).strip().lower() in {"true", "yes", "on"}
+    return bool(default)
+
+
+def _v46_33_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return int(default)
+
+
+def _v46_33_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _v46_33_cfg_bool(cfg: V46Config, attr: str, env: str, default: bool) -> bool:
+    return _v46_33_env_bool(env, bool(getattr(cfg, attr, default)))
+
+
+def _v46_33_cfg_int(cfg: V46Config, attr: str, env: str, default: int) -> int:
+    return _v46_33_env_int(env, int(getattr(cfg, attr, default)))
+
+
+def _v46_33_cfg_float(cfg: V46Config, attr: str, env: str, default: float) -> float:
+    return _v46_33_env_float(env, float(getattr(cfg, attr, default)))
+
+
+def _v46_33_slerp_quat_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Vectorized quaternion SLERP. q0/q1: [J,4], t: [T,1,1]."""
+    q0 = normalize_quat_np(np.asarray(q0, dtype=np.float32))
+    q1 = normalize_quat_np(np.asarray(q1, dtype=np.float32))
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0.0, -q1, q1)
+    dot = np.clip(np.abs(dot), 0.0, 1.0)
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    tt = np.asarray(t, dtype=np.float32)
+    q0b = q0[None]
+    q1b = q1[None]
+    dotb = dot[None]
+    thetab = theta[None]
+    sinb = sin_theta[None]
+    lerp = normalize_quat_np((1.0 - tt) * q0b + tt * q1b)
+    s0 = np.sin((1.0 - tt) * thetab) / np.maximum(sinb, 1e-6)
+    s1 = np.sin(tt * thetab) / np.maximum(sinb, 1e-6)
+    slerp = normalize_quat_np(s0 * q0b + s1 * q1b)
+    use_lerp = (dotb > 0.9995) | (np.abs(sinb) < 1e-6)
+    return np.where(use_lerp, lerp, slerp).astype(np.float32)
+
+
+def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_frames: int, cfg: V46Config) -> np.ndarray:
+    """Kinematic inbetweening in EDGE-151D: root Hermite + per-joint rotation SLERP.
+
+    prev_tail and curr_head are short clips. The generated bridge excludes both
+    endpoints, so it can be inserted between previous core and current core
+    without duplicating boundary frames.
+    """
+    n = int(n_frames)
+    if n <= 0:
+        return np.zeros((0, EDGE_DIM), dtype=np.float32)
+    a_clip = np.asarray(prev_tail, dtype=np.float32)
+    b_clip = np.asarray(curr_head, dtype=np.float32)
+    a = a_clip[-1].copy()
+    b = b_clip[0].copy()
+    out = np.zeros((n, EDGE_DIM), dtype=np.float32)
+    phase = (np.arange(n, dtype=np.float32) + 1.0) / float(n + 1)
+    s = phase[:, None]
+    smooth = (s * s * (3.0 - 2.0 * s)).astype(np.float32)
+
+    # Contact channels are re-derived after FK; keep them as conservative blends here.
+    out[:, 0:4] = ((1.0 - smooth) * a[None, 0:4] + smooth * b[None, 0:4]).astype(np.float32)
+
+    # Root position: C1 Hermite using local endpoint velocities.
+    p0 = a[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
+    p1 = b[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
+    v0 = np.zeros(3, dtype=np.float32)
+    v1 = np.zeros(3, dtype=np.float32)
+    if a_clip.shape[0] >= 2:
+        v0 = (a_clip[-1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - a_clip[-2, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
+    if b_clip.shape[0] >= 2:
+        v1 = (b_clip[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - b_clip[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
+    # Bound bridge tangents to avoid long-range root launches at mismatched clips.
+    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mpf", "V46_TRANSITION_ROOT_TANGENT_MAX_MPF", 0.045)
+    for vv in (v0, v1):
+        norm = float(np.linalg.norm(vv[[0, 2]]))
+        if norm > max_step:
+            vv[[0, 2]] *= max_step / max(norm, 1e-8)
+    tt = phase[:, None]
+    h00 = 2 * tt ** 3 - 3 * tt ** 2 + 1
+    h10 = tt ** 3 - 2 * tt ** 2 + tt
+    h01 = -2 * tt ** 3 + 3 * tt ** 2
+    h11 = tt ** 3 - tt ** 2
+    scale = float(n + 1)
+    root = h00 * p0[None] + h10 * (v0[None] * scale) + h01 * p1[None] + h11 * (v1[None] * scale)
+    out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
+
+    # Rotation: joint-wise quaternion SLERP, then convert back to legal Rot6D.
+    Ra = rot6d_to_matrix_np(a[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
+    Rb = rot6d_to_matrix_np(b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
+    qa = matrix_to_quat_np(Ra)
+    qb = matrix_to_quat_np(Rb)
+    q = _v46_33_slerp_quat_np(qa, qb, phase.reshape(n, 1, 1))
+    R = quat_to_matrix_np(q)
+    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(R).reshape(n, -1)
+
+    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="v46_33_motion_inbetween", derive_contact=True, project_rot=True)
+    return out.astype(np.float32)
+
+
+def _v46_33_align_core_to_prev(prev_piece: np.ndarray, core: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+    """Align current core to previous endpoint in yaw and XZ only."""
+    out = core.copy().astype(np.float32)
+    report: Dict[str, object] = {"mode": "yaw_xz_to_previous_endpoint_no_root_y_ramp"}
+    if prev_piece.size == 0 or out.size == 0:
+        return out, report
+    try:
+        yaw_prev = float(root_yaw_np(prev_piece[-1:])[0])
+        yaw_core = float(root_yaw_np(out[:1])[0])
+        dyaw = float(np.arctan2(np.sin(yaw_prev - yaw_core), np.cos(yaw_prev - yaw_core)))
+    except Exception:
+        yaw_prev, yaw_core, dyaw = 0.0, 0.0, 0.0
+    out = rotate_motion_around_y_np(out, dyaw, pivot_xz=out[0, [ROOT_X_IDX, ROOT_Z_IDX]])
+    delta = prev_piece[-1, [ROOT_X_IDX, ROOT_Z_IDX]] - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
+    out[:, ROOT_X_IDX] += float(delta[0])
+    out[:, ROOT_Z_IDX] += float(delta[1])
+    out, contract = enforce_edge151_contract_np(out, cfg, source_hint="v46_33_align_core_to_prev", derive_contact=True, project_rot=True)
+    report.update({
+        "yaw_prev": float(yaw_prev),
+        "yaw_core_before": float(yaw_core),
+        "dyaw_applied": float(dyaw),
+        "delta_xz_applied": [float(delta[0]), float(delta[1])],
+        "root_y_ramp_applied": False,
+        "contract": contract,
+    })
+    return out.astype(np.float32), report
+
+
+def _v46_33_choose_core_and_transition_lengths(source_len: int, target_len: int, has_prev: bool, cfg: V46Config) -> Tuple[int, int, dict]:
+    """Return (core_len, transition_in_len) while preserving target_len exactly."""
+    target_len = max(1, int(target_len))
+    source_len = max(1, int(source_len))
+    if not has_prev:
+        return target_len, 0, {"reason": "first_slot_no_transition", "core_warp": float(target_len / source_len)}
+
+    min_trans = _v46_33_cfg_int(cfg, "transition_min_frames", "V46_TRANSITION_MIN_FRAMES", 10)
+    max_trans = _v46_33_cfg_int(cfg, "transition_max_frames", "V46_TRANSITION_MAX_FRAMES", 28)
+    ratio = _v46_33_cfg_float(cfg, "transition_ratio", "V46_TRANSITION_RATIO", 0.18)
+    min_core = _v46_33_cfg_int(cfg, "transition_min_core_frames", "V46_TRANSITION_MIN_CORE_FRAMES", 30)
+    warp_min = _v46_33_cfg_float(cfg, "core_warp_min", "V46_CORE_WARP_MIN", 0.72)
+    warp_max = _v46_33_cfg_float(cfg, "core_warp_max", "V46_CORE_WARP_MAX", 1.38)
+
+    if target_len <= min_core + 2:
+        return target_len, 0, {"reason": "slot_too_short_for_transition", "core_warp": float(target_len / source_len)}
+
+    trans = int(round(target_len * ratio))
+    trans = max(min_trans, min(max_trans, trans))
+    trans = min(trans, max(0, target_len - min_core))
+    core = max(min_core, target_len - trans)
+
+    # Prefer natural core duration, but never violate total slot length.
+    lower = max(min_core, int(round(source_len * warp_min)))
+    upper = max(lower, int(round(source_len * warp_max)))
+    desired = int(np.clip(core, lower, upper))
+    desired = min(max(min_core, desired), target_len - max(1, min_trans))
+    if desired > 0:
+        core = desired
+        trans = target_len - core
+
+    if trans < 0:
+        trans = 0
+        core = target_len
+    info = {
+        "target_len": int(target_len),
+        "source_len": int(source_len),
+        "transition_frames": int(trans),
+        "core_frames": int(core),
+        "core_warp": float(core / max(1, source_len)),
+        "warp_min": float(warp_min),
+        "warp_max": float(warp_max),
+        "ratio": float(ratio),
+    }
+    return int(core), int(trans), info
+
+
+
+# === V46.33 reference-conditioned transition budget begin ===
+def _v46_33_env_bool(name: str, default: bool) -> bool:
+    if name in os.environ:
+        try:
+            return bool(int(os.environ[name]))
+        except Exception:
+            return str(os.environ[name]).strip().lower() in {"true", "yes", "on"}
+    return bool(default)
+
+
+def _v46_33_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return int(default)
+
+
+def _v46_33_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _v46_33_cfg_bool(cfg: V46Config, attr: str, env: str, default: bool) -> bool:
+    return _v46_33_env_bool(env, bool(getattr(cfg, attr, default)))
+
+
+def _v46_33_cfg_int(cfg: V46Config, attr: str, env: str, default: int) -> int:
+    return _v46_33_env_int(env, int(getattr(cfg, attr, default)))
+
+
+def _v46_33_cfg_float(cfg: V46Config, attr: str, env: str, default: float) -> float:
+    return _v46_33_env_float(env, float(getattr(cfg, attr, default)))
+
+
+def _v46_33_slerp_quat_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Vectorized quaternion SLERP. q0/q1: [J,4], t: [T,1,1]."""
+    q0 = normalize_quat_np(np.asarray(q0, dtype=np.float32))
+    q1 = normalize_quat_np(np.asarray(q1, dtype=np.float32))
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0.0, -q1, q1)
+    dot = np.clip(np.abs(dot), 0.0, 1.0)
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+    tt = np.asarray(t, dtype=np.float32)
+    q0b = q0[None]
+    q1b = q1[None]
+    dotb = dot[None]
+    thetab = theta[None]
+    sinb = sin_theta[None]
+    lerp = normalize_quat_np((1.0 - tt) * q0b + tt * q1b)
+    s0 = np.sin((1.0 - tt) * thetab) / np.maximum(sinb, 1e-6)
+    s1 = np.sin(tt * thetab) / np.maximum(sinb, 1e-6)
+    slerp = normalize_quat_np(s0 * q0b + s1 * q1b)
+    use_lerp = (dotb > 0.9995) | (np.abs(sinb) < 1e-6)
+    return np.where(use_lerp, lerp, slerp).astype(np.float32)
+
+
+def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_frames: int, cfg: V46Config) -> np.ndarray:
+    """Kinematic inbetweening in EDGE-151D: root Hermite + per-joint rotation SLERP.
+
+    prev_tail and curr_head are short clips. The generated bridge excludes both
+    endpoints, so it can be inserted between previous core and current core
+    without duplicating boundary frames.
+    """
+    n = int(n_frames)
+    if n <= 0:
+        return np.zeros((0, EDGE_DIM), dtype=np.float32)
+    a_clip = np.asarray(prev_tail, dtype=np.float32)
+    b_clip = np.asarray(curr_head, dtype=np.float32)
+    a = a_clip[-1].copy()
+    b = b_clip[0].copy()
+    out = np.zeros((n, EDGE_DIM), dtype=np.float32)
+    phase = (np.arange(n, dtype=np.float32) + 1.0) / float(n + 1)
+    s = phase[:, None]
+    smooth = (s * s * (3.0 - 2.0 * s)).astype(np.float32)
+
+    # Contact channels are re-derived after FK; keep them as conservative blends here.
+    out[:, 0:4] = ((1.0 - smooth) * a[None, 0:4] + smooth * b[None, 0:4]).astype(np.float32)
+
+    # Root position: C1 Hermite using local endpoint velocities.
+    p0 = a[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
+    p1 = b[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
+    v0 = np.zeros(3, dtype=np.float32)
+    v1 = np.zeros(3, dtype=np.float32)
+    if a_clip.shape[0] >= 2:
+        v0 = (a_clip[-1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - a_clip[-2, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
+    if b_clip.shape[0] >= 2:
+        v1 = (b_clip[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - b_clip[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
+    # Bound bridge tangents to avoid long-range root launches at mismatched clips.
+    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mpf", "V46_TRANSITION_ROOT_TANGENT_MAX_MPF", 0.045)
+    for vv in (v0, v1):
+        norm = float(np.linalg.norm(vv[[0, 2]]))
+        if norm > max_step:
+            vv[[0, 2]] *= max_step / max(norm, 1e-8)
+    tt = phase[:, None]
+    h00 = 2 * tt ** 3 - 3 * tt ** 2 + 1
+    h10 = tt ** 3 - 2 * tt ** 2 + tt
+    h01 = -2 * tt ** 3 + 3 * tt ** 2
+    h11 = tt ** 3 - tt ** 2
+    scale = float(n + 1)
+    root = h00 * p0[None] + h10 * (v0[None] * scale) + h01 * p1[None] + h11 * (v1[None] * scale)
+    out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
+
+    # Rotation: joint-wise quaternion SLERP, then convert back to legal Rot6D.
+    Ra = rot6d_to_matrix_np(a[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
+    Rb = rot6d_to_matrix_np(b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
+    qa = matrix_to_quat_np(Ra)
+    qb = matrix_to_quat_np(Rb)
+    q = _v46_33_slerp_quat_np(qa, qb, phase.reshape(n, 1, 1))
+    R = quat_to_matrix_np(q)
+    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(R).reshape(n, -1)
+
+    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="v46_33_motion_inbetween", derive_contact=True, project_rot=True)
+    return out.astype(np.float32)
+
+
+def _v46_33_align_core_to_prev(prev_piece: np.ndarray, core: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+    """Align current core to previous endpoint in yaw and XZ only."""
+    out = core.copy().astype(np.float32)
+    report: Dict[str, object] = {"mode": "yaw_xz_to_previous_endpoint_no_root_y_ramp"}
+    if prev_piece.size == 0 or out.size == 0:
+        return out, report
+    try:
+        yaw_prev = float(root_yaw_np(prev_piece[-1:])[0])
+        yaw_core = float(root_yaw_np(out[:1])[0])
+        dyaw = float(np.arctan2(np.sin(yaw_prev - yaw_core), np.cos(yaw_prev - yaw_core)))
+    except Exception:
+        yaw_prev, yaw_core, dyaw = 0.0, 0.0, 0.0
+    out = rotate_motion_around_y_np(out, dyaw, pivot_xz=out[0, [ROOT_X_IDX, ROOT_Z_IDX]])
+    delta = prev_piece[-1, [ROOT_X_IDX, ROOT_Z_IDX]] - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
+    out[:, ROOT_X_IDX] += float(delta[0])
+    out[:, ROOT_Z_IDX] += float(delta[1])
+    out, contract = enforce_edge151_contract_np(out, cfg, source_hint="v46_33_align_core_to_prev", derive_contact=True, project_rot=True)
+    report.update({
+        "yaw_prev": float(yaw_prev),
+        "yaw_core_before": float(yaw_core),
+        "dyaw_applied": float(dyaw),
+        "delta_xz_applied": [float(delta[0]), float(delta[1])],
+        "root_y_ramp_applied": False,
+        "contract": contract,
+    })
+    return out.astype(np.float32), report
+
+
+def _v46_33_choose_core_and_transition_lengths(source_len: int, target_len: int, has_prev: bool, cfg: V46Config) -> Tuple[int, int, dict]:
+    """Return (core_len, transition_in_len) while preserving target_len exactly."""
+    target_len = max(1, int(target_len))
+    source_len = max(1, int(source_len))
+    if not has_prev:
+        return target_len, 0, {"reason": "first_slot_no_transition", "core_warp": float(target_len / source_len)}
+
+    min_trans = _v46_33_cfg_int(cfg, "transition_min_frames", "V46_TRANSITION_MIN_FRAMES", 10)
+    max_trans = _v46_33_cfg_int(cfg, "transition_max_frames", "V46_TRANSITION_MAX_FRAMES", 28)
+    ratio = _v46_33_cfg_float(cfg, "transition_ratio", "V46_TRANSITION_RATIO", 0.18)
+    min_core = _v46_33_cfg_int(cfg, "transition_min_core_frames", "V46_TRANSITION_MIN_CORE_FRAMES", 30)
+    warp_min = _v46_33_cfg_float(cfg, "core_warp_min", "V46_CORE_WARP_MIN", 0.72)
+    warp_max = _v46_33_cfg_float(cfg, "core_warp_max", "V46_CORE_WARP_MAX", 1.38)
+
+    if target_len <= min_core + 2:
+        return target_len, 0, {"reason": "slot_too_short_for_transition", "core_warp": float(target_len / source_len)}
+
+    trans = int(round(target_len * ratio))
+    trans = max(min_trans, min(max_trans, trans))
+    trans = min(trans, max(0, target_len - min_core))
+    core = max(min_core, target_len - trans)
+
+    # Prefer natural core duration, but never violate total slot length.
+    lower = max(min_core, int(round(source_len * warp_min)))
+    upper = max(lower, int(round(source_len * warp_max)))
+    desired = int(np.clip(core, lower, upper))
+    desired = min(max(min_core, desired), target_len - max(1, min_trans))
+    if desired > 0:
+        core = desired
+        trans = target_len - core
+
+    if trans < 0:
+        trans = 0
+        core = target_len
+    info = {
+        "target_len": int(target_len),
+        "source_len": int(source_len),
+        "transition_frames": int(trans),
+        "core_frames": int(core),
+        "core_warp": float(core / max(1, source_len)),
+        "warp_min": float(warp_min),
+        "warp_max": float(warp_max),
+        "ratio": float(ratio),
+    }
+    return int(core), int(trans), info
+
+
 def concat_events(event_paths: Sequence[str], target_durations: Sequence[float], cfg: V46Config) -> Tuple[np.ndarray, List[dict]]:
     """V46.33 reference-conditioned transition-budget concatenation.
 
@@ -4750,6 +5343,62 @@ def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]
 # === V46.33 reference-conditioned transition budget end ===
 
 
+def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: V46Config) -> np.ndarray:
+    """Build precise transition mask with optional halo and low core mask."""
+    core_val = _v46_33_cfg_float(cfg, "transition_core_mask_value", "V46_TRANSITION_CORE_MASK_VALUE", 0.0)
+    halo = _v46_33_cfg_int(cfg, "transition_mask_halo", "V46_TRANSITION_MASK_HALO", 6)
+    mask = np.full((int(T), 1), float(core_val), dtype=np.float32)
+    for sp in transition_spans:
+        if sp is None or len(sp) < 2:
+            continue
+        a, b = int(sp[0]), int(sp[1])
+        a0 = max(0, a - halo)
+        b0 = min(int(T), b + halo)
+        if b0 <= a0:
+            continue
+        # Raised plateau: transition core = 1, halo ramps down to core_val.
+        mask[a:b, 0] = 1.0
+        if halo > 0:
+            la = max(0, a - halo)
+            if a > la:
+                ramp = np.linspace(float(core_val), 1.0, a - la, endpoint=False, dtype=np.float32)
+                mask[la:a, 0] = np.maximum(mask[la:a, 0], ramp)
+            rb = min(int(T), b + halo)
+            if rb > b:
+                ramp = np.linspace(1.0, float(core_val), rb - b, endpoint=False, dtype=np.float32)
+                mask[b:rb, 0] = np.maximum(mask[b:rb, 0], ramp)
+    return np.clip(mask, 0.0, 1.0).astype(np.float32)
+# === V46.33 reference-conditioned transition budget end ===
+
+
+def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: V46Config) -> np.ndarray:
+    """Build precise transition mask with optional halo and low core mask."""
+    core_val = _v46_33_cfg_float(cfg, "transition_core_mask_value", "V46_TRANSITION_CORE_MASK_VALUE", 0.0)
+    halo = _v46_33_cfg_int(cfg, "transition_mask_halo", "V46_TRANSITION_MASK_HALO", 6)
+    mask = np.full((int(T), 1), float(core_val), dtype=np.float32)
+    for sp in transition_spans:
+        if sp is None or len(sp) < 2:
+            continue
+        a, b = int(sp[0]), int(sp[1])
+        a0 = max(0, a - halo)
+        b0 = min(int(T), b + halo)
+        if b0 <= a0:
+            continue
+        # Raised plateau: transition core = 1, halo ramps down to core_val.
+        mask[a:b, 0] = 1.0
+        if halo > 0:
+            la = max(0, a - halo)
+            if a > la:
+                ramp = np.linspace(float(core_val), 1.0, a - la, endpoint=False, dtype=np.float32)
+                mask[la:a, 0] = np.maximum(mask[la:a, 0], ramp)
+            rb = min(int(T), b + halo)
+            if rb > b:
+                ramp = np.linspace(1.0, float(core_val), rb - b, endpoint=False, dtype=np.float32)
+                mask[b:rb, 0] = np.maximum(mask[b:rb, 0], ramp)
+    return np.clip(mask, 0.0, 1.0).astype(np.float32)
+# === V46.33 reference-conditioned transition budget end ===
+
+
 def make_boundary_mask(T: int, seams: Sequence[int], width: int = 18) -> np.ndarray:
     mask = np.zeros((T, 1), dtype=np.float32)
     for s in seams:
@@ -4777,6 +5426,8 @@ def analytic_residual_refine(motion: np.ndarray, seam_positions: Sequence[int], 
         out[a:b, idx] = (1 - 0.35 * w) * out[a:b, idx] + 0.35 * w * bridge[:, idx]
     out[:, ROOT_Y_IDX] = smooth_np(out[:, ROOT_Y_IDX:ROOT_Y_IDX + 1], 1.0)[:, 0]
     return out.astype(np.float32)
+
+
 
 
 
@@ -5525,6 +6176,8 @@ def render_if_possible(motion_path: str, audio_path: Optional[str], output_mp4: 
     cmd = [sys.executable, render_script, "--motion", motion_path, "--audio", audio_path, "--output", output_mp4, "--camera_mode", "follow", "--render_smooth_window", "5"]
     print("[V46 RENDER]", " ".join(cmd))
     subprocess.run(cmd, check=True)
+
+
 
 
 
