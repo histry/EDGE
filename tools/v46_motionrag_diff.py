@@ -4135,10 +4135,30 @@ def train_diffusion(args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+
+# ===== TRUSTED LOCAL CKPT LOAD FIX START =====
+def _v46_trusted_torch_load(path, map_location=None, **_unused_kwargs):
+    """Load trusted local checkpoints saved by this project.
+
+    PyTorch 2.6 defaults torch.load(..., weights_only=True), which may reject
+    V44 checkpoints containing numpy arrays. These ckpts are generated locally
+    in this experiment, so we explicitly use weights_only=False.
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required to load checkpoints.")
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older PyTorch has no weights_only argument.
+        return torch.load(path, map_location=map_location)
+# ===== TRUSTED LOCAL CKPT LOAD FIX END =====
+
 def load_contrastive(path: Optional[str], cfg: V46Config):
     if torch is None or not path or not Path(path).exists():
         return None
-    ckpt = torch.load(path, map_location=cfg.device)
+    ckpt = _v46_trusted_torch_load(path, map_location=cfg.device)
     model = ContrastiveModel(ckpt.get("feat_dim", 32), ckpt.get("embed_dim", cfg.embed_dim)).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.music_mean = np.asarray(ckpt.get("music_mean", np.zeros((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
@@ -5452,7 +5472,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         )
         return refined.astype(np.float32)
 
-    ckpt = torch.load(ckpt_path, map_location=cfg.device)
+    ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
     model = TemporalRefiner(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
@@ -5519,7 +5539,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
     trans_strength = _v46_33_cfg_float(cfg, "diffusion_transition_strength", "V46_DIFFUSION_TRANSITION_STRENGTH", 0.72)
     noise_scale = _v46_33_cfg_float(cfg, "diffusion_reference_noise_scale", "V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.03)
 
-    ckpt = torch.load(ckpt_path, map_location=cfg.device)
+    ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
