@@ -2,8 +2,9 @@ import os
 import argparse
 import numpy as np
 import torch
+from pytorch3d.transforms import matrix_to_axis_angle
 from vis import skeleton_render, SMPLSkeleton
-from dataset.quaternion import ax_from_6v
+from tools.v46_motionrag_diff import rot6d_to_matrix_np
 
 
 def _as_batch_motion(arr):
@@ -73,8 +74,13 @@ def _render_one(
     )
     pos = motion_tensor[:, :, 4:7]
     seq_len = pos.shape[1]
-    q_6d = motion_tensor[:, :, 7:].reshape(1, seq_len, 24, 6)
-    q_ax = ax_from_6v(q_6d)
+    # V46.44 contract fix: V46 stores Rot6D as column-concatenated
+    # [R[:,0], R[:,1]].  Do not decode with dataset.quaternion.ax_from_6v,
+    # whose backend may assume a different flattening convention.
+    q_6d_np = motion_data[:, 7:].reshape(seq_len, 24, 6).astype(np.float32)
+    rot_m_np = rot6d_to_matrix_np(q_6d_np)
+    rot_m = torch.tensor(rot_m_np, dtype=torch.float32, device=device).unsqueeze(0)
+    q_ax = matrix_to_axis_angle(rot_m)
     smpl = SMPLSkeleton(device=device)
     poses_3d = smpl.forward(q_ax, pos).detach().cpu().numpy()[0]
     out_dir = os.path.dirname(output) or "."
