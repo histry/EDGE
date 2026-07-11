@@ -246,12 +246,41 @@ def simple_boundary_risk(previous: np.ndarray, transition: np.ndarray, following
 
 
 def transition_risk(v46, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, float]:
+    previous = np.asarray(previous, dtype=np.float32)
+    transition = np.asarray(transition, dtype=np.float32)
+    following = np.asarray(following, dtype=np.float32)
+
+    # V46.48: v32 transition_risk may return 1e9 sentinel values when the
+    # explicit bridge is empty, especially for a tiny terminal residual slot.
+    # An empty bridge is a direct join and should be evaluated as such.
+    if transition.shape[0] == 0:
+        return simple_boundary_risk(previous, transition, following, fps)
+
     fn = import_v32_transition_risk()
     if fn is not None:
         try:
-            return dict(fn(previous, transition, following, fps=fps))
+            risk = dict(fn(previous, transition, following, fps=fps))
+            probe_keys = (
+                "total",
+                "boundary_joint_jerk_max",
+                "exit_fk_jump",
+                "exit_rotation_step_rad",
+                "foot_slip",
+                "foot_penetration",
+            )
+            values = [
+                float(risk.get(k, 0.0))
+                for k in probe_keys
+            ]
+            sentinel = any(
+                (not np.isfinite(v)) or abs(v) >= 1.0e8
+                for v in values
+            )
+            if not sentinel:
+                return risk
         except Exception:
             pass
+
     return simple_boundary_risk(previous, transition, following, fps)
 
 
@@ -776,10 +805,95 @@ def set_cfg_runtime_knobs(cfg: Any) -> None:
         pass
 
 
+def merge_short_terminal_slot(
+    slots: Sequence[Dict[str, Any]],
+    slot_feat: np.ndarray,
+    cfg: Any,
+) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    """Merge a tiny terminal residual slot into the preceding slot.
+
+    A final 1–3 frame residual cannot represent a meaningful motion event and
+    causes extreme time compression, zero-length transitions, and false
+    1e9 boundary-risk sentinels.
+    """
+    out_slots = [dict(s) for s in slots]
+    feat = np.asarray(slot_feat, dtype=np.float32)
+
+    if len(out_slots) < 2 or feat.shape[0] != len(out_slots):
+        return out_slots, feat
+
+    fps = float(getattr(cfg, "fps", 30.0))
+    default_min = max(
+        int(getattr(cfg, "min_event_frames", 1)),
+        int(round(1.0 * fps)),
+    )
+    min_tail_frames = env_int(
+        "V46_46_MIN_TERMINAL_SLOT_FRAMES",
+        default_min,
+    )
+
+    prev_frames = slot_target_frames(out_slots[-2], cfg)
+    tail_frames = slot_target_frames(out_slots[-1], cfg)
+
+    if tail_frames >= min_tail_frames:
+        return out_slots, feat
+
+    previous = dict(out_slots[-2])
+    tail = dict(out_slots[-1])
+    total_frames = int(prev_frames + tail_frames)
+
+    merged = previous
+    merged["target_frames"] = total_frames
+
+    if "duration" in previous or "duration" in tail:
+        merged["duration"] = float(total_frames / fps)
+    if "duration_sec" in previous or "duration_sec" in tail:
+        merged["duration_sec"] = float(total_frames / fps)
+
+    for key in (
+        "end",
+        "end_sec",
+        "end_time",
+        "end_frame",
+        "audio_end",
+    ):
+        if key in tail:
+            merged[key] = tail[key]
+
+    merged["v46_48_terminal_tail_merge"] = {
+        "enabled": True,
+        "previous_frames": int(prev_frames),
+        "tail_frames": int(tail_frames),
+        "merged_frames": int(total_frames),
+        "minimum_terminal_frames": int(min_tail_frames),
+    }
+
+    denom = float(max(1, total_frames))
+    merged_feat = (
+        feat[-2] * float(prev_frames)
+        + feat[-1] * float(tail_frames)
+    ) / denom
+
+    out_slots[-2] = merged
+    out_slots.pop()
+
+    feat2 = feat[:-1].copy()
+    feat2[-1] = merged_feat.astype(np.float32)
+
+    print(
+        f"[V46.48 TAIL MERGE] merged terminal slot: "
+        f"{tail_frames} frames -> previous slot, "
+        f"new_frames={total_frames}, slots={len(out_slots)}",
+        file=sys.stderr,
+    )
+    return out_slots, feat2.astype(np.float32)
+
+
 def load_slots_and_candidates(v46, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
     db = v46.load_db(args.db)
     contrastive = v46.load_contrastive(getattr(args, "contrastive", None), cfg)
     slots, slot_feat = v46.audio_slots(args.audio, cfg, args.slot_seconds, getattr(args, "slots_json", None))
+    slots, slot_feat = merge_short_terminal_slot(slots, slot_feat, cfg)
     path_idx, retrieval_report = v46.retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
     candidate_lists = extract_candidate_lists(path_idx, retrieval_report, db, cfg)
     return db, contrastive, list(slots), np.asarray(slot_feat, dtype=np.float32), list(map(int, path_idx)), list(retrieval_report), candidate_lists

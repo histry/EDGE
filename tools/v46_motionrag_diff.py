@@ -483,6 +483,51 @@ def load_bvh_file(path: str | Path) -> List[np.ndarray]:
             vals = [data[t, st + k] for k in rot_idx]
             local_all[t, j_idx] = _bvh_euler_to_matrix(rot_ch, vals)
 
+
+    # === V46.47 CHANG-E UPRIGHT ROOT HOTFIX ===
+    # Chang-E BVH Hips/root rotation may contain pitch/roll.
+    # EDGE/SMPL root should not inherit full pitch/roll, otherwise the whole body
+    # may flip, roll, or lie sideways.  This guard is applied before mapping BVH
+    # joints to EDGE 24-joint rot6d.
+    #
+    # Supported modes:
+    #   raw      : keep original BVH root rotation
+    #   identity : remove root rotation completely
+    #   yaw      : keep only facing/yaw, remove pitch/roll
+    _v46_47_root_mode = str(os.environ.get(
+        "V46_47_BVH_ROOT_ROT_MODE",
+        os.environ.get("V46_45_BVH_ROOT_ROT_MODE", "raw")
+    )).strip().lower()
+
+    if _v46_47_root_mode in {"identity", "upright", "zero", "none"}:
+        local_all[:, 0] = np.eye(3, dtype=np.float32)[None, :, :]
+    elif _v46_47_root_mode in {"yaw", "yaw_only", "yaw-only"}:
+        _R0 = local_all[:, 0].astype(np.float32)
+        _forward = _R0[:, :, 2]
+        _yaw = np.arctan2(_forward[:, 0], _forward[:, 2]).astype(np.float32)
+        _c = np.cos(_yaw).astype(np.float32)
+        _s = np.sin(_yaw).astype(np.float32)
+
+        _Ry = np.zeros_like(_R0, dtype=np.float32)
+        _Ry[:, 0, 0] = _c
+        _Ry[:, 0, 1] = 0.0
+        _Ry[:, 0, 2] = _s
+
+        _Ry[:, 1, 0] = 0.0
+        _Ry[:, 1, 1] = 1.0
+        _Ry[:, 1, 2] = 0.0
+
+        _Ry[:, 2, 0] = -_s
+        _Ry[:, 2, 1] = 0.0
+        _Ry[:, 2, 2] = _c
+
+        local_all[:, 0] = _Ry.astype(np.float32)
+    elif _v46_47_root_mode in {"raw", "full", "original"}:
+        pass
+    else:
+        print(f"[V46.47 WARN] Unknown root rotation mode: {_v46_47_root_mode}; using raw.", file=sys.stderr)
+    # === V46.47 CHANG-E UPRIGHT ROOT HOTFIX END ===
+
     target_idx = _bvh_target_joint_indices([str(j["name"]) for j in joints])
     target_local = np.tile(np.eye(3, dtype=np.float32), (data.shape[0], NUM_JOINTS, 1, 1))
     for tgt, src in enumerate(target_idx):
