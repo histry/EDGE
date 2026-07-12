@@ -1,161 +1,130 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Render EDGE 151D motion with a mandatory gravity-contract preflight.
+
+This replaces the repository root render_from_npy.py.  It keeps the corrected
+column-concatenated Rot6D convention and prevents a scientifically invalid
+sideways/floating sequence from being rendered as a successful result.
+"""
+from __future__ import annotations
+
 import argparse
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 from pytorch3d.transforms import matrix_to_axis_angle
-from vis import skeleton_render, SMPLSkeleton
-from tools.v46_motionrag_diff import rot6d_to_matrix_np
+
+from vis import SMPLSkeleton, skeleton_render
+from tools.v46_49_gravity_contract import (
+    GravityThresholds,
+    evaluate_gravity_contract,
+    gravity_metrics_np,
+    rot6d_to_matrix_np,
+)
 
 
-def _as_batch_motion(arr):
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 2:
-        if arr.shape[-1] != 151:
-            raise ValueError(f"Expected [T,151], got {arr.shape}")
-        return arr[None]
-    if arr.ndim == 3:
-        if arr.shape[-1] != 151:
-            raise ValueError(f"Expected [B,T,151], got {arr.shape}")
-        return arr
-    raise ValueError(f"Expected [T,151] or [B,T,151], got {arr.shape}")
+def as_batch(arr):
+    x = np.asarray(arr, dtype=np.float32)
+    if x.ndim == 2 and x.shape[-1] == 151:
+        return x[None]
+    if x.ndim == 3 and x.shape[-1] == 151:
+        return x
+    raise ValueError(f"Expected [T,151] or [B,T,151], got {x.shape}")
 
 
-def _sanitize_contacts(contacts, seq_len):
-    contacts = np.asarray(contacts)
-    if contacts.ndim == 1:
-        contacts = np.repeat(contacts[:, None], 4, axis=1)
-    if contacts.ndim == 2 and contacts.shape[1] == 1:
-        contacts = np.repeat(contacts, 4, axis=1)
-    if contacts.ndim != 2:
-        return np.zeros((seq_len, 4), dtype=np.float32)
-    if contacts.shape[1] != 4:
-        if contacts.shape[1] > 4:
-            contacts = contacts[:, :4]
-        else:
-            pad = np.zeros(
-                (contacts.shape[0], 4 - contacts.shape[1]),
-                dtype=contacts.dtype,
-            )
-            contacts = np.concatenate([contacts, pad], axis=1)
-    if contacts.shape[0] == seq_len - 1:
-        contacts = np.concatenate([contacts, contacts[-1:]], axis=0)
-    elif contacts.shape[0] < seq_len:
-        pad_src = (
-            contacts[-1:]
-            if len(contacts)
-            else np.zeros((1, 4), dtype=np.float32)
-        )
-        contacts = np.concatenate(
-            [
-                contacts,
-                np.repeat(pad_src, seq_len - contacts.shape[0], axis=0),
-            ],
-            axis=0,
-        )
-    elif contacts.shape[0] > seq_len:
-        contacts = contacts[:seq_len]
-    return contacts.astype(np.float32)
+def sanitize_contacts(c, T):
+    c = np.asarray(c, dtype=np.float32)
+    if c.ndim != 2:
+        return np.zeros((T, 4), dtype=np.float32)
+    if c.shape[1] < 4:
+        c = np.pad(c, ((0, 0), (0, 4 - c.shape[1])))
+    c = c[:, :4]
+    if len(c) < T:
+        last = c[-1:] if len(c) else np.zeros((1, 4), np.float32)
+        c = np.concatenate([c, np.repeat(last, T - len(c), axis=0)], axis=0)
+    return c[:T]
 
 
-def _render_one(
-    motion_data,
-    audio,
-    output,
-    camera_mode,
-    render_smooth_window,
-):
+def render_one(motion, audio, output, camera_mode, smooth):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    motion_tensor = torch.tensor(
-        motion_data, dtype=torch.float32, device=device
-    ).unsqueeze(0)
-    contacts = _sanitize_contacts(
-        motion_tensor[0, :, 0:4].detach().cpu().numpy(),
-        motion_data.shape[0],
+    T = len(motion)
+    pos = torch.as_tensor(motion[:, 4:7], dtype=torch.float32, device=device).unsqueeze(0)
+    rot6 = motion[:, 7:151].reshape(T, 24, 6)
+    matrices = rot6d_to_matrix_np(rot6)
+    axis_angle = matrix_to_axis_angle(
+        torch.as_tensor(matrices, dtype=torch.float32, device=device).unsqueeze(0)
     )
-    pos = motion_tensor[:, :, 4:7]
-    seq_len = pos.shape[1]
-    # V46.44 contract fix: V46 stores Rot6D as column-concatenated
-    # [R[:,0], R[:,1]].  Do not decode with dataset.quaternion.ax_from_6v,
-    # whose backend may assume a different flattening convention.
-    q_6d_np = motion_data[:, 7:].reshape(seq_len, 24, 6).astype(np.float32)
-    rot_m_np = rot6d_to_matrix_np(q_6d_np)
-    rot_m = torch.tensor(rot_m_np, dtype=torch.float32, device=device).unsqueeze(0)
-    q_ax = matrix_to_axis_angle(rot_m)
-    smpl = SMPLSkeleton(device=device)
-    poses_3d = smpl.forward(q_ax, pos).detach().cpu().numpy()[0]
-    out_dir = os.path.dirname(output) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    base_name = os.path.basename(output).replace(".mp4", "")
+    poses = SMPLSkeleton(device=device).forward(axis_angle, pos).detach().cpu().numpy()[0]
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
     skeleton_render(
-        poses=poses_3d,
-        epoch=base_name,
-        out=out_dir,
+        poses=poses,
+        epoch=Path(output).stem,
+        out=str(Path(output).parent),
         name=[audio],
         sound=True,
         stitch=False,
-        contact=contacts,
+        contact=sanitize_contacts(motion[:, :4], T),
         render=True,
         camera_mode=camera_mode,
         output_path=output,
-        render_smooth_window=max(1, int(render_smooth_window)),
+        render_smooth_window=max(1, int(smooth)),
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Render EDGE 151D motion. Use --render_smooth_window 1 for "
-            "scientific inspection; 3-5 only for presentation rendering."
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--motion", required=True)
+    ap.add_argument("--audio", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--camera_mode", choices=["fixed", "follow"], default="fixed")
+    ap.add_argument("--render_smooth_window", type=int, default=1)
+    ap.add_argument("--gravity_audit_json", default=None)
+    ap.add_argument("--allow_invalid_gravity", action="store_true")
+    args = ap.parse_args()
+
+    if not Path(args.motion).is_file():
+        raise FileNotFoundError(args.motion)
+    if not Path(args.audio).is_file():
+        raise FileNotFoundError(args.audio)
+
+    batch = as_batch(np.load(args.motion, allow_pickle=True))
+    reports = []
+    for i, motion in enumerate(batch):
+        metrics = gravity_metrics_np(motion)
+        ok, reasons = evaluate_gravity_contract(metrics, GravityThresholds())
+        reports.append({"batch": i, "ok": ok, "reasons": reasons, **metrics})
+        print(json.dumps(reports[-1], ensure_ascii=False, indent=2))
+        if not ok and not args.allow_invalid_gravity:
+            raise RuntimeError(
+                "Render blocked by V46.49 gravity contract: " + " | ".join(reasons)
+            )
+
+    audit_path = (
+        Path(args.gravity_audit_json)
+        if args.gravity_audit_json
+        else Path(args.output).with_name(
+            Path(args.output).stem + ".render_gravity.json"
         )
     )
-    parser.add_argument("--motion", type=str, required=True)
-    parser.add_argument("--audio", type=str, required=True)
-    parser.add_argument("--output", type=str, required=True)
-    parser.add_argument(
-        "--camera_mode",
-        type=str,
-        choices=["fixed", "follow"],
-        default="fixed",
-    )
-    parser.add_argument(
-        "--render_smooth_window",
-        type=int,
-        default=1,
-        help="1 disables render-only smoothing; use 3 or 5 for display copies.",
-    )
-    args = parser.parse_args()
-    if not os.path.exists(args.motion):
-        raise FileNotFoundError(f"Motion not found: {args.motion}")
-    if not os.path.exists(args.audio):
-        raise FileNotFoundError(f"Audio not found: {args.audio}")
-    print(f"🎬 正在读取动作张量: {args.motion}")
-    motion_batch = _as_batch_motion(np.load(args.motion, allow_pickle=True))
-    print(f"motion shape: {motion_batch.shape}")
-    if motion_batch.shape[0] == 1:
-        print(
-            f"🎥 开始渲染 (camera={args.camera_mode}, "
-            f"smooth={args.render_smooth_window})..."
-        )
-        _render_one(
-            motion_batch[0],
-            args.audio,
-            args.output,
-            args.camera_mode,
-            args.render_smooth_window,
-        )
-        print(f"✅ 视频渲染完成: {args.output}")
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if len(batch) == 1:
+        render_one(batch[0], args.audio, args.output, args.camera_mode, args.render_smooth_window)
     else:
-        root, ext = os.path.splitext(args.output)
-        for i in range(motion_batch.shape[0]):
-            out = f"{root}_b{i:02d}{ext or '.mp4'}"
-            _render_one(
-                motion_batch[i],
+        stem, ext = os.path.splitext(args.output)
+        for i, motion in enumerate(batch):
+            render_one(
+                motion,
                 args.audio,
-                out,
+                f"{stem}_b{i:02d}{ext or '.mp4'}",
                 args.camera_mode,
                 args.render_smooth_window,
             )
-        print(f"✅ batch 视频渲染完成，共 {motion_batch.shape[0]} 条。")
+    print(f"[DONE] rendered {len(batch)} sequence(s); audit={audit_path}")
 
 
 if __name__ == "__main__":
