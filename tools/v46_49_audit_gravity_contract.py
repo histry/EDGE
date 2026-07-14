@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -64,7 +65,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--allow_failed", action="store_true")
-    ap.add_argument("--torso_p05_min", type=float, default=0.45)
+    ap.add_argument(
+        "--torso_p05_min",
+        type=float,
+        default=float(
+            os.environ.get(
+                "V46_49_GRAVITY_TORSO_P05_MIN", "0.45"
+            )
+        ),
+    )
     ap.add_argument("--torso_median_min", type=float, default=0.70)
     ap.add_argument("--head_ratio_min", type=float, default=0.92)
     ap.add_argument("--feet_ratio_min", type=float, default=0.90)

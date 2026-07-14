@@ -111,6 +111,7 @@ class RetargetConfig:
     localize_root_xz: bool = True
     floor_to_zero: bool = True
     hard_gravity_gate: bool = True
+    gravity_torso_p05_min: float = 0.45
     fit_rmse_p95_max_m: float = 0.18
     seed: int = 1234
 
@@ -157,7 +158,12 @@ class RetargetConfig:
             localize_root_xz=b("V46_49_LOCALIZE_ROOT_XZ", True),
             floor_to_zero=b("V46_49_FLOOR_TO_ZERO", True),
             hard_gravity_gate=b("V46_49_GRAVITY_HARD_FAIL", True),
-            fit_rmse_p95_max_m=f("V46_49_FIT_RMSE_P95_MAX_M", 0.18),
+            gravity_torso_p05_min=f(
+                "V46_49_GRAVITY_TORSO_P05_MIN", 0.45
+            ),
+            fit_rmse_p95_max_m=f(
+                "V46_49_FIT_RMSE_P95_MAX_M", 0.18
+            ),
             seed=i("V46_49_SEED", 1234),
         )
 
@@ -1176,7 +1182,13 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
     fit_report["heading_contract"] = heading_report
 
     gravity = gravity_metrics_np(motion, cfg.target_fps)
-    gravity_ok, gravity_reasons = evaluate_gravity_contract(gravity, GravityThresholds())
+    gravity_thresholds = GravityThresholds(
+        torso_up_cos_p05_min=float(cfg.gravity_torso_p05_min),
+    )
+    gravity_ok, gravity_reasons = evaluate_gravity_contract(
+        gravity,
+        gravity_thresholds,
+    )
     fit_ok = float(fit_report["fit_rmse_p95_m"]) <= float(cfg.fit_rmse_p95_max_m)
     ok = gravity_ok and fit_ok
 
@@ -1212,6 +1224,7 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
         "config": dataclasses.asdict(cfg),
         "fit": fit_report,
         "gravity": gravity,
+        "gravity_thresholds": gravity_thresholds.to_dict(),
         "gravity_ok": bool(gravity_ok),
         "gravity_reasons": gravity_reasons,
         "fit_ok": bool(fit_ok),

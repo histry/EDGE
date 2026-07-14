@@ -69,7 +69,7 @@ fi
 
 echo "========== 2. RETARGET GRAVITY AUDIT =========="
 "$PY" tools/v46_49_audit_gravity_contract.py \
-  --input "$RETARGET_CACHE" \
+  --motion_dir "$RETARGET_CACHE" \
   --out "$OUT_ROOT/retarget_cache.gravity.json" \
   --csv "$OUT_ROOT/retarget_cache.gravity.csv"
 
