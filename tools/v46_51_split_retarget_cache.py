@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Split V46.49.4 retarget caches by source before event slicing.
+"""Exact-cardinality source-disjoint split for low-resource retarget caches.
 
-Every retargeted source sequence is assigned to train/val/test before
-`v46_50_build_event_heading_db.py` performs adaptive event segmentation.
-This directly enforces the paper's source-disjoint protocol.
+The public V46.51 splitter rounds within each dance label independently, which can
+leave a globally empty validation/test split. This replacement first computes exact
+global capacities (all non-empty for n>=3), then performs deterministic label-aware
+assignment without source leakage.
 """
 from __future__ import annotations
 
@@ -16,16 +17,16 @@ import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import tools.v46_motionrag_diff as v46  # noqa: E402
+import tools.v46_motionrag_diff as v46
 
-
-SCHEMA = "v46_51_pre_event_source_disjoint_cache_split"
+SCHEMA = "v46_53_1_exact_source_disjoint_cache_split"
+SPLITS = ("train", "val", "test")
 
 
 def jsonable(x: Any) -> Any:
@@ -41,73 +42,73 @@ def jsonable(x: Any) -> Any:
 def save_json(obj: Any, path: str | Path) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
-        json.dumps(jsonable(obj), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    p.write_text(json.dumps(jsonable(obj), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def stable_int(text: str, seed: int) -> int:
-    return int(
-        hashlib.sha256(f"{seed}::{text}".encode("utf-8")).hexdigest()[:16],
-        16,
-    )
+    return int(hashlib.sha256(f"{seed}::{text}".encode("utf-8")).hexdigest()[:16], 16)
+
+
+def exact_split_counts(n: int, train_ratio: float, val_ratio: float, test_ratio: float) -> Dict[str, int]:
+    if n < 3:
+        raise ValueError(f"source-disjoint train/val/test requires at least 3 sources, got {n}")
+    ratios = [float(train_ratio), float(val_ratio), float(test_ratio)]
+    total = sum(ratios)
+    if total <= 0:
+        raise ValueError("split ratios must sum to a positive value")
+    ratios = [r / total for r in ratios]
+
+    ideal = [n * r for r in ratios]
+    counts = [int(x) for x in ideal]
+    left = n - sum(counts)
+    remainders = [ideal[i] - counts[i] for i in range(3)]
+    order = sorted(range(3), key=lambda i: (remainders[i], ratios[i], -i), reverse=True)
+    for k in range(left):
+        counts[order[k % 3]] += 1
+
+    # Guarantee a real held-out validation and test set for every n>=3.
+    for receiver in (1, 2, 0):
+        if counts[receiver] == 0:
+            donor = max((i for i in range(3) if counts[i] > 1), key=lambda i: counts[i])
+            counts[donor] -= 1
+            counts[receiver] += 1
+    return dict(zip(SPLITS, counts))
 
 
 def assign_sources(
-    source_to_label: Mapping[str, str],
-    *,
-    seed: int,
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
+    source_to_label: Mapping[str, str], *, seed: int, train_ratio: float, val_ratio: float, test_ratio: float
 ) -> Dict[str, str]:
-    total = train_ratio + val_ratio + test_ratio
-    if total <= 0:
-        raise ValueError("split ratios must sum to a positive value")
-    train_ratio /= total
-    val_ratio /= total
-    test_ratio /= total
-
-    by_label: Dict[str, List[str]] = defaultdict(list)
-    for source, label in source_to_label.items():
-        by_label[str(label)].append(str(source))
-
+    sources = list(source_to_label)
+    target = exact_split_counts(len(sources), train_ratio, val_ratio, test_ratio)
+    remaining = dict(target)
+    label_total = Counter(str(source_to_label[s]) for s in sources)
+    # Rare labels first, then deterministic hash, to distribute scarce categories.
+    ordered = sorted(sources, key=lambda s: (label_total[str(source_to_label[s])], stable_int(s, seed)))
+    label_counts: Dict[str, Counter] = {sp: Counter() for sp in SPLITS}
     assignment: Dict[str, str] = {}
-    heldout_toggle = 0
-    for label in sorted(by_label):
-        sources = sorted(
-            by_label[label],
-            key=lambda s: stable_int(f"{label}::{s}", seed),
-        )
-        n = len(sources)
-        if n == 1:
-            n_train, n_val, n_test = 1, 0, 0
-        elif n == 2:
-            n_train = 1
-            if heldout_toggle % 2 == 0:
-                n_val, n_test = 1, 0
-            else:
-                n_val, n_test = 0, 1
-            heldout_toggle += 1
-        else:
-            n_val = max(1, int(round(n * val_ratio)))
-            n_test = max(1, int(round(n * test_ratio)))
-            while n_val + n_test >= n:
-                if n_val >= n_test and n_val > 1:
-                    n_val -= 1
-                elif n_test > 1:
-                    n_test -= 1
-                else:
-                    break
-            n_train = n - n_val - n_test
 
-        for source in sources[:n_train]:
-            assignment[source] = "train"
-        for source in sources[n_train : n_train + n_val]:
-            assignment[source] = "val"
-        for source in sources[n_train + n_val :]:
-            assignment[source] = "test"
+    for source in ordered:
+        label = str(source_to_label[source])
+        candidates = [sp for sp in SPLITS if remaining[sp] > 0]
+        if not candidates:
+            raise RuntimeError("split capacity exhausted before all sources were assigned")
+
+        def cost(sp: str) -> tuple:
+            # Prefer splits with low representation of this label and ample capacity.
+            label_load = label_counts[sp][label] / max(1, target[sp])
+            total_load = (target[sp] - remaining[sp]) / max(1, target[sp])
+            heldout_bonus = 0.0 if sp == "train" else -0.02
+            tie = stable_int(f"{source}::{sp}", seed)
+            return (label_load + 0.30 * total_load + heldout_bonus, tie)
+
+        chosen = min(candidates, key=cost)
+        assignment[source] = chosen
+        remaining[chosen] -= 1
+        label_counts[chosen][label] += 1
+
+    actual = Counter(assignment.values())
+    if any(actual[sp] != target[sp] for sp in SPLITS):
+        raise RuntimeError(f"exact split count mismatch: target={target}, actual={dict(actual)}")
     return assignment
 
 
@@ -118,39 +119,26 @@ def report_path_for_motion(path: Path) -> Path:
 def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
     report_path = report_path_for_motion(motion_path)
     if not report_path.is_file():
-        raise FileNotFoundError(
-            f"Retarget report missing for {motion_path}: {report_path}"
-        )
+        raise FileNotFoundError(f"Retarget report missing for {motion_path}: {report_path}")
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    if not bool(report.get("ok", False)):
-        raise RuntimeError(f"Non-OK retarget cache: {motion_path}")
+    if not bool(report.get("ok", False)) or not bool(report.get("source_gate_ok", report.get("anatomy_ok", False))):
+        raise RuntimeError(f"Non-OK source-safe retarget cache: {motion_path}")
 
     rel = motion_path.relative_to(cache_root)
-    original = str(
-        report.get("source")
-        or report.get("source_relative")
-        or rel.with_suffix(".bvh")
-    )
+    original = str(report.get("source_used") or report.get("source") or report.get("source_relative") or rel.with_suffix(".bvh"))
     semantic = v46.parse_change_bvh_semantics(original)
-    source_uid = str(
-        semantic.get("source_uid")
-        or Path(original).stem
-    )
-    dance_key = str(
-        semantic.get("dance_key")
-        or semantic.get("dance_category")
-        or "unknown"
-    )
+    source_uid = str(semantic.get("source_uid") or Path(original).stem)
+    dance_key = str(semantic.get("dance_key") or semantic.get("dance_category") or "unknown")
     return {
         "motion": str(motion_path.resolve()),
         "report": str(report_path.resolve()),
         "relative_motion": str(rel),
-        "relative_report": str(
-            report_path.relative_to(cache_root)
-        ),
+        "relative_report": str(report_path.relative_to(cache_root)),
         "original_source": original,
         "source_uid": source_uid,
         "dance_key": dance_key,
+        "source_anatomy_quality": float(report.get("anatomy", {}).get("anatomy_quality", 0.0)),
+        "source_gate_reasons": list(report.get("source_gate_reasons", [])),
         "semantic": semantic,
     }
 
@@ -160,36 +148,27 @@ def materialize(src: Path, dst: Path, mode: str) -> str:
     if dst.exists() or dst.is_symlink():
         dst.unlink()
     if mode == "copy":
-        shutil.copy2(src, dst)
-        return "copy"
+        shutil.copy2(src, dst); return "copy"
     if mode == "hardlink":
         try:
-            os.link(src, dst)
-            return "hardlink"
+            os.link(src, dst); return "hardlink"
         except OSError:
-            shutil.copy2(src, dst)
-            return "copy_fallback"
+            shutil.copy2(src, dst); return "copy_fallback"
     try:
-        os.symlink(src.resolve(), dst)
-        return "symlink"
+        os.symlink(src.resolve(), dst); return "symlink"
     except OSError:
-        shutil.copy2(src, dst)
-        return "copy_fallback"
+        shutil.copy2(src, dst); return "copy_fallback"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache_root", required=True)
     ap.add_argument("--out_root", required=True)
-    ap.add_argument("--seed", type=int, default=20260712)
-    ap.add_argument("--train_ratio", type=float, default=0.80)
-    ap.add_argument("--val_ratio", type=float, default=0.10)
-    ap.add_argument("--test_ratio", type=float, default=0.10)
-    ap.add_argument(
-        "--mode",
-        choices=["symlink", "hardlink", "copy"],
-        default="symlink",
-    )
+    ap.add_argument("--seed", type=int, default=20260718)
+    ap.add_argument("--train_ratio", type=float, default=0.67)
+    ap.add_argument("--val_ratio", type=float, default=0.165)
+    ap.add_argument("--test_ratio", type=float, default=0.165)
+    ap.add_argument("--mode", choices=["symlink", "hardlink", "copy"], default="symlink")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args(argv)
 
@@ -201,17 +180,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     files = []
     for p in sorted(cache_root.rglob("*.npy")):
-        name = p.name.lower()
-        if any(
-            token in name
-            for token in (
-                "motion_ref",
-                "transition_mask",
-                "single_test",
-                "spin_interval",
-                "jitter",
-            )
-        ):
+        if any(token in p.name.lower() for token in ("motion_ref", "transition_mask", "single_test", "spin_interval", "jitter")):
             continue
         files.append(p)
     if not files:
@@ -219,62 +188,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     records = [source_record(cache_root, p) for p in files]
     uid_counts = Counter(r["source_uid"] for r in records)
-    duplicate_uids = sorted(k for k, v in uid_counts.items() if v > 1)
-    if duplicate_uids:
-        raise RuntimeError(
-            "source_uid must identify one complete source sequence before "
-            f"event slicing; duplicates={duplicate_uids[:20]}"
-        )
+    duplicates = sorted(k for k, v in uid_counts.items() if v > 1)
+    if duplicates:
+        raise RuntimeError(f"source_uid must identify one complete source sequence; duplicates={duplicates[:20]}")
 
-    source_to_label = {
-        r["source_uid"]: r["dance_key"] for r in records
-    }
+    target_counts = exact_split_counts(len(records), args.train_ratio, args.val_ratio, args.test_ratio)
     assignment = assign_sources(
-        source_to_label,
-        seed=args.seed,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
+        {r["source_uid"]: r["dance_key"] for r in records}, seed=args.seed,
+        train_ratio=args.train_ratio, val_ratio=args.val_ratio, test_ratio=args.test_ratio,
     )
 
-    split_records: Dict[str, List[Dict[str, Any]]] = {
-        "train": [],
-        "val": [],
-        "test": [],
-    }
+    split_records: Dict[str, List[Dict[str, Any]]] = {sp: [] for sp in SPLITS}
     actual_modes = Counter()
     for record in records:
         split = assignment[record["source_uid"]]
-        motion_src = Path(record["motion"])
-        report_src = Path(record["report"])
+        motion_src, report_src = Path(record["motion"]), Path(record["report"])
         motion_dst = out_root / split / record["relative_motion"]
         report_dst = out_root / split / record["relative_report"]
         actual_modes[materialize(motion_src, motion_dst, args.mode)] += 1
         actual_modes[materialize(report_src, report_dst, args.mode)] += 1
-        copied = dict(record)
-        copied["split"] = split
-        copied["split_motion"] = str(motion_dst)
-        copied["split_report"] = str(report_dst)
-        split_records[split].append(copied)
+        row = dict(record)
+        row.update({"split": split, "split_motion": str(motion_dst), "split_report": str(report_dst)})
+        split_records[split].append(row)
 
-    source_sets = {
-        k: set(r["source_uid"] for r in rows)
-        for k, rows in split_records.items()
-    }
+    source_sets = {sp: {r["source_uid"] for r in rows} for sp, rows in split_records.items()}
     overlap = {
         "train_val": sorted(source_sets["train"] & source_sets["val"]),
         "train_test": sorted(source_sets["train"] & source_sets["test"]),
         "val_test": sorted(source_sets["val"] & source_sets["test"]),
     }
     reasons: List[str] = []
-    if any(overlap.values()):
-        reasons.append("source_overlap")
-    if not split_records["train"]:
-        reasons.append("empty_train")
-    if len(records) >= 3 and not split_records["val"]:
-        reasons.append("empty_val")
-    if len(records) >= 3 and not split_records["test"]:
-        reasons.append("empty_test")
+    if any(overlap.values()): reasons.append("source_overlap")
+    for sp in SPLITS:
+        if len(split_records[sp]) != target_counts[sp]: reasons.append(f"count_mismatch_{sp}")
+        if not split_records[sp]: reasons.append(f"empty_{sp}")
 
     report = {
         "schema": SCHEMA,
@@ -283,53 +230,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "cache_root": str(cache_root),
         "out_root": str(out_root),
         "seed": args.seed,
-        "split_ratios": {
-            "train": args.train_ratio,
-            "val": args.val_ratio,
-            "test": args.test_ratio,
-        },
+        "split_ratios": {"train": args.train_ratio, "val": args.val_ratio, "test": args.test_ratio},
+        "target_counts": target_counts,
         "assignment_unit": "source_uid_before_event_slicing",
+        "assignment_algorithm": "exact_global_capacity_label_aware_deterministic_greedy",
         "materialization_requested": args.mode,
         "materialization_actual": dict(actual_modes),
         "num_sources": len(records),
         "splits": {
-            split: {
+            sp: {
                 "sources": len(rows),
-                "source_uids": sorted(
-                    r["source_uid"] for r in rows
-                ),
-                "dance_key_histogram": dict(
-                    Counter(r["dance_key"] for r in rows)
-                ),
+                "source_uids": sorted(r["source_uid"] for r in rows),
+                "dance_key_histogram": dict(Counter(r["dance_key"] for r in rows)),
                 "records": rows,
-            }
-            for split, rows in split_records.items()
+            } for sp, rows in split_records.items()
         },
         "overlap": overlap,
         "policy": {
             "split_before_event_slicing": True,
             "train_motion_only": "training_and_retrieval",
             "val_test_motion": "evaluation_only",
-            "all_change": "qualitative_upper_bound_only",
+            "all_splits_nonempty": True,
         },
     }
-    report_path = out_root / "source_split_manifest.json"
-    save_json(report, report_path)
-    print(
-        json.dumps(
-            {
-                "manifest": str(report_path),
-                "ok": report["ok"],
-                "reasons": reasons,
-                "num_sources": len(records),
-                "train_sources": len(split_records["train"]),
-                "val_sources": len(split_records["val"]),
-                "test_sources": len(split_records["test"]),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    manifest = out_root / "source_split_manifest.json"
+    save_json(report, manifest)
+    print(json.dumps({
+        "manifest": str(manifest), "ok": report["ok"], "reasons": reasons,
+        "num_sources": len(records),
+        "train_sources": len(split_records["train"]),
+        "val_sources": len(split_records["val"]),
+        "test_sources": len(split_records["test"]),
+    }, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 2
 
 

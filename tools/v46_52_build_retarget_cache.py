@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build the V46.52 anatomy-gated retarget cache.
+"""Build a V46.53.1 source-safe retarget cache.
 
-Preferred source order per stem:
-1. official fitted SMPL .npz/.pkl parameters;
-2. Chang-E .bvh through anatomy-constrained optimization.
-
-Invalid sources are excluded from the cache when --allow_partial is used.  The
-pipeline still enforces a minimum number of accepted sources.
+This replacement separates source-level catastrophic safety from event-level style
+quality. A source is retained when it is numerically/physically usable; expressive
+low-posture or instrument-specific segments are filtered after event slicing.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import sys
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -21,19 +18,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import tools.chang_e_edge_retarget as legacy
 from tools.v46_52_anatomy_contract import env_bool, env_int
-from tools.v46_52_anatomy_retarget import load_official_smpl_motion, retarget_bvh_anatomy
+from tools.v46_52_anatomy_retarget import load_official_smpl_motion
+from tools.v46_53_1_anatomy_retarget import retarget_bvh_research
+
+SCHEMA = "v46_53_1_source_safe_retarget_cache"
 
 
 def _discover(in_dir: Path) -> List[Path]:
     bvh = sorted(in_dir.rglob("*.bvh"))
     smpl = sorted([*in_dir.rglob("*.npz"), *in_dir.rglob("*.pkl"), *in_dir.rglob("*.pickle")])
-    # Avoid selecting generated event/index files accidentally.
     smpl = [p for p in smpl if not any(t in p.name.lower() for t in ("event", "index", "feature", "cache", "split"))]
     prefer_smpl = env_bool("V46_52_PREFER_OFFICIAL_SMPL", True)
     grouped: Dict[str, List[Path]] = {}
@@ -41,24 +39,29 @@ def _discover(in_dir: Path) -> List[Path]:
         grouped.setdefault(str(p.relative_to(in_dir).with_suffix("")), []).append(p)
     selected: List[Path] = []
     for _, paths in sorted(grouped.items()):
-        paths.sort(key=lambda p: (0 if (prefer_smpl and p.suffix.lower() in {".npz", ".pkl", ".pickle"}) else 1, str(p)))
+        paths.sort(key=lambda p: (0 if prefer_smpl and p.suffix.lower() in {".npz", ".pkl", ".pickle"} else 1, str(p)))
         selected.append(paths[0])
     return selected
 
 
 def _report_valid(rep: Dict[str, Any]) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
-    if str(rep.get("version", "")).startswith("v46_52") is False:
-        reasons.append("not_v46_52")
+    version = str(rep.get("version", ""))
+    if "v46_53_1" not in version and not env_bool("V46_53_1_ALLOW_LEGACY_RETARGET_CACHE", False):
+        reasons.append("not_v46_53_1")
     if not bool(rep.get("ok", False)):
         reasons.append("not_ok")
-    if not bool(rep.get("anatomy_ok", False)):
-        reasons.append("anatomy_not_ok")
+    if not bool(rep.get("source_gate_ok", rep.get("anatomy_ok", False))):
+        reasons.append("source_gate_not_ok")
     if not bool(rep.get("gravity_ok", False)):
         reasons.append("gravity_not_ok")
     if not bool(rep.get("fit_ok", False)):
         reasons.append("fit_not_ok")
     return not reasons, reasons
+
+
+def _split_feasible(num_sources: int) -> bool:
+    return int(num_sources) >= 3
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -70,8 +73,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--device", default=None)
     args = ap.parse_args(argv)
 
-    in_dir = Path(args.in_dir)
-    out_dir = Path(args.out_dir)
+    in_dir = Path(args.in_dir).resolve()
+    out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     files = _discover(in_dir)
     if not files:
@@ -81,7 +84,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.device:
         cfg.device = args.device
     allow_partial = bool(args.allow_partial or env_bool("V46_52_ALLOW_PARTIAL_RETARGET", True))
-    min_ok = env_int("V46_52_MIN_OK_SOURCES", min(8, len(files)))
+    min_ok = max(3, min(len(files), env_int("V46_52_MIN_OK_SOURCES", min(8, len(files)))))
 
     reports: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
@@ -92,85 +95,74 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dst = (out_dir / rel).with_suffix(".npy")
         rep_path = dst.with_suffix(".retarget.json")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[V46.52 RETARGET {idx}/{len(files)}] {src} -> {dst}", flush=True)
+        print(f"[V46.53.1 RETARGET {idx}/{len(files)}] {src} -> {dst}", flush=True)
         try:
             if dst.exists() and rep_path.exists() and not args.overwrite:
                 old = json.loads(rep_path.read_text(encoding="utf-8"))
                 valid, reasons = _report_valid(old)
                 if valid:
-                    print("[SKIP] existing formal V46.52 anatomy cache", flush=True)
+                    print("[SKIP] existing V46.53.1 source-safe cache", flush=True)
                     reports.append(old)
                     continue
                 stale.append({"source": str(src), "reasons": reasons})
                 print(f"[REBUILD STALE] {reasons}", flush=True)
 
-            # Prefer official fitted SMPL parameters, but never discard a source
-            # merely because a sidecar file uses an unsupported schema.  When an
-            # exact-stem BVH exists, it is the scientifically safer fallback.
             candidates = [src]
             if src.suffix.lower() != ".bvh":
-                bvh_fallback = src.with_suffix(".bvh")
-                if bvh_fallback.is_file():
-                    candidates.append(bvh_fallback)
+                fallback = src.with_suffix(".bvh")
+                if fallback.is_file():
+                    candidates.append(fallback)
 
-            candidate_errors = []
+            candidate_errors: List[Dict[str, str]] = []
             motion = None
             rep = None
             source_used = None
             for candidate in candidates:
                 try:
                     if candidate.suffix.lower() == ".bvh":
-                        motion, rep = retarget_bvh_anatomy(candidate, cfg)
+                        motion, rep = retarget_bvh_research(candidate, cfg)
                     else:
-                        motion, rep = load_official_smpl_motion(
-                            candidate,
-                            target_fps=float(cfg.target_fps),
-                        )
+                        # Existing official-SMPL loader remains supported. Its strict
+                        # report must still pass the source-safety report validator.
+                        motion, rep = load_official_smpl_motion(candidate, target_fps=float(cfg.target_fps))
+                        rep = dict(rep)
+                        rep.setdefault("source_gate_ok", bool(rep.get("anatomy_ok", False)))
+                        rep["version"] = str(rep.get("version", "official_smpl")) + "_v46_53_1"
                     source_used = candidate
                     break
-                except Exception as candidate_exc:
-                    candidate_errors.append({
-                        "source": str(candidate),
-                        "error": str(candidate_exc),
-                    })
-                    motion = None
-                    rep = None
+                except Exception as exc:
+                    candidate_errors.append({"source": str(candidate), "error": str(exc)})
+                    motion = rep = source_used = None
 
             if motion is None or rep is None or source_used is None:
-                raise RuntimeError(
-                    "All V46.52 source representations failed: "
-                    + json.dumps(candidate_errors, ensure_ascii=False)
-                )
+                raise RuntimeError("All source representations failed: " + json.dumps(candidate_errors, ensure_ascii=False))
 
             rep = dict(rep)
-            rep["output"] = str(dst)
-            rep["source_relative"] = str(rel.with_suffix(source_used.suffix))
-            rep["preferred_source"] = str(src)
-            rep["source_used"] = str(source_used)
-            rep["representation_fallbacks"] = candidate_errors
-            rep["v46_52_cache_contract"] = {
-                "schema": "v46_52_anatomy_retarget_cache",
-                "requires_anatomy_ok": True,
-                "requires_gravity_ok": True,
-                "requires_fit_ok": True,
-                "official_smpl_preferred": env_bool("V46_52_PREFER_OFFICIAL_SMPL", True),
-            }
+            rep.update({
+                "output": str(dst),
+                "source_relative": str(rel.with_suffix(source_used.suffix)),
+                "preferred_source": str(src),
+                "source_used": str(source_used),
+                "representation_fallbacks": candidate_errors,
+                "v46_53_1_cache_contract": {
+                    "schema": SCHEMA,
+                    "source_gate": "catastrophic_only",
+                    "event_quality_gate_deferred": True,
+                    "requires_gravity_ok": True,
+                    "requires_fit_ok": True,
+                    "official_smpl_preferred": env_bool("V46_52_PREFER_OFFICIAL_SMPL", True),
+                },
+            })
             valid, reasons = _report_valid(rep)
             if not valid:
-                raise RuntimeError(f"Non-formal V46.52 report: {reasons}")
+                raise RuntimeError(f"Non-formal V46.53.1 report: {reasons}")
             np.save(dst, np.asarray(motion, dtype=np.float32))
             rep_path.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
             reports.append(rep)
         except Exception as exc:
-            fail = {
-                "source": str(src),
-                "output": str(dst),
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
+            fail = {"source": str(src), "output": str(dst), "error": str(exc), "traceback": traceback.format_exc()}
             failures.append(fail)
             print(f"[REJECTED SOURCE] {src}: {exc}", flush=True)
-            # Do not leave stale invalid files discoverable by the split builder.
             for p in (dst, rep_path):
                 try:
                     p.unlink(missing_ok=True)
@@ -179,37 +171,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not allow_partial:
                 break
 
-    all_ok = len(reports) >= min_ok and (allow_partial or not failures)
+    enough = len(reports) >= min_ok
+    split_ok = _split_feasible(len(reports))
+    all_ok = enough and split_ok and (allow_partial or not failures)
     summary = {
-        "schema": "v46_52_anatomy_retarget_cache",
+        "schema": SCHEMA,
         "in_dir": str(in_dir),
         "out_dir": str(out_dir),
         "num_inputs": len(files),
         "num_ok": len(reports),
         "num_failed": len(failures),
         "minimum_ok_sources": int(min_ok),
+        "split_feasible": bool(split_ok),
         "allow_partial": bool(allow_partial),
         "all_ok": bool(all_ok),
-        "source_formats": {
-            "official_smpl": sum(str(r.get("source_format", "")).startswith("official_smpl") for r in reports),
-            "bvh_optimized": sum("bvh" in str(r.get("version", "")) for r in reports),
+        "policy": {
+            "source_gate": "catastrophic numerical/physical failures only",
+            "style_quality": "deferred to event-level posture-aware gate",
+            "minimum_split_cardinality": 3,
         },
-        "anatomy_quality_min": min(
-            [float(r.get("anatomy", {}).get("anatomy_quality", 0.0)) for r in reports],
-            default=0.0,
-        ),
-        "fit_rmse_p95_max_m": max(
-            [float(r.get("fit", {}).get("fit_rmse_p95_m", 0.0)) for r in reports],
-            default=0.0,
-        ),
         "stale_rebuilt": stale,
         "reports": reports,
         "failures": failures,
     }
-    # Keep the legacy filename because the V46.51 split script checks it.
-    for name in ("v46_50_retarget_cache_report.json", "v46_52_retarget_cache_report.json"):
+    for name in ("v46_50_retarget_cache_report.json", "v46_52_retarget_cache_report.json", "v46_53_1_retarget_cache_report.json"):
         (out_dir / name).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({k: summary[k] for k in ("num_inputs", "num_ok", "num_failed", "minimum_ok_sources", "all_ok")}, indent=2))
+    print(json.dumps({k: summary[k] for k in ("num_inputs", "num_ok", "num_failed", "minimum_ok_sources", "split_feasible", "all_ok")}, indent=2))
     return 0 if all_ok else 2
 
 
