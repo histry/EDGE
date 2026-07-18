@@ -99,8 +99,17 @@ def sibling_retarget_report(path: Path) -> Dict[str, Any]:
 
 
 def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Validate legacy V46.49.4 caches and V46.53.1 soft-root caches.
+
+    V46.53.1 intentionally replaces the complete root-orientation lock with a
+    source-body-frame SO(3) soft geodesic anchor.  The Event-DB builder must not
+    reject that newer contract merely because its mode string differs from the
+    legacy ``absolute_reference_lock`` contract.  Acceptance remains strict:
+    the report must be produced by the V46.53.1 source-safety retargeter and all
+    source-level anatomy, gravity and fit gates must have passed.
+    """
     reasons: List[str] = []
-    strict = str(os.environ.get("V46_50_REQUIRE_V46_49_4_CACHE", "1")).strip() not in {
+    strict = str(os.environ.get("V46_50_REQUIRE_V46_49_4_CACHE", "1")).strip().lower() not in {
         "0", "false", "no", "off"
     }
     if not strict:
@@ -122,8 +131,34 @@ def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool
         reasons.append("heading_contract_not_stabilize")
 
     root_contract = fit.get("root_orientation_contract", {})
-    if str(root_contract.get("mode", "")) != "absolute_reference_lock":
-        reasons.append("root_orientation_not_absolute_reference_lock")
+    root_mode = str(root_contract.get("mode", "")).strip()
+
+    if root_mode == "absolute_reference_lock":
+        # Preserved V46.49.4/V46.52 contract.
+        pass
+    elif root_mode == "soft_geodesic_anchor":
+        allow_soft = str(
+            os.environ.get("V46_53_1_ALLOW_SOFT_ROOT_CONTRACT", "1")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not allow_soft:
+            reasons.append("v46_53_1_soft_root_contract_disabled")
+
+        if str(report.get("schema", "")) != "v46_53_1_source_safety_retarget":
+            reasons.append("soft_root_missing_v46_53_1_source_safety_schema")
+        if str(root_contract.get("version", "")) != "v46_53_1_soft_source_body_frame_contract":
+            reasons.append("soft_root_contract_version_mismatch")
+        if str(root_contract.get("root_orientation", "")) != "optimized_with_source_body_frame_prior":
+            reasons.append("soft_root_orientation_prior_missing")
+
+        # Do not weaken the source gate while adding compatibility.
+        for key in ("source_gate_ok", "anatomy_ok", "gravity_ok", "fit_ok"):
+            if not bool(report.get(key, False)):
+                reasons.append(f"soft_root_{key}_false")
+    else:
+        reasons.append(
+            "unsupported_root_orientation_contract_mode="
+            + (root_mode if root_mode else "missing")
+        )
 
     return not reasons, reasons
 
